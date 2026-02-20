@@ -3,7 +3,7 @@
   "report": {
     "topLimit": 5,
     "channel": "discord",
-    "target": "channel:1468117725040742527",
+    "target": "channel:123456789012345678",
     "maxSendLength": 3000
   },
   "watchdog": {
@@ -21,8 +21,53 @@
   },
   "linear": {
     "enabled": true,
-    "teamKey": "OPS",
+    "teamKey": "CLAW",
     "teamId": "",
     "projectId": ""
+  },
+  "ingest": {
+    "host": "127.0.0.1",
+    "port": 8788,
+    "triagePath": "/triage",
+    "githubPath": "/github/pr",
+    "token": "",
+    "maxBodyBytes": 1048576
+  },
+  "reminders": {
+    "enabled": true,
+    "dueSoonDays": 7,
+    "dueSoonCron": "0 10 * * *",
+    "cycleCron": "30 9 * * 1",
+    "channel": "discord",
+    "target": "channel:123456789012345678",
+    "maxSendLength": 3000
+  },
+  "github": {
+    "stateInReview": "In Review",
+    "stateDone": "Done",
+    "webhookSecret": "",
+    "token": "",
+    "repos": [
+      "frank8ai/openclaw-workspace",
+      "frank8ai/openclaw-mission-control"
+    ],
+    "pollIntervalMinutes": 15,
+    "lookbackHours": 72
+  },
+  "todoist": {
+    "enabled": true,
+    "apiToken": "",
+    "syncToLinear": true,
+    "label": "todoist",
+    "defaultState": "Triage",
+    "syncBatchSize": 10
+  },
+  "calendar": {
+    "enabled": true,
+    "browserProfile": "openclaw",
+    "tabHint": "calendar.google.com",
+    "syncToLinear": false,
+    "label": "calendar",
+    "defaultState": "Triage"
   }
 }

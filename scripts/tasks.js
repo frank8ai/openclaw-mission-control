@@ -4,6 +4,7 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 
 const fs = require('node:fs');
+const http = require('node:http');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
@@ -16,6 +17,11 @@ const CONFIG_PATH = process.env.CONTROL_CENTER_CONFIG
   : path.join(ROOT_DIR, 'config', 'control-center.json');
 const CONFIRMATIONS_PATH = path.join(DATA_DIR, 'confirmations.json');
 const INCIDENTS_PATH = path.join(DATA_DIR, 'incidents.json');
+const TODOIST_SYNC_PATH = path.join(DATA_DIR, 'todoist-sync.json');
+const CALENDAR_SYNC_PATH = path.join(DATA_DIR, 'calendar-sync.json');
+const GITHUB_SYNC_PATH = path.join(DATA_DIR, 'github-sync.json');
+
+hydrateEnvFromDotEnv();
 
 const DEFAULTS = {
   timezone: process.env.CONTROL_CENTER_TZ || 'Asia/Shanghai',
@@ -40,14 +46,56 @@ const DEFAULTS = {
   },
   linear: {
     enabled: true,
-    teamKey: process.env.LINEAR_TEAM_KEY || 'OPS',
+    teamKey: process.env.LINEAR_TEAM_KEY || 'CLAW',
     teamId: process.env.LINEAR_TEAM_ID || '',
     projectId: process.env.LINEAR_PROJECT_ID || '',
     apiKey: process.env.LINEAR_API_KEY || '',
   },
+  ingest: {
+    host: process.env.CONTROL_CENTER_INGEST_HOST || '127.0.0.1',
+    port: Number(process.env.CONTROL_CENTER_INGEST_PORT || 8788),
+    triagePath: process.env.CONTROL_CENTER_TRIAGE_PATH || '/triage',
+    githubPath: process.env.CONTROL_CENTER_GITHUB_PATH || '/github/pr',
+    token: process.env.CONTROL_CENTER_INGEST_TOKEN || '',
+    maxBodyBytes: 1024 * 1024,
+  },
+  reminders: {
+    enabled: true,
+    dueSoonDays: 7,
+    dueSoonCron: '0 10 * * *',
+    cycleCron: '30 9 * * 1',
+    channel: process.env.CONTROL_CENTER_REMINDER_CHANNEL || '',
+    target: process.env.CONTROL_CENTER_REMINDER_TARGET || '',
+    maxSendLength: 3000,
+  },
+  github: {
+    stateInReview: 'In Review',
+    stateDone: 'Done',
+    webhookSecret: process.env.GITHUB_WEBHOOK_SECRET || '',
+    token: process.env.GITHUB_TOKEN || '',
+    repos: [],
+    pollIntervalMinutes: 15,
+    lookbackHours: 72,
+  },
+  todoist: {
+    enabled: true,
+    apiToken: process.env.TODOIST_API_TOKEN || '',
+    syncToLinear: true,
+    label: 'todoist',
+    defaultState: 'Triage',
+    syncBatchSize: 10,
+  },
+  calendar: {
+    enabled: true,
+    browserProfile: process.env.CONTROL_CENTER_CALENDAR_PROFILE || 'openclaw',
+    tabHint: process.env.CONTROL_CENTER_CALENDAR_TAB_HINT || 'calendar.google.com',
+    syncToLinear: false,
+    label: 'calendar',
+    defaultState: 'Triage',
+  },
 };
 
-const HELP_TEXT = `OpenClaw Control Center CLI\n\nUsage:\n  npm run tasks -- <command> [options]\n  node scripts/tasks.js <command> [options]\n\nRead commands:\n  now                          Quick 30-second answer: what is happening + what next\n  jobs                         List cron jobs and status\n  agents                       List subagents (label/status/start/elapsed)\n  sessions                     List active sessions summary\n  report [--json] [--send]     Build health report (Top 5 anomalies + manual actions)\n  watchdog [--auto-linear]     Detect incidents and optionally auto-create Linear issues\n\nWrite commands (require one-time confirmation):\n  confirm                      Generate one-time confirmation code\n  run <jobId> --confirm CODE   Run cron job now\n  enable <jobId> --confirm CODE\n  disable <jobId> --confirm CODE\n  kill <subagentId> --confirm CODE\n\nScheduling:\n  schedule [--apply] [--channel CH] [--target TGT]\n    Prepare (or install) crontab block:\n    - 09:00 + 18:00 report\n    - every 5 minutes watchdog\n\nExamples:\n  npm run tasks -- report\n  npm run tasks -- report --send --channel discord --target channel:123\n  npm run tasks -- watchdog --auto-linear\n  npm run tasks -- confirm\n  npm run tasks -- disable 10a67acd-... --confirm "CONFIRM X3H4QK"\n`;
+const HELP_TEXT = `OpenClaw Control Center CLI\n\nUsage:\n  npm run tasks -- <command> [options]\n  node scripts/tasks.js <command> [options]\n\nRead commands:\n  now                          Quick 30-second answer: what is happening + what next\n  jobs                         List cron jobs and status\n  agents                       List subagents (label/status/start/elapsed)\n  sessions                     List active sessions summary\n  report [--json] [--send]     Build health report (Top 5 anomalies + manual actions)\n  watchdog [--auto-linear]     Detect incidents and optionally auto-create Linear issues\n  remind [due|cycle|all]       Send reminders from Linear (due soon/current cycle)\n\nIntegrations:\n  triage --title ...           Create a Triage issue quickly (supports --source/--labels)\n  ingest-server                Start webhook server for external intake + GitHub PR sync\n  github-hooks [--repo PATH]   Install git hooks to enforce/add Linear ID in branch/commit\n  github-sync                  Poll GitHub PRs and sync Linear states (In Review/Done)\n  todoist-sync                 Sync Todoist tasks into Linear Triage\n  calendar-sync                Sync Google Calendar events snapshot (browser logged-in tab)\n\nWrite commands (require one-time confirmation):\n  confirm                      Generate one-time confirmation code\n  run <jobId> --confirm CODE   Run cron job now\n  enable <jobId> --confirm CODE\n  disable <jobId> --confirm CODE\n  kill <subagentId> --confirm CODE\n\nScheduling:\n  schedule [--apply] [--channel CH] [--target TGT]\n    Prepare (or install) crontab block:\n    - 09:00 + 18:00 report\n    - every 5 minutes watchdog\n    - reminders (due soon + cycle planning)\n\nExamples:\n  npm run tasks -- triage --title \"Fix Discord manual model switch\" --source discord\n  npm run tasks -- github-sync\n  npm run tasks -- todoist-sync\n  npm run tasks -- calendar-sync\n`;
 
 async function main() {
   const { command, flags } = parseArgv(process.argv.slice(2));
@@ -79,6 +127,34 @@ async function main() {
         return;
       case 'watchdog':
         await cmdWatchdog(settings, flags);
+        return;
+      case 'triage':
+        await cmdTriage(settings, flags);
+        return;
+      case 'remind':
+      case 'reminder':
+        await cmdRemind(settings, flags);
+        return;
+      case 'ingest-server':
+      case 'webhook':
+        await cmdIngestServer(settings, flags);
+        return;
+      case 'github-hooks':
+      case 'git-hooks':
+        await cmdGithubHooks(settings, flags);
+        return;
+      case 'github-sync':
+      case 'gh-sync':
+        await cmdGithubSync(settings, flags);
+        return;
+      case 'todoist-sync':
+      case 'todoist':
+        await cmdTodoistSync(settings, flags);
+        return;
+      case 'calendar-sync':
+      case 'gcal-sync':
+      case 'calendar':
+        await cmdCalendarSync(settings, flags);
         return;
       case 'confirm':
         await cmdConfirm(settings, flags);
@@ -172,6 +248,28 @@ function loadSettings() {
 
   const merged = deepMerge(DEFAULTS, config);
 
+  if (!merged.linear.apiKey && process.env.LINEAR_API_KEY) {
+    merged.linear.apiKey = process.env.LINEAR_API_KEY;
+  }
+  if (!merged.linear.teamKey && process.env.LINEAR_TEAM_KEY) {
+    merged.linear.teamKey = process.env.LINEAR_TEAM_KEY;
+  }
+  if (!merged.linear.teamId && process.env.LINEAR_TEAM_ID) {
+    merged.linear.teamId = process.env.LINEAR_TEAM_ID;
+  }
+  if (!merged.linear.projectId && process.env.LINEAR_PROJECT_ID) {
+    merged.linear.projectId = process.env.LINEAR_PROJECT_ID;
+  }
+  if (!merged.github.token && process.env.GITHUB_TOKEN) {
+    merged.github.token = process.env.GITHUB_TOKEN;
+  }
+  if (!merged.github.token) {
+    merged.github.token = readFileTrim(path.join(os.homedir(), '.openclaw', 'credentials', 'github-token.txt'));
+  }
+  if (!merged.todoist.apiToken && process.env.TODOIST_API_TOKEN) {
+    merged.todoist.apiToken = process.env.TODOIST_API_TOKEN;
+  }
+
   if (process.env.CONTROL_CENTER_KILL_WHITELIST) {
     merged.control.killWhitelist = process.env.CONTROL_CENTER_KILL_WHITELIST
       .split(',')
@@ -180,6 +278,41 @@ function loadSettings() {
   }
 
   return merged;
+}
+
+function hydrateEnvFromDotEnv() {
+  const files = [
+    path.join(ROOT_DIR, '.env'),
+    path.join(path.resolve(ROOT_DIR, '..'), '.env'),
+  ];
+
+  for (const filePath of files) {
+    if (!fs.existsSync(filePath)) {
+      continue;
+    }
+    let content = '';
+    try {
+      content = fs.readFileSync(filePath, 'utf8');
+    } catch {
+      continue;
+    }
+
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#') || !trimmed.includes('=')) {
+        continue;
+      }
+      const index = trimmed.indexOf('=');
+      const key = trimmed.slice(0, index).trim();
+      const value = trimmed.slice(index + 1).trim().replace(/^['"]|['"]$/g, '');
+      if (!key || !value) {
+        continue;
+      }
+      if (!process.env[key]) {
+        process.env[key] = value;
+      }
+    }
+  }
 }
 
 function deepMerge(base, override) {
@@ -265,25 +398,49 @@ async function cmdJobs(settings, flags) {
 
 async function cmdAgents(settings, flags) {
   const subagents = loadSubagents(settings);
-  if (flags.json) {
-    process.stdout.write(`${JSON.stringify({ subagents }, null, 2)}\n`);
+  if (subagents.length > 0) {
+    if (flags.json) {
+      process.stdout.write(`${JSON.stringify({ subagents }, null, 2)}\n`);
+      return;
+    }
+
+    const rows = subagents.map((item) => ({
+      id: item.id,
+      label: item.label,
+      status: item.status,
+      start: formatTime(item.startedAtMs, settings.timezone),
+      elapsed: formatDuration(item.durationMs),
+      pid: item.pid ? String(item.pid) : '-',
+    }));
+
+    printTable(rows, ['id', 'label', 'status', 'start', 'elapsed', 'pid']);
     return;
   }
 
-  if (subagents.length === 0) {
+  const activeWindowMs = Math.max(30, Number(settings.watchdog.subagentLongRunMinutes || 120)) * 60 * 1000;
+  const sessionFallback = loadSessions(settings)
+    .filter((session) => Number(session.ageMs || Number.POSITIVE_INFINITY) <= activeWindowMs)
+    .sort((a, b) => Number(a.ageMs || 0) - Number(b.ageMs || 0));
+
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify({ subagents: [], fallback: 'sessions', sessions: sessionFallback }, null, 2)}\n`);
+    return;
+  }
+
+  if (sessionFallback.length === 0) {
     process.stdout.write('No subagents found in ~/.openclaw/subagents/runs.json\n');
     return;
   }
 
-  const rows = subagents.map((item) => ({
-    id: item.id,
-    label: item.label,
-    status: item.status,
-    start: formatTime(item.startedAtMs, settings.timezone),
-    elapsed: formatDuration(item.durationMs),
-    pid: item.pid ? String(item.pid) : '-',
+  process.stdout.write('No subagent runs file found; showing active sessions fallback.\n');
+  const rows = sessionFallback.map((session) => ({
+    id: session.sessionId || session.key || '-',
+    label: session.agentId || inferAgentId(session.key),
+    status: session.abortedLastRun ? 'aborted' : 'running',
+    start: formatTime(session.updatedAt, settings.timezone),
+    elapsed: formatDuration(session.ageMs),
+    pid: '-',
   }));
-
   printTable(rows, ['id', 'label', 'status', 'start', 'elapsed', 'pid']);
 }
 
@@ -540,11 +697,30 @@ async function cmdSchedule(settings, flags) {
 
   const channel = String(flags.channel || settings.report.channel || '').trim();
   const target = String(flags.target || settings.report.target || '').trim();
+  const reminderChannel = String(
+    flags['reminder-channel'] || settings.reminders.channel || channel || '',
+  ).trim();
+  const reminderTarget = String(
+    flags['reminder-target'] || settings.reminders.target || target || '',
+  ).trim();
+  const withReminders =
+    !Boolean(flags['without-reminders']) && Boolean(settings.reminders.enabled !== false);
   const nodeBin = process.execPath;
   const scriptPath = path.join(ROOT_DIR, 'scripts', 'tasks.js');
   const reportLog = path.join(DATA_DIR, 'report-cron.log');
   const watchdogLog = path.join(DATA_DIR, 'watchdog-cron.log');
+  const reminderDueLog = path.join(DATA_DIR, 'reminder-due-cron.log');
+  const reminderCycleLog = path.join(DATA_DIR, 'reminder-cycle-cron.log');
+  const githubSyncLog = path.join(DATA_DIR, 'github-sync-cron.log');
+  const todoistSyncLog = path.join(DATA_DIR, 'todoist-sync-cron.log');
+  const calendarSyncLog = path.join(DATA_DIR, 'calendar-sync-cron.log');
   const watchdogInterval = Number(flags['watchdog-interval'] || 5);
+  const githubPollMinutes = Number(flags['github-poll-minutes'] || settings.github.pollIntervalMinutes || 15);
+  const todoistPollMinutes = Number(flags['todoist-poll-minutes'] || 30);
+  const calendarPollMinutes = Number(flags['calendar-poll-minutes'] || 60);
+  const githubExpr = cronEveryMinutesExpr(githubPollMinutes);
+  const todoistExpr = cronEveryMinutesExpr(todoistPollMinutes);
+  const calendarExpr = cronEveryMinutesExpr(calendarPollMinutes);
 
   ensureDir(DATA_DIR);
 
@@ -554,12 +730,47 @@ async function cmdSchedule(settings, flags) {
   }
 
   const watchdogParts = [nodeBin, scriptPath, 'watchdog', '--auto-linear'];
+  const githubSyncParts = [nodeBin, scriptPath, 'github-sync'];
+  const todoistBatchSize = Math.max(1, Number(settings.todoist.syncBatchSize || 10));
+  const todoistSyncParts = [nodeBin, scriptPath, 'todoist-sync', '--limit', String(todoistBatchSize)];
+  const calendarSyncParts = [nodeBin, scriptPath, 'calendar-sync'];
+  const remindDueParts = [nodeBin, scriptPath, 'remind', 'due'];
+  const remindCycleParts = [nodeBin, scriptPath, 'remind', 'cycle'];
+  const dueSoonDays = Number(flags.days || settings.reminders.dueSoonDays || 7);
+  if (dueSoonDays > 0) {
+    remindDueParts.push('--days', String(dueSoonDays));
+  }
+  if (reminderChannel && reminderTarget) {
+    remindDueParts.push('--send', '--channel', reminderChannel, '--target', reminderTarget);
+    remindCycleParts.push('--send', '--channel', reminderChannel, '--target', reminderTarget);
+  }
 
   const blockLines = [
     '# OPENCLAW_CONTROL_CENTER_BEGIN',
     `CRON_TZ=${timezone}`,
     `0 9,18 * * * cd ${shellQuote(ROOT_DIR)} && ${joinShell(reportParts)} >> ${shellQuote(reportLog)} 2>&1`,
     `*/${watchdogInterval} * * * * cd ${shellQuote(ROOT_DIR)} && ${joinShell(watchdogParts)} >> ${shellQuote(watchdogLog)} 2>&1`,
+    ...(githubExpr
+      ? [
+          `${githubExpr} cd ${shellQuote(ROOT_DIR)} && ${joinShell(githubSyncParts)} >> ${shellQuote(githubSyncLog)} 2>&1`,
+        ]
+      : []),
+    ...(todoistExpr
+      ? [
+          `${todoistExpr} cd ${shellQuote(ROOT_DIR)} && ${joinShell(todoistSyncParts)} >> ${shellQuote(todoistSyncLog)} 2>&1`,
+        ]
+      : []),
+    ...(calendarExpr
+      ? [
+          `${calendarExpr} cd ${shellQuote(ROOT_DIR)} && ${joinShell(calendarSyncParts)} >> ${shellQuote(calendarSyncLog)} 2>&1`,
+        ]
+      : []),
+    ...(withReminders
+      ? [
+          `${settings.reminders.dueSoonCron || '0 10 * * *'} cd ${shellQuote(ROOT_DIR)} && ${joinShell(remindDueParts)} >> ${shellQuote(reminderDueLog)} 2>&1`,
+          `${settings.reminders.cycleCron || '30 9 * * 1'} cd ${shellQuote(ROOT_DIR)} && ${joinShell(remindCycleParts)} >> ${shellQuote(reminderCycleLog)} 2>&1`,
+        ]
+      : []),
     '# OPENCLAW_CONTROL_CENTER_END',
   ];
 
@@ -577,6 +788,1245 @@ async function cmdSchedule(settings, flags) {
   writeCrontab(next);
 
   process.stdout.write('Crontab updated with OpenClaw Control Center schedule.\n');
+}
+
+async function cmdTriage(settings, flags) {
+  const rawText = String(flags.text || flags._.join(' ') || '').trim();
+  const title = String(flags.title || '').trim();
+  const description = String(flags.description || flags.desc || '').trim();
+  const source = String(flags.source || 'manual').trim();
+  const author = String(flags.author || '').trim();
+  const sourceUrl = String(flags.url || '').trim();
+  const state = String(flags.state || 'Triage').trim();
+  const labels = normalizeLabelNames(flags.labels || flags.label || '');
+  const dueDate = String(flags['due-date'] || '').trim();
+  const priority = Number(flags.priority || 3);
+
+  const issue = await createTriageIssueFromInput(
+    {
+      title,
+      rawText,
+      description,
+      source,
+      author,
+      sourceUrl,
+      state,
+      labels,
+      dueDate,
+      priority: Number.isFinite(priority) ? priority : 3,
+    },
+    settings,
+  );
+
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(issue, null, 2)}\n`);
+    return;
+  }
+
+  const lines = [];
+  lines.push('Triage issue created:');
+  lines.push(`- ${issue.identifier}: ${issue.title}`);
+  lines.push(`- state: ${issue.stateName || '-'}`);
+  if (issue.url) {
+    lines.push(`- url: ${issue.url}`);
+  }
+  if (issue.labels && issue.labels.length > 0) {
+    lines.push(`- labels: ${issue.labels.join(', ')}`);
+  }
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+async function cmdRemind(settings, flags) {
+  const mode = String(flags._[0] || 'all').trim().toLowerCase();
+  if (!['all', 'due', 'cycle'].includes(mode)) {
+    throw new Error(`invalid remind mode: ${mode}. expected due|cycle|all`);
+  }
+
+  const apiKey = String(settings.linear.apiKey || '').trim();
+  if (!apiKey) {
+    throw new Error('LINEAR_API_KEY is required for remind.');
+  }
+
+  const teamId = settings.linear.teamId || (await resolveLinearTeamId(apiKey, settings.linear.teamKey));
+  if (!teamId) {
+    throw new Error('Unable to resolve Linear team id for reminder.');
+  }
+
+  const dueDays = Number(flags.days || settings.reminders.dueSoonDays || 7);
+  const data = {
+    generatedAtMs: Date.now(),
+    mode,
+    dueDays,
+    due: [],
+    cycle: [],
+  };
+
+  if (mode === 'all' || mode === 'due') {
+    data.due = await fetchDueSoonIssues(apiKey, teamId, dueDays);
+  }
+  if (mode === 'all' || mode === 'cycle') {
+    data.cycle = await fetchCurrentCycleIssues(apiKey, teamId);
+  }
+
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(data, null, 2)}\n`);
+  } else {
+    process.stdout.write(`${renderReminder(data, settings)}\n`);
+  }
+
+  if (flags.send) {
+    const channel = String(
+      flags.channel || settings.reminders.channel || settings.report.channel || '',
+    ).trim();
+    const target = String(
+      flags.target || settings.reminders.target || settings.report.target || '',
+    ).trim();
+    if (!channel || !target) {
+      throw new Error('remind --send requires --channel and --target (or values in config).');
+    }
+
+    const maxLength = Number(flags['max-message-length'] || settings.reminders.maxSendLength || 3000);
+    const text = trimMessage(renderReminder(data, settings), maxLength);
+    runCommand('openclaw', [
+      'message',
+      'send',
+      '--channel',
+      channel,
+      '--target',
+      target,
+      '--message',
+      text,
+    ]);
+    process.stdout.write(`Reminder sent via openclaw message send (${channel} -> ${target}).\n`);
+  }
+}
+
+async function cmdIngestServer(settings, flags) {
+  const host = String(flags.host || settings.ingest.host || '127.0.0.1').trim();
+  const port = Number(flags.port || settings.ingest.port || 8788);
+  const triagePath = String(flags.path || settings.ingest.triagePath || '/triage').trim();
+  const githubPath = String(flags['github-path'] || settings.ingest.githubPath || '/github/pr').trim();
+  const token = String(flags.token || settings.ingest.token || '').trim();
+  const maxBodyBytes = Number(flags['max-body-bytes'] || settings.ingest.maxBodyBytes || 1024 * 1024);
+
+  if (!Number.isFinite(port) || port <= 0) {
+    throw new Error(`invalid ingest port: ${String(port)}`);
+  }
+
+  const server = http.createServer(async (req, res) => {
+    const requestPath = new URL(String(req.url || '/'), `http://${host}`).pathname;
+
+    try {
+      if (String(req.method || '').toUpperCase() !== 'POST') {
+        sendJson(res, 405, { ok: false, error: 'method_not_allowed' });
+        return;
+      }
+
+      if (requestPath === triagePath) {
+        if (token) {
+          const provided = String(req.headers['x-openclaw-token'] || '').trim();
+          if (!provided || provided !== token) {
+            sendJson(res, 403, { ok: false, error: 'forbidden' });
+            return;
+          }
+        }
+
+        const body = await readJsonBody(req, maxBodyBytes);
+        const issue = await createTriageIssueFromInput(
+          {
+            title: String(body.title || '').trim(),
+            rawText: String(body.text || body.message || '').trim(),
+            description: String(body.description || '').trim(),
+            source: String(body.source || 'webhook').trim(),
+            author: String(body.author || '').trim(),
+            sourceUrl: String(body.url || '').trim(),
+            state: String(body.state || 'Triage').trim(),
+            labels: normalizeLabelNames(body.labels || ''),
+            dueDate: String(body.dueDate || '').trim(),
+            priority: Number(body.priority || 3),
+          },
+          settings,
+        );
+
+        sendJson(res, 200, { ok: true, issue });
+        return;
+      }
+
+      if (requestPath === githubPath) {
+        const rawBody = await readJsonBody(req, maxBodyBytes, true);
+        const githubSecret = String(flags['github-secret'] || settings.github.webhookSecret || '').trim();
+        if (githubSecret && !verifyGithubSignature(req, rawBody, githubSecret)) {
+          sendJson(res, 403, { ok: false, error: 'invalid_signature' });
+          return;
+        }
+
+        const body = rawBody.parsed;
+        const event = String(req.headers['x-github-event'] || '').toLowerCase();
+        const result = await handleGithubPullRequestEvent(event, body, settings);
+        sendJson(res, 200, { ok: true, event, result });
+        return;
+      }
+
+      sendJson(res, 404, { ok: false, error: 'not_found' });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendJson(res, 500, { ok: false, error: message });
+    }
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, host, () => {
+      process.stdout.write(
+        `Ingest server listening on http://${host}:${port}\n` +
+          `- triage path: ${triagePath}\n` +
+          `- github path: ${githubPath}\n`,
+      );
+      resolve(null);
+    });
+  });
+}
+
+async function cmdGithubHooks(settings, flags) {
+  const repoPath = path.resolve(String(flags.repo || path.resolve(ROOT_DIR, '..')).trim());
+  const teamKey = String(flags.team || settings.linear.teamKey || 'CLAW')
+    .trim()
+    .toUpperCase();
+  const result = installLinearGitHooks(repoPath, teamKey);
+
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+
+  process.stdout.write(
+    `Git hooks installed for Linear IDs:\n` +
+      `- repo: ${result.repoPath}\n` +
+      `- hooks: ${result.hooks.join(', ')}\n` +
+      `- teamKey: ${teamKey}\n`,
+  );
+}
+
+async function cmdGithubSync(settings, flags) {
+  const token = String(flags.token || settings.github.token || '').trim();
+  if (!token) {
+    throw new Error('GitHub token missing. Set GITHUB_TOKEN or ~/.openclaw/credentials/github-token.txt');
+  }
+
+  const lookbackHours = Number(flags['lookback-hours'] || settings.github.lookbackHours || 72);
+  const repos = resolveGithubRepos(settings, flags);
+  if (repos.length === 0) {
+    throw new Error('No GitHub repositories configured for sync.');
+  }
+
+  const sinceMs = Date.now() - Math.max(1, lookbackHours) * 60 * 60 * 1000;
+  const updates = [];
+  const errors = [];
+
+  for (const repo of repos) {
+    try {
+      const openPrs = await githubApiRequest(
+        token,
+        `/repos/${repo}/pulls?state=open&per_page=100&sort=updated&direction=desc`,
+      );
+      const closedPrs = await githubApiRequest(
+        token,
+        `/repos/${repo}/pulls?state=closed&per_page=100&sort=updated&direction=desc`,
+      );
+
+      const openEvents = Array.isArray(openPrs)
+        ? openPrs.map((pr) => ({ repo, action: 'open', targetState: settings.github.stateInReview, pr }))
+        : [];
+
+      const mergedEvents = Array.isArray(closedPrs)
+        ? closedPrs
+            .filter((pr) => pr && pr.merged_at)
+            .filter((pr) => {
+              const updatedAt = Date.parse(String(pr.updated_at || pr.merged_at || ''));
+              return Number.isFinite(updatedAt) && updatedAt >= sinceMs;
+            })
+            .map((pr) => ({ repo, action: 'merged', targetState: settings.github.stateDone, pr }))
+        : [];
+
+      for (const event of [...openEvents, ...mergedEvents]) {
+        const pr = event.pr || {};
+        const identifiers = extractLinearIssueIds(
+          pr.title,
+          pr.body,
+          pr.head && pr.head.ref,
+          pr.base && pr.base.ref,
+        );
+        if (identifiers.length === 0) {
+          continue;
+        }
+
+        for (const identifier of identifiers) {
+          const result = await transitionIssueByIdentifier(identifier, event.targetState, settings);
+          updates.push({
+            repo,
+            action: event.action,
+            prNumber: pr.number,
+            prTitle: pr.title,
+            identifier,
+            result,
+          });
+        }
+      }
+    } catch (error) {
+      errors.push({
+        repo,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  writeJsonFile(GITHUB_SYNC_PATH, {
+    updatedAtMs: Date.now(),
+    repos,
+    lookbackHours,
+    updates,
+    errors,
+  });
+
+  if (flags.json) {
+    process.stdout.write(
+      `${JSON.stringify({ ok: errors.length === 0, repos, lookbackHours, updates, errors }, null, 2)}\n`,
+    );
+    return;
+  }
+
+  const lines = [];
+  lines.push('GitHub sync result:');
+  lines.push(`- repos: ${repos.length}`);
+  lines.push(`- updates: ${updates.length}`);
+  lines.push(`- errors: ${errors.length}`);
+  for (const item of updates.slice(0, 12)) {
+    lines.push(
+      `- ${item.repo}#${item.prNumber} ${item.identifier} -> ${item.result.status}${item.result.state ? ` (${item.result.state})` : ''}`,
+    );
+  }
+  if (errors.length > 0) {
+    lines.push('Errors:');
+    for (const item of errors) {
+      lines.push(`- ${item.repo}: ${item.error}`);
+    }
+  }
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+async function cmdTodoistSync(settings, flags) {
+  const enabled = settings.todoist.enabled !== false;
+  if (!enabled) {
+    throw new Error('todoist integration disabled in config.');
+  }
+
+  const syncToLinear = !Boolean(flags['no-linear']) && Boolean(settings.todoist.syncToLinear !== false);
+  let apiToken = String(flags.token || settings.todoist.apiToken || '').trim();
+  if (!apiToken) {
+    apiToken = await extractTodoistTokenFromBrowser('openclaw');
+    if (apiToken) {
+      persistControlCenterValue(['todoist', 'apiToken'], apiToken);
+      settings.todoist.apiToken = apiToken;
+    }
+  }
+  if (!apiToken) {
+    throw new Error('Todoist token not found. Keep Todoist tab logged in or set TODOIST_API_TOKEN.');
+  }
+
+  const maxItems = Boolean(flags.all) ? Number.POSITIVE_INFINITY : Math.max(1, Number(flags.limit || 20));
+  const tasks = await fetchTodoistTasks(apiToken, Number.isFinite(maxItems) ? maxItems : 200);
+  const selectedTasks = (Array.isArray(tasks) ? tasks : []).slice(0, maxItems);
+  const mapping = readJsonFile(TODOIST_SYNC_PATH, { version: 1, items: {} });
+  const items = mapping.items || {};
+  const created = [];
+  const skipped = [];
+
+  for (const task of selectedTasks) {
+    const key = String(task.id || '');
+    if (!key) {
+      continue;
+    }
+
+    const existing = items[key];
+    if (existing && existing.linearIssueId) {
+      skipped.push({ todoistId: key, reason: 'already-synced', linearIdentifier: existing.linearIdentifier });
+      continue;
+    }
+
+    if (!syncToLinear) {
+      items[key] = {
+        todoistId: key,
+        content: task.content || '',
+        updatedAt: task.updated_at || '',
+        syncedAtMs: Date.now(),
+        linearIssueId: '',
+        linearIdentifier: '',
+      };
+      skipped.push({ todoistId: key, reason: 'linear-disabled' });
+      continue;
+    }
+
+    const issue = await createTriageIssueFromInput(
+      {
+        title: `[Todoist] ${singleLine(String(task.content || 'Untitled task'))}`,
+        description: [
+          `Todoist task id: ${key}`,
+          `projectId: ${task.project_id || '-'}`,
+          `priority: ${task.priority || '-'}`,
+          `due: ${task.due && task.due.date ? task.due.date : '-'}`,
+          task.description ? `description:\n${task.description}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n'),
+        source: 'todoist',
+        state: String(settings.todoist.defaultState || 'Triage'),
+        labels: [String(settings.todoist.label || 'todoist')],
+        dueDate: task.due && task.due.date ? String(task.due.date) : '',
+        priority: mapTodoistPriorityToLinear(task.priority),
+      },
+      settings,
+    );
+
+    items[key] = {
+      todoistId: key,
+      content: task.content || '',
+      updatedAt: task.updated_at || '',
+      syncedAtMs: Date.now(),
+      linearIssueId: issue.id,
+      linearIdentifier: issue.identifier,
+      linearUrl: issue.url || '',
+    };
+    created.push({
+      todoistId: key,
+      content: task.content || '',
+      linearIdentifier: issue.identifier,
+      linearUrl: issue.url || '',
+    });
+  }
+
+  writeJsonFile(TODOIST_SYNC_PATH, {
+    version: 1,
+    updatedAtMs: Date.now(),
+    items,
+  });
+
+  if (flags.json) {
+    process.stdout.write(
+      `${JSON.stringify({ ok: true, totalTasks: Array.isArray(tasks) ? tasks.length : 0, processed: selectedTasks.length, created, skipped }, null, 2)}\n`,
+    );
+    return;
+  }
+
+  const lines = [];
+  lines.push('Todoist sync result:');
+  lines.push(`- fetched: ${Array.isArray(tasks) ? tasks.length : 0}`);
+  lines.push(`- processed: ${selectedTasks.length}`);
+  lines.push(`- created Linear issues: ${created.length}`);
+  lines.push(`- skipped: ${skipped.length}`);
+  for (const item of created.slice(0, 10)) {
+    lines.push(`- ${item.todoistId} -> ${item.linearIdentifier}`);
+  }
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+async function cmdCalendarSync(settings, flags) {
+  if (settings.calendar.enabled === false) {
+    throw new Error('calendar integration disabled in config.');
+  }
+
+  const profile = String(flags.profile || settings.calendar.browserProfile || 'openclaw').trim();
+  const tabHint = String(flags.hint || settings.calendar.tabHint || 'calendar.google.com').trim();
+  const tabs = listBrowserTabs(profile);
+  const tab = tabs.find((item) => String(item.url || '').includes(tabHint));
+  if (!tab) {
+    throw new Error(`Google Calendar tab not found in profile=${profile}.`);
+  }
+
+  const result = openclawBrowserEvaluate(
+    profile,
+    tab.targetId,
+    "() => Array.from(document.querySelectorAll('[data-eventid]')).map((el) => ({id: el.getAttribute('data-eventid') || '', text: (el.textContent||'').replace(/\\s+/g,' ').trim(), className: el.className || ''})).filter((x) => x.id && x.text).slice(0, 500)",
+  );
+  const rows = Array.isArray(result) ? result : [];
+  const seen = new Set();
+  const events = [];
+  for (const item of rows) {
+    const id = String(item.id || '').trim();
+    const text = singleLine(String(item.text || ''));
+    if (!id || !text) {
+      continue;
+    }
+    if (text.length < 3) {
+      continue;
+    }
+    const key = `${id}:${text}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    events.push({ id, text });
+  }
+
+  const snapshot = {
+    updatedAtMs: Date.now(),
+    profile,
+    tabId: tab.targetId,
+    url: tab.url,
+    eventCount: events.length,
+    events: events.slice(0, 200),
+  };
+  writeJsonFile(CALENDAR_SYNC_PATH, snapshot);
+
+  const toLinear = Boolean(flags['to-linear'] || settings.calendar.syncToLinear);
+  const created = [];
+  if (toLinear) {
+    const mapping = readJsonFile(CALENDAR_SYNC_PATH.replace('.json', '-linear.json'), { items: {} });
+    const items = mapping.items || {};
+    for (const event of events.slice(0, 100)) {
+      const key = event.id;
+      if (items[key] && items[key].linearIssueId) {
+        continue;
+      }
+      const issue = await createTriageIssueFromInput(
+        {
+          title: `[Calendar] ${trimMessage(event.text, 120)}`,
+          description: `Google Calendar event snapshot\nid: ${event.id}\nsource: ${tab.url}`,
+          source: 'google-calendar',
+          labels: [String(settings.calendar.label || 'calendar')],
+          state: String(settings.calendar.defaultState || 'Triage'),
+          priority: 3,
+        },
+        settings,
+      );
+      items[key] = {
+        id: key,
+        text: event.text,
+        linearIssueId: issue.id,
+        linearIdentifier: issue.identifier,
+        syncedAtMs: Date.now(),
+      };
+      created.push({ id: key, linearIdentifier: issue.identifier });
+    }
+    writeJsonFile(CALENDAR_SYNC_PATH.replace('.json', '-linear.json'), { updatedAtMs: Date.now(), items });
+  }
+
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify({ ok: true, snapshot, created }, null, 2)}\n`);
+    return;
+  }
+
+  const lines = [];
+  lines.push('Calendar sync result:');
+  lines.push(`- profile: ${profile}`);
+  lines.push(`- tab: ${tab.url}`);
+  lines.push(`- events captured: ${events.length}`);
+  lines.push(`- toLinear created: ${created.length}`);
+  for (const event of events.slice(0, 8)) {
+    lines.push(`- ${trimMessage(event.text, 120)}`);
+  }
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+function resolveGithubRepos(settings, flags) {
+  const fromFlag = []
+    .concat(flags.repo ? [flags.repo] : [])
+    .concat(flags.repos ? String(flags.repos).split(',') : [])
+    .map((item) => String(item).trim())
+    .filter(Boolean)
+    .map(normalizeGithubRepo)
+    .filter(Boolean);
+  if (fromFlag.length > 0) {
+    return dedupeStrings(fromFlag);
+  }
+
+  const fromConfig = Array.isArray(settings.github.repos)
+    ? settings.github.repos.map((item) => normalizeGithubRepo(item)).filter(Boolean)
+    : [];
+  if (fromConfig.length > 0) {
+    return dedupeStrings(fromConfig);
+  }
+
+  const candidates = [
+    path.resolve(ROOT_DIR, '..'),
+    ROOT_DIR,
+  ];
+  const auto = [];
+  for (const repoPath of candidates) {
+    const remote = getGitRemote(repoPath);
+    if (!remote) {
+      continue;
+    }
+    const normalized = normalizeGithubRepo(remote);
+    if (normalized) {
+      auto.push(normalized);
+    }
+  }
+  return dedupeStrings(auto);
+}
+
+async function createTriageIssueFromInput(input, settings) {
+  const apiKey = String(settings.linear.apiKey || '').trim();
+  if (!apiKey) {
+    throw new Error('LINEAR_API_KEY is required to create triage issues.');
+  }
+
+  const teamId = settings.linear.teamId || (await resolveLinearTeamId(apiKey, settings.linear.teamKey));
+  if (!teamId) {
+    throw new Error('Unable to resolve Linear team id for triage.');
+  }
+
+  const stateName = String(input.state || 'Triage').trim();
+  const stateId = await resolveLinearStateId(apiKey, teamId, stateName);
+  if (!stateId) {
+    throw new Error(`Linear state not found: ${stateName}`);
+  }
+
+  const title = buildTriageTitle(input);
+  if (!title) {
+    throw new Error('triage requires --title or --text.');
+  }
+
+  const description = buildTriageDescription(input);
+  const labelIds = await resolveLinearLabelIds(
+    apiKey,
+    teamId,
+    Array.isArray(input.labels) ? input.labels : [],
+    true,
+  );
+
+  const payload = await linearRequest(
+    apiKey,
+    `mutation CreateIssue($input: IssueCreateInput!) {
+      issueCreate(input: $input) {
+        success
+        issue {
+          id
+          identifier
+          title
+          url
+          state { id name }
+          labels { nodes { id name } }
+        }
+      }
+    }`,
+    {
+      input: {
+        teamId,
+        stateId,
+        title,
+        description,
+        priority: Number.isFinite(Number(input.priority)) ? Number(input.priority) : 3,
+        labelIds: labelIds.length > 0 ? labelIds : undefined,
+        projectId: settings.linear.projectId || undefined,
+        dueDate: input.dueDate || undefined,
+      },
+    },
+  );
+
+  const issue = payload && payload.issueCreate ? payload.issueCreate.issue : null;
+  if (!issue) {
+    throw new Error('Linear issueCreate returned no issue.');
+  }
+
+  return {
+    id: issue.id,
+    identifier: issue.identifier,
+    title: issue.title,
+    url: issue.url,
+    stateName: issue.state ? issue.state.name : '',
+    labels: (((issue.labels || {}).nodes || []).map((item) => item.name)).filter(Boolean),
+  };
+}
+
+function buildTriageTitle(input) {
+  const title = String(input.title || '').trim();
+  if (title) {
+    return title;
+  }
+
+  const raw = String(input.rawText || '').trim();
+  if (!raw) {
+    return '';
+  }
+  const oneLine = singleLine(raw);
+  return oneLine.length > 120 ? `${oneLine.slice(0, 117)}...` : oneLine;
+}
+
+function buildTriageDescription(input) {
+  const blocks = [];
+  const base = String(input.description || '').trim();
+  if (base) {
+    blocks.push(base);
+  }
+
+  const meta = [];
+  if (input.source) {
+    meta.push(`- source: ${singleLine(String(input.source))}`);
+  }
+  if (input.author) {
+    meta.push(`- author: ${singleLine(String(input.author))}`);
+  }
+  if (input.sourceUrl) {
+    meta.push(`- link: ${String(input.sourceUrl).trim()}`);
+  }
+  if (meta.length > 0) {
+    blocks.push(['## Intake metadata', ...meta].join('\n'));
+  }
+
+  const raw = String(input.rawText || '').trim();
+  if (raw) {
+    blocks.push(['## Raw input', '```text', trimMessage(raw, 3000), '```'].join('\n'));
+  }
+
+  return blocks.join('\n\n').trim();
+}
+
+async function fetchDueSoonIssues(apiKey, teamId, dueDays) {
+  const windowText = `P${Math.max(1, Number(dueDays || 7))}D`;
+  const payload = await linearRequest(
+    apiKey,
+    `query DueSoon($teamId: ID!, $window: TimelessDateOrDuration!) {
+      issues(
+        first: 100
+        filter: {
+          team: { id: { eq: $teamId } }
+          dueDate: { gte: "P0D", lte: $window }
+          state: { type: { nin: ["completed", "canceled"] } }
+        }
+      ) {
+        nodes {
+          id
+          identifier
+          title
+          url
+          dueDate
+          priority
+          state { name type }
+          assignee { name }
+        }
+      }
+    }`,
+    { teamId, window: windowText },
+  );
+
+  const nodes = (((payload || {}).issues || {}).nodes || []).filter(Boolean);
+  return nodes
+    .sort((a, b) => {
+      const aDue = String(a.dueDate || '9999-99-99');
+      const bDue = String(b.dueDate || '9999-99-99');
+      if (aDue === bDue) {
+        return Number(b.priority || 0) - Number(a.priority || 0);
+      }
+      return aDue.localeCompare(bDue);
+    })
+    .slice(0, 25);
+}
+
+async function fetchCurrentCycleIssues(apiKey, teamId) {
+  const payload = await linearRequest(
+    apiKey,
+    `query CurrentCycle($teamId: ID!) {
+      issues(
+        first: 200
+        filter: {
+          team: { id: { eq: $teamId } }
+          cycle: { isActive: { eq: true } }
+          state: { type: { nin: ["completed", "canceled"] } }
+        }
+      ) {
+        nodes {
+          id
+          identifier
+          title
+          url
+          priority
+          state { id name type }
+          assignee { name }
+          cycle { id name number endsAt }
+        }
+      }
+    }`,
+    { teamId },
+  );
+
+  const nodes = (((payload || {}).issues || {}).nodes || []).filter(Boolean);
+  return nodes.sort(
+    (a, b) =>
+      Number(b.priority || 0) - Number(a.priority || 0) ||
+      String(a.identifier || '').localeCompare(String(b.identifier || '')),
+  );
+}
+
+function renderReminder(data, settings) {
+  const lines = [];
+  lines.push(`# Linear Reminder (${formatTime(data.generatedAtMs, settings.timezone)})`);
+  lines.push('');
+
+  if (data.mode === 'all' || data.mode === 'due') {
+    lines.push(`## Due Soon (next ${data.dueDays} days)`);
+    if (!data.due || data.due.length === 0) {
+      lines.push('- none');
+    } else {
+      lines.push(`- total open: ${data.due.length}`);
+      for (const issue of data.due.slice(0, 10)) {
+        lines.push(
+          `- ${issue.identifier} [${issue.state ? issue.state.name : '-'}] due ${issue.dueDate || '-'}: ${singleLine(issue.title)}`,
+        );
+      }
+    }
+    lines.push('');
+  }
+
+  if (data.mode === 'all' || data.mode === 'cycle') {
+    const cycleIssues = Array.isArray(data.cycle) ? data.cycle : [];
+    const cycle = cycleIssues.find((item) => item.cycle) || null;
+    const stateCounts = {};
+    for (const issue of cycleIssues) {
+      const key = issue && issue.state && issue.state.name ? issue.state.name : 'Unknown';
+      stateCounts[key] = (stateCounts[key] || 0) + 1;
+    }
+
+    lines.push('## Current Cycle');
+    if (cycle && cycle.cycle) {
+      lines.push(
+        `- ${cycle.cycle.name || `Cycle ${cycle.cycle.number || '?'}`} (ends ${cycle.cycle.endsAt || '-'})`,
+      );
+    }
+    lines.push(`- open issues: ${cycleIssues.length}`);
+    for (const [stateName, count] of Object.entries(stateCounts).sort((a, b) => b[1] - a[1])) {
+      lines.push(`- ${stateName}: ${count}`);
+    }
+    if (cycleIssues.length > 0) {
+      lines.push('- top focus:');
+      for (const issue of cycleIssues.slice(0, 8)) {
+        lines.push(
+          `  - ${issue.identifier} [${issue.state ? issue.state.name : '-'}] ${singleLine(issue.title)}`,
+        );
+      }
+    }
+    lines.push('');
+  }
+
+  lines.push('## Next Actions');
+  lines.push('1. Pull one Blocked item into owner discussion and unblock within 24h.');
+  lines.push('2. Close or re-scope stale In Progress items before adding new scope.');
+
+  return lines.join('\n');
+}
+
+async function resolveLinearStateId(apiKey, teamId, stateName) {
+  const payload = await linearRequest(
+    apiKey,
+    `query TeamStates($teamId: String!) {
+      team(id: $teamId) {
+        id
+        states { nodes { id name type } }
+      }
+    }`,
+    { teamId },
+  );
+
+  const nodes = (((payload || {}).team || {}).states || {}).nodes || [];
+  const wanted = String(stateName || '').trim().toLowerCase();
+  const exact = nodes.find((item) => String(item.name || '').trim().toLowerCase() === wanted);
+  return exact ? String(exact.id) : '';
+}
+
+async function resolveLinearLabelIds(apiKey, teamId, labels, createMissing) {
+  const wanted = normalizeLabelNames(labels);
+  if (wanted.length === 0) {
+    return [];
+  }
+
+  const payload = await linearRequest(
+    apiKey,
+    `query TeamLabels($teamId: String!) {
+      team(id: $teamId) {
+        id
+        labels(first: 250) { nodes { id name } }
+      }
+    }`,
+    { teamId },
+  );
+
+  const nodes = ((((payload || {}).team || {}).labels || {}).nodes || []).filter(Boolean);
+  const byName = new Map(nodes.map((item) => [String(item.name || '').trim().toLowerCase(), item]));
+  const labelIds = [];
+
+  for (const name of wanted) {
+    const key = name.toLowerCase();
+    let node = byName.get(key);
+    if (!node && createMissing) {
+      node = await createLinearLabel(apiKey, teamId, name);
+      if (node) {
+        byName.set(key, node);
+      }
+    }
+    if (node) {
+      labelIds.push(String(node.id));
+    }
+  }
+
+  return dedupeStrings(labelIds);
+}
+
+async function createLinearLabel(apiKey, teamId, name) {
+  const payload = await linearRequest(
+    apiKey,
+    `mutation CreateLabel($input: IssueLabelCreateInput!) {
+      issueLabelCreate(input: $input) {
+        success
+        issueLabel { id name }
+      }
+    }`,
+    { input: { teamId, name } },
+  );
+
+  const node = payload && payload.issueLabelCreate ? payload.issueLabelCreate.issueLabel : null;
+  if (!node) {
+    return null;
+  }
+  return {
+    id: node.id,
+    name: node.name,
+  };
+}
+
+async function resolveLinearIssueByIdentifier(apiKey, identifier, fallbackTeamKey) {
+  const normalized = String(identifier || '').trim().toUpperCase();
+  const match = normalized.match(/^([A-Z][A-Z0-9]+)-(\d+)$/);
+  if (!match) {
+    return null;
+  }
+
+  const teamKey = match[1];
+  const issueNumber = Number(match[2]);
+
+  const payload = await linearRequest(
+    apiKey,
+    `query FindIssue($teamKey: String!, $number: Float!) {
+      issues(
+        first: 1
+        filter: {
+          team: { key: { eqIgnoreCase: $teamKey } }
+          number: { eq: $number }
+        }
+      ) {
+        nodes {
+          id
+          identifier
+          title
+          url
+          number
+          team { id key name }
+          state { id name type }
+        }
+      }
+    }`,
+    { teamKey, number: issueNumber },
+  );
+
+  const primary = (((payload || {}).issues || {}).nodes || [])[0];
+  if (primary) {
+    return primary;
+  }
+
+  if (fallbackTeamKey && String(fallbackTeamKey).toUpperCase() !== teamKey) {
+    const fallbackPayload = await linearRequest(
+      apiKey,
+      `query FindIssueFallback($teamKey: String!, $number: Float!) {
+        issues(
+          first: 1
+          filter: {
+            team: { key: { eqIgnoreCase: $teamKey } }
+            number: { eq: $number }
+          }
+        ) {
+          nodes {
+            id
+            identifier
+            title
+            url
+            number
+            team { id key name }
+            state { id name type }
+          }
+        }
+      }`,
+      { teamKey: String(fallbackTeamKey), number: issueNumber },
+    );
+    return ((((fallbackPayload || {}).issues || {}).nodes || [])[0]) || null;
+  }
+
+  return null;
+}
+
+async function transitionIssueByIdentifier(identifier, targetStateName, settings) {
+  const apiKey = String(settings.linear.apiKey || '').trim();
+  if (!apiKey) {
+    throw new Error('LINEAR_API_KEY is required for GitHub->Linear transitions.');
+  }
+
+  const issue = await resolveLinearIssueByIdentifier(apiKey, identifier, settings.linear.teamKey);
+  if (!issue) {
+    return { identifier, status: 'not_found' };
+  }
+
+  const currentState = issue.state ? String(issue.state.name || '') : '';
+  if (currentState.trim().toLowerCase() === String(targetStateName || '').trim().toLowerCase()) {
+    return { identifier: issue.identifier, status: 'unchanged', state: currentState, url: issue.url };
+  }
+
+  const stateId = await resolveLinearStateId(apiKey, issue.team.id, targetStateName);
+  if (!stateId) {
+    return { identifier: issue.identifier, status: 'state_not_found', targetStateName };
+  }
+
+  const payload = await linearRequest(
+    apiKey,
+    `mutation MoveIssue($id: String!, $input: IssueUpdateInput!) {
+      issueUpdate(id: $id, input: $input) {
+        success
+        issue {
+          id
+          identifier
+          url
+          state { id name }
+        }
+      }
+    }`,
+    {
+      id: issue.id,
+      input: {
+        stateId,
+      },
+    },
+  );
+
+  const moved = payload && payload.issueUpdate ? payload.issueUpdate.issue : null;
+  return {
+    identifier: moved ? moved.identifier : issue.identifier,
+    status: moved ? 'updated' : 'unknown',
+    state: moved && moved.state ? moved.state.name : targetStateName,
+    url: moved ? moved.url : issue.url,
+  };
+}
+
+function extractLinearIssueIds(...inputs) {
+  const set = new Set();
+  const pattern = /\b[A-Z][A-Z0-9]+-\d+\b/g;
+  for (const input of inputs) {
+    const text = String(input || '').toUpperCase();
+    const matches = text.match(pattern) || [];
+    for (const id of matches) {
+      set.add(id);
+    }
+  }
+  return Array.from(set.values());
+}
+
+async function handleGithubPullRequestEvent(eventName, payload, settings) {
+  if (eventName !== 'pull_request') {
+    return { handled: false, reason: `ignored_event_${eventName}` };
+  }
+
+  const action = String((payload && payload.action) || '').toLowerCase();
+  const pr = payload && payload.pull_request ? payload.pull_request : null;
+  if (!pr) {
+    return { handled: false, reason: 'missing_pull_request_payload' };
+  }
+
+  let targetStateName = '';
+  if (['opened', 'reopened', 'ready_for_review', 'review_requested'].includes(action)) {
+    targetStateName = String(settings.github.stateInReview || 'In Review');
+  } else if (action === 'closed' && Boolean(pr.merged)) {
+    targetStateName = String(settings.github.stateDone || 'Done');
+  } else {
+    return { handled: false, reason: `ignored_action_${action}` };
+  }
+
+  const identifiers = extractLinearIssueIds(
+    pr.title,
+    pr.body,
+    pr && pr.head ? pr.head.ref : '',
+    pr && pr.base ? pr.base.ref : '',
+  );
+
+  if (identifiers.length === 0) {
+    return { handled: false, reason: 'no_linear_ids_found' };
+  }
+
+  const updates = [];
+  for (const identifier of identifiers) {
+    const result = await transitionIssueByIdentifier(identifier, targetStateName, settings);
+    updates.push(result);
+  }
+
+  return {
+    handled: true,
+    action,
+    targetStateName,
+    identifiers,
+    updates,
+  };
+}
+
+function verifyGithubSignature(req, rawBody, secret) {
+  const signatureHeader = String(req.headers['x-hub-signature-256'] || '').trim();
+  if (!signatureHeader.startsWith('sha256=')) {
+    return false;
+  }
+  const providedHex = signatureHeader.slice('sha256='.length);
+  const expectedHex = crypto
+    .createHmac('sha256', secret)
+    .update(rawBody.raw)
+    .digest('hex');
+
+  const provided = Buffer.from(providedHex, 'hex');
+  const expected = Buffer.from(expectedHex, 'hex');
+  if (provided.length !== expected.length || provided.length === 0) {
+    return false;
+  }
+  return crypto.timingSafeEqual(provided, expected);
+}
+
+function readJsonBody(req, maxBodyBytes, returnRaw = false) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+
+    req.on('data', (chunk) => {
+      total += chunk.length;
+      if (total > maxBodyBytes) {
+        reject(new Error(`request body too large (${total} bytes)`));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (!raw.trim()) {
+        resolve(returnRaw ? { raw, parsed: {} } : {});
+        return;
+      }
+      try {
+        const parsed = JSON.parse(raw);
+        resolve(returnRaw ? { raw, parsed } : parsed);
+      } catch (error) {
+        reject(new Error(`invalid JSON body: ${String(error)}`));
+      }
+    });
+
+    req.on('error', reject);
+  });
+}
+
+function sendJson(res, statusCode, payload) {
+  res.statusCode = statusCode;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.end(`${JSON.stringify(payload)}\n`);
+}
+
+function normalizeLabelNames(value) {
+  if (Array.isArray(value)) {
+    return dedupeStrings(
+      value
+        .map((item) => String(item || '').trim())
+        .filter(Boolean)
+        .map((item) => item.toLowerCase()),
+    );
+  }
+  const raw = String(value || '').trim();
+  if (!raw) {
+    return [];
+  }
+  return dedupeStrings(
+    raw
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .map((item) => item.toLowerCase()),
+  );
+}
+
+function installLinearGitHooks(repoPath, teamKey) {
+  const gitDirOutput = runCommand('git', ['-C', repoPath, 'rev-parse', '--git-dir']);
+  const gitDir = path.resolve(repoPath, String(gitDirOutput.stdout || '.git').trim());
+  const hooksDir = path.join(gitDir, 'hooks');
+  ensureDir(hooksDir);
+
+  const prepareCommitMsgPath = path.join(hooksDir, 'prepare-commit-msg');
+  const commitMsgPath = path.join(hooksDir, 'commit-msg');
+
+  const prepareScript = `#!/bin/sh
+set -eu
+MSG_FILE="$1"
+if [ -z "\${MSG_FILE:-}" ] || [ ! -f "$MSG_FILE" ]; then
+  exit 0
+fi
+BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+if [ -z "$BRANCH" ]; then
+  exit 0
+fi
+ISSUE="$(printf '%s' "$BRANCH" | grep -Eo '[A-Z][A-Z0-9]+-[0-9]+' | head -n1 || true)"
+if [ -z "$ISSUE" ]; then
+  exit 0
+fi
+if grep -Eq "\\b$ISSUE\\b" "$MSG_FILE"; then
+  exit 0
+fi
+TMP_FILE="$(mktemp)"
+{
+  IFS= read -r FIRST_LINE || true
+  if [ -n "$FIRST_LINE" ]; then
+    printf '%s %s\\n' "$ISSUE" "$FIRST_LINE"
+  else
+    printf '%s\\n' "$ISSUE"
+  fi
+  cat
+} < "$MSG_FILE" > "$TMP_FILE"
+mv "$TMP_FILE" "$MSG_FILE"
+`;
+
+  const commitScript = `#!/bin/sh
+set -eu
+MSG_FILE="$1"
+if [ -z "\${MSG_FILE:-}" ] || [ ! -f "$MSG_FILE" ]; then
+  exit 0
+fi
+BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+case "$BRANCH" in
+  ""|main|master)
+    exit 0
+    ;;
+esac
+BRANCH_ISSUE="$(printf '%s' "$BRANCH" | grep -Eo '\\b${teamKey}-[0-9]+\\b' | head -n1 || true)"
+if [ -z "$BRANCH_ISSUE" ]; then
+  BRANCH_ISSUE="$(printf '%s' "$BRANCH" | grep -Eo '\\b[A-Z][A-Z0-9]+-[0-9]+\\b' | head -n1 || true)"
+fi
+if [ -z "$BRANCH_ISSUE" ]; then
+  echo 'ERROR: branch name must include Linear ID (e.g. feature/${teamKey}-123-short-title).' >&2
+  exit 1
+fi
+if ! grep -Eq "\\b[A-Z][A-Z0-9]+-[0-9]+\\b" "$MSG_FILE"; then
+  echo "ERROR: commit message must include Linear ID (expected $BRANCH_ISSUE)." >&2
+  exit 1
+fi
+if ! grep -Eq "\\b$BRANCH_ISSUE\\b" "$MSG_FILE"; then
+  echo "ERROR: commit message should contain branch Linear ID: $BRANCH_ISSUE" >&2
+  exit 1
+fi
+`;
+
+  fs.writeFileSync(prepareCommitMsgPath, prepareScript, { mode: 0o755 });
+  fs.writeFileSync(commitMsgPath, commitScript, { mode: 0o755 });
+
+  return {
+    repoPath,
+    hooks: [prepareCommitMsgPath, commitMsgPath],
+  };
 }
 
 function collectSnapshot(settings) {
@@ -956,16 +2406,210 @@ async function linearRequest(apiKey, query, variables) {
     body: JSON.stringify({ query, variables }),
   });
 
-  if (!response.ok) {
-    throw new Error(`Linear API HTTP ${response.status}`);
+  const raw = await response.text();
+  let body = null;
+  try {
+    body = raw ? JSON.parse(raw) : {};
+  } catch {
+    body = null;
   }
 
-  const body = await response.json();
-  if (body.errors && body.errors.length > 0) {
+  if (!response.ok) {
+    const detail =
+      body && Array.isArray(body.errors)
+        ? body.errors.map((item) => item.message).join('; ')
+        : trimMessage(raw, 300);
+    throw new Error(`Linear API HTTP ${response.status}${detail ? `: ${detail}` : ''}`);
+  }
+
+  if (body && body.errors && body.errors.length > 0) {
     throw new Error(`Linear API error: ${body.errors.map((item) => item.message).join('; ')}`);
   }
 
-  return body.data;
+  return body ? body.data : null;
+}
+
+async function githubApiRequest(token, endpoint) {
+  const url = `https://api.github.com${endpoint}`;
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${token}`,
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'openclaw-mission-control',
+    },
+  });
+
+  const raw = await response.text();
+  let body = null;
+  try {
+    body = raw ? JSON.parse(raw) : null;
+  } catch {
+    body = null;
+  }
+
+  if (!response.ok) {
+    const detail =
+      body && body.message ? body.message : trimMessage(raw || `HTTP ${response.status}`, 240);
+    throw new Error(`GitHub API ${response.status}: ${detail}`);
+  }
+  return body;
+}
+
+async function todoistApiRequest(apiToken, pathSuffix) {
+  const suffix = String(pathSuffix || '').startsWith('/') ? String(pathSuffix) : `/${String(pathSuffix || '')}`;
+  const url = `https://api.todoist.com/api/v1${suffix}`;
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${apiToken}`,
+      'Content-Type': 'application/json',
+      'User-Agent': 'openclaw-mission-control',
+    },
+  });
+  const raw = await response.text();
+  let body = null;
+  try {
+    body = raw ? JSON.parse(raw) : null;
+  } catch {
+    body = null;
+  }
+  if (!response.ok) {
+    const detail = body && body.error ? body.error : trimMessage(raw || `HTTP ${response.status}`, 240);
+    throw new Error(`Todoist API ${response.status}: ${detail}`);
+  }
+  return body;
+}
+
+async function fetchTodoistTasks(apiToken, limit) {
+  const wanted = Math.max(1, Number(limit || 200));
+  let cursor = '';
+  const tasks = [];
+
+  while (tasks.length < wanted) {
+    const params = new URLSearchParams();
+    params.set('limit', String(Math.min(200, wanted - tasks.length)));
+    if (cursor) {
+      params.set('cursor', cursor);
+    }
+
+    const payload = await todoistApiRequest(apiToken, `/tasks?${params.toString()}`);
+    const chunk = Array.isArray(payload && payload.results) ? payload.results : [];
+    tasks.push(...chunk);
+
+    cursor = String((payload && payload.next_cursor) || '').trim();
+    if (!cursor || chunk.length === 0) {
+      break;
+    }
+  }
+
+  return tasks.slice(0, wanted);
+}
+
+function mapTodoistPriorityToLinear(todoistPriority) {
+  const p = Number(todoistPriority || 1);
+  if (p >= 4) {
+    return 1;
+  }
+  if (p === 3) {
+    return 2;
+  }
+  if (p === 2) {
+    return 3;
+  }
+  return 4;
+}
+
+async function extractTodoistTokenFromBrowser(profile) {
+  const tabs = listBrowserTabs(profile);
+  const tab = tabs.find((item) => String(item.url || '').includes('app.todoist.com'));
+  if (!tab) {
+    return '';
+  }
+
+  const result = openclawBrowserEvaluate(
+    profile,
+    tab.targetId,
+    "() => { try { const u = JSON.parse(localStorage.getItem('User') || '{}'); return u.token || ''; } catch { return ''; } }",
+  );
+  return String(result || '').trim();
+}
+
+function persistControlCenterValue(pathKeys, value) {
+  const keys = Array.isArray(pathKeys) ? pathKeys.map((item) => String(item)) : [String(pathKeys)];
+  if (keys.length === 0) {
+    return;
+  }
+
+  const config = readJsonFile(CONFIG_PATH, {});
+  let cursor = config;
+  for (let i = 0; i < keys.length - 1; i += 1) {
+    const key = keys[i];
+    if (!cursor[key] || typeof cursor[key] !== 'object') {
+      cursor[key] = {};
+    }
+    cursor = cursor[key];
+  }
+  cursor[keys[keys.length - 1]] = value;
+  writeJsonFile(CONFIG_PATH, config);
+}
+
+function listBrowserTabs(profile) {
+  try {
+    const payload = runOpenclawJson(['browser', '--browser-profile', profile, 'tabs', '--json']);
+    return Array.isArray(payload.tabs) ? payload.tabs : [];
+  } catch {
+    return [];
+  }
+}
+
+function openclawBrowserEvaluate(profile, targetId, fnCode) {
+  const output = runCommand('openclaw', [
+    'browser',
+    '--browser-profile',
+    profile,
+    'evaluate',
+    '--target-id',
+    String(targetId),
+    '--fn',
+    String(fnCode),
+    '--json',
+  ]);
+  const payload = extractJson(output.stdout || '');
+  if (!payload || payload.ok !== true) {
+    throw new Error(`browser evaluate failed for target ${targetId}`);
+  }
+  return payload.result;
+}
+
+function normalizeGithubRepo(value) {
+  const text = String(value || '').trim();
+  if (!text) {
+    return '';
+  }
+  if (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(text)) {
+    return text;
+  }
+
+  const ssh = text.match(/^git@github\.com:([^/]+)\/([^/.]+)(?:\.git)?$/i);
+  if (ssh) {
+    return `${ssh[1]}/${ssh[2]}`;
+  }
+  const https = text.match(/^https?:\/\/github\.com\/([^/]+)\/([^/.]+)(?:\.git)?$/i);
+  if (https) {
+    return `${https[1]}/${https[2]}`;
+  }
+  return '';
+}
+
+function getGitRemote(repoPath) {
+  try {
+    const out = runCommand('git', ['-C', repoPath, 'remote', 'get-url', 'origin']);
+    return String(out.stdout || '').trim();
+  } catch {
+    return '';
+  }
 }
 
 function loadCronJobs(settings) {
@@ -1472,6 +3116,14 @@ function readJsonFile(filePath, fallback) {
   }
 }
 
+function readFileTrim(filePath) {
+  try {
+    return fs.readFileSync(filePath, 'utf8').trim();
+  } catch {
+    return '';
+  }
+}
+
 function writeJsonFile(filePath, value) {
   ensureDir(path.dirname(filePath));
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
@@ -1515,6 +3167,21 @@ function shellQuote(value) {
 
 function joinShell(parts) {
   return parts.map((part) => shellQuote(part)).join(' ');
+}
+
+function cronEveryMinutesExpr(value) {
+  const minutes = Number(value);
+  if (!Number.isFinite(minutes) || minutes <= 0) {
+    return '';
+  }
+  if (minutes >= 60) {
+    const hourStep = Math.max(1, Math.floor(minutes / 60));
+    if (hourStep === 1) {
+      return `0 * * * *`;
+    }
+    return `0 */${hourStep} * * *`;
+  }
+  return `*/${Math.max(1, Math.floor(minutes))} * * * *`;
 }
 
 function readCrontab() {

@@ -2,6 +2,10 @@
 
 Local-first Next.js dashboard + CLI control center for OpenClaw operations.
 
+Tracking page for ongoing OpenClaw development projects:
+
+- `OPENCLAW_DEV_PROJECT_TRACKING.md`
+
 ## What this includes
 
 ### Dashboard (existing MVP)
@@ -20,19 +24,46 @@ Local-first Next.js dashboard + CLI control center for OpenClaw operations.
 - `tasks agents`: list backend subagents (`label/status/start/elapsed`)
 - `tasks report`: runtime health report with Top 5 anomalies + human actions
 - `tasks watchdog`: incident loop for cron failures/timeout/silence, with optional Linear auto issue creation
+- `tasks triage`: external input to Linear Triage issue
+- `tasks remind`: due-soon + current-cycle reminders
+- `tasks ingest-server`: webhook intake (`/triage`) + GitHub PR state sync (`/github/pr`)
+- `tasks github-hooks`: install git hooks to enforce/add Linear ID in branch/commit
+- `tasks github-sync`: poll GitHub PRs and sync Linear state (In Review/Done) without webhook dependency
+- `tasks todoist-sync`: pull Todoist tasks and create Linear triage issues
+- `tasks calendar-sync`: capture Google Calendar events from logged-in browser tab
 - `tasks run|enable|disable|kill`: control actions with one-time confirmation token
 - `tasks schedule`: generate/install crontab for:
   - Daily report at `09:00` and `18:00`
   - Watchdog every `5` minutes
+  - Due-soon reminder daily + cycle reminder weekly
 
 ## Quick start
 
 ```bash
 npm install
-npm run dev
+npm run control:start
 ```
 
 Open `http://localhost:3000`.
+
+`control:start` startup flow:
+
+- auto-sync Linear SoT for team `openclaw` (`scripts/linear_sot_setup.py --apply`)
+- auto-verify Linear SoT (`scripts/linear_sot_verify.py`)
+- then start Next.js dev server
+
+If you want only the dashboard without Linear bootstrap:
+
+```bash
+npm run dev
+```
+
+If you want only Linear sync/verify:
+
+```bash
+npm run linear:sync
+npm run linear:verify
+```
 
 ## CLI usage
 
@@ -57,6 +88,27 @@ npm run tasks -- watchdog
 
 # Watchdog + auto-create Linear issues
 npm run tasks -- watchdog --auto-linear
+
+# One-line intake -> Linear Triage
+npm run tasks -- triage --title "Fix Discord manual model switch" --source discord --labels needs-spec
+
+# Reminder report from Linear
+npm run tasks -- remind all --send
+
+# Start webhook server for external systems
+npm run tasks -- ingest-server --port 8788
+
+# Install git hooks (branch/commit must contain Linear ID)
+npm run tasks -- github-hooks --repo /Users/yizhi/.openclaw/workspace
+
+# Poll GitHub PRs -> Linear state sync
+npm run tasks -- github-sync
+
+# Todoist -> Linear triage sync
+npm run tasks -- todoist-sync
+
+# Google Calendar snapshot sync (requires logged-in tab in openclaw browser profile)
+npm run tasks -- calendar-sync
 ```
 
 ## API response contract
@@ -120,7 +172,19 @@ npm run tasks -- schedule --apply
 Install with report push target:
 
 ```bash
-npm run tasks -- schedule --apply --channel discord --target channel:1468117725040742527
+npm run tasks -- schedule --apply --channel discord --target channel:123456789012345678
+```
+
+Disable reminder cron lines:
+
+```bash
+npm run tasks -- schedule --without-reminders
+```
+
+Disable integration poll lines:
+
+```bash
+npm run tasks -- schedule --github-poll-minutes 0 --todoist-poll-minutes 0 --calendar-poll-minutes 0
 ```
 
 ## Linear integration
@@ -129,7 +193,7 @@ Set env vars before running watchdog auto-create:
 
 ```bash
 export LINEAR_API_KEY="lin_api_..."
-export LINEAR_TEAM_KEY="OPS"
+export LINEAR_TEAM_KEY="CLAW"
 # optional
 export LINEAR_TEAM_ID=""
 export LINEAR_PROJECT_ID=""
@@ -154,6 +218,76 @@ Issue body includes:
 - run log location (`~/.openclaw/cron/runs/<jobId>.jsonl`)
 - suggested fix steps
 
+### External intake (Discord / forms / mail / Notion / Todoist)
+
+Start webhook server:
+
+```bash
+npm run tasks -- ingest-server --port 8788
+```
+
+Create triage issue via webhook:
+
+```bash
+curl -X POST "http://127.0.0.1:8788/triage" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "source":"discord",
+    "title":"修复 Discord 手动切模型不可切换",
+    "description":"主代理任务反馈",
+    "labels":["needs-spec","urgent"],
+    "url":"https://discord.com/channels/..."
+  }'
+```
+
+### GitHub -> Linear state sync
+
+`/github/pr` endpoint supports GitHub `pull_request` webhook:
+
+- PR opened/reopened/ready_for_review/review_requested -> move issue to `In Review`
+- PR merged -> move issue to `Done`
+
+Linear ID is extracted from PR title/body/branch, for example `CLAW-123`.
+
+You can secure webhook with:
+
+```bash
+export GITHUB_WEBHOOK_SECRET="your_secret"
+```
+
+If webhook can not reach localhost, use polling mode:
+
+```bash
+npm run tasks -- github-sync
+```
+
+`github.token` will auto-read from `~/.openclaw/credentials/github-token.txt` when available.
+
+### Todoist -> Linear sync
+
+Todoist token can be provided by env/config:
+
+```bash
+export TODOIST_API_TOKEN="..."
+npm run tasks -- todoist-sync
+```
+
+If token is not set, CLI tries to extract it from a logged-in Todoist tab in `openclaw` browser profile and persists to local `config/control-center.json`.
+
+### Google Calendar sync
+
+Capture events from current logged-in Google Calendar tab (browser profile `openclaw`):
+
+```bash
+npm run tasks -- calendar-sync
+```
+
+Optional: create Linear triage issues from captured events:
+
+```bash
+npm run tasks -- calendar-sync --to-linear
+```
+
 ## Config
 
 Copy template and edit:
@@ -169,6 +303,11 @@ Fields:
 - `control.killWhitelist`
 - `watchdog.*`
 - `linear.*`
+- `ingest.*`
+- `reminders.*`
+- `github.*`
+- `todoist.*`
+- `calendar.*`
 
 ## Storage files
 
