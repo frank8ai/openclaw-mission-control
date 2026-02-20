@@ -20,7 +20,10 @@
     "tasks:github-hooks": "node ./scripts/tasks.js github-hooks",
     "tasks:github-sync": "node ./scripts/tasks.js github-sync",
     "tasks:todoist-sync": "node ./scripts/tasks.js todoist-sync",
-    "tasks:calendar-sync": "node ./scripts/tasks.js calendar-sync"
+    "tasks:calendar-sync": "node ./scripts/tasks.js calendar-sync",
+    "tasks:status-sync": "node ./scripts/tasks.js status-sync",
+    "tasks:queue-drain": "node ./scripts/tasks.js queue-drain",
+    "tasks:sla-check": "node ./scripts/tasks.js sla-check"
   },
   "dependencies": {
     "next": "16.1.6",

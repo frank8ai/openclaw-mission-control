@@ -5,6 +5,8 @@ Local-first Next.js dashboard + CLI control center for OpenClaw operations.
 Tracking page for ongoing OpenClaw development projects:
 
 - `OPENCLAW_DEV_PROJECT_TRACKING.md`
+- SOP index for mission-control automation:
+  - `docs/sop/SOP_INDEX.md`
 
 ## What this includes
 
@@ -32,6 +34,9 @@ Tracking page for ongoing OpenClaw development projects:
 - `tasks github-sync`: poll GitHub PRs and sync Linear state (In Review/Done) without webhook dependency
 - `tasks todoist-sync`: pull Todoist tasks and create Linear triage issues
 - `tasks calendar-sync`: capture Google Calendar events from logged-in browser tab
+- `tasks status-sync`: auto status machine (`Triage -> In Progress -> In Review -> Done/Blocked`) for linked runtime issues
+- `tasks queue-drain`: retry ingest queue and move exhausted items to DLQ
+- `tasks sla-check`: stale issue SLA check (Blocked/In Progress) with owner mention + escalation issue
 - `tasks run|enable|disable|kill`: control actions with one-time confirmation token
 - `tasks schedule`: generate/install crontab for:
   - Daily report at `09:00` and `18:00`
@@ -129,6 +134,9 @@ npm run tasks -- watchdog --auto-linear
 # One-line intake -> Linear Triage
 npm run tasks -- triage --title "Fix Discord manual model switch" --source discord --labels needs-spec
 
+# Idempotent intake (source + sourceId)
+npm run tasks -- triage --title "..." --source discord --source-id discord:msg:123
+
 # Reminder report from Linear
 npm run tasks -- remind all --send
 
@@ -146,6 +154,15 @@ npm run tasks -- todoist-sync
 
 # Google Calendar snapshot sync (requires logged-in tab in openclaw browser profile)
 npm run tasks -- calendar-sync
+
+# Runtime-linked issue status machine + comment trail
+npm run tasks -- status-sync
+
+# Retry queued ingest items
+npm run tasks -- queue-drain
+
+# Stale SLA checks + escalation
+npm run tasks -- sla-check
 ```
 
 ## API response contract
@@ -311,6 +328,66 @@ npm run tasks -- todoist-sync
 
 If token is not set, CLI tries to extract it from a logged-in Todoist tab in `openclaw` browser profile and persists to local `config/control-center.json`.
 
+### SourceId idempotency (dedupe)
+
+To avoid duplicate issues from multi-channel intake (Discord/Todoist/Calendar/webhook), provide:
+
+- `source`
+- `sourceId`
+
+The pair is indexed at:
+
+- `data/control-center/triage-source-index.json`
+
+If the same `source + sourceId` arrives again, Mission Control returns the existing issue instead of creating a duplicate.
+
+### Ingest queue + DLQ
+
+When webhook triage intake fails (e.g. Linear transient error), payload is queued automatically.
+
+Files:
+
+- queue: `data/control-center/ingest-queue.json`
+- dead letter: `data/control-center/ingest-dlq.json`
+
+Manual retry:
+
+```bash
+npm run tasks -- queue-drain
+```
+
+Queue behavior:
+
+- exponential backoff
+- max retries configurable via `intakeQueue.maxRetries`
+- exceeds max retries -> moved to DLQ
+
+### SLA automation
+
+`sla-check` scans open issues and applies stale rules:
+
+- `Blocked` over threshold -> owner mention + optional escalation issue
+- `In Progress` stale over threshold -> owner mention reminder
+
+State file:
+
+- `data/control-center/sla-check.json`
+
+### Runtime status machine
+
+`status-sync` reads linked runtime signals and moves issue state automatically:
+
+- active runtime -> `In Progress`
+- open PR signal -> `In Review`
+- merged PR signal -> `Done`
+- cron warning signal -> `Blocked`
+
+On state change, it posts a Linear comment with session/cron/github evidence.
+
+Audit trail:
+
+- `data/control-center/audit.jsonl`
+
 ### Google Calendar sync
 
 Capture events from current logged-in Google Calendar tab (browser profile `openclaw`):
@@ -345,6 +422,9 @@ Fields:
 - `github.*`
 - `todoist.*`
 - `calendar.*`
+- `statusMachine.*`
+- `intakeQueue.*`
+- `sla.*`
 
 ## Storage files
 

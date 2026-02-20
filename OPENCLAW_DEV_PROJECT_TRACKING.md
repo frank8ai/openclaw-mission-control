@@ -18,6 +18,52 @@ Primary focus:
 - Read-only mission control views for operators
 - Upstream-ready PR split and merge progress
 
+## Automation Checklist (SOP Routed)
+
+1. `taskId <-> session/subagent` 绑定与按 issue 展示
+- Status: `Done`
+- Evidence:
+  - `src/lib/openclaw-runtime.ts`
+  - `src/components/mission-control-dashboard.tsx`
+  - `src/app/ops/page.tsx`
+
+2. 自动状态机流转 + 自动评论留痕
+- Status: `Done`
+- Evidence:
+  - `scripts/tasks.js` (`status-sync`)
+  - `data/control-center/status-sync.json`
+
+3. 去重与幂等（sourceId）
+- Status: `Done (v1)`
+- Evidence:
+  - `scripts/tasks.js` (`triage` + intake adapters)
+  - `data/control-center/triage-source-index.json`
+
+4. 可靠投递层（queue + retry + DLQ）
+- Status: `Done (v1)`
+- Evidence:
+  - `scripts/tasks.js` (`queue-drain`, ingest enqueue)
+  - `data/control-center/ingest-queue.json`
+  - `data/control-center/ingest-dlq.json`
+
+5. SLA 自动化（stale/blocked）
+- Status: `Done (v1)`
+- Evidence:
+  - `scripts/tasks.js` (`sla-check`)
+  - `data/control-center/sla-check.json`
+
+6. 自动修复 Runbook
+- Status: `Done (v1 suggestion mode)`
+- Evidence:
+  - `docs/sop/SOP_MC_Runbook_AutoFix_v1.md`
+  - `scripts/tasks.js` (`status-sync` suggested runbook hints)
+
+7. 审计与权限（write actions）
+- Status: `Done (v1)`
+- Evidence:
+  - `scripts/tasks.js` audit appends
+  - `data/control-center/audit.jsonl`
+
 ## Current Upstream Links
 
 - Alignment issue: https://github.com/openclaw/openclaw/issues/21600
@@ -109,3 +155,21 @@ Use this template for each update:
 - Verification:
   - `npm run lint` 通过
   - `GET /api/runtime/tasks` 返回 `issues` + 新 summary 字段（`linkedIssues/linkedTasks/unlinkedActive`）
+
+### 2026-02-20 21:42
+- What changed:
+  - Added `status-sync` (auto transitions + evidence comments).
+  - Added sourceId idempotency index.
+  - Added ingest retry queue + DLQ (`queue-drain`).
+  - Added SLA stale checks (`sla-check`) with optional escalation issue.
+  - Added audit trail (`audit.jsonl`) for state/control/queue events.
+  - Added mission-control SOP set under `docs/sop/`.
+- Current state:
+  - P0 and P1-v1 automation loop is runnable by cron.
+  - Runbook now in suggestion mode (safe, non-destructive).
+- Blockers:
+  - v2 runbook semi-auto execution not implemented yet.
+- Next action:
+  - implement runbook mapping + guarded semi-auto command execution.
+- Links:
+  - `docs/sop/SOP_INDEX.md`

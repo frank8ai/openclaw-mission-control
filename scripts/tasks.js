@@ -20,6 +20,13 @@ const INCIDENTS_PATH = path.join(DATA_DIR, 'incidents.json');
 const TODOIST_SYNC_PATH = path.join(DATA_DIR, 'todoist-sync.json');
 const CALENDAR_SYNC_PATH = path.join(DATA_DIR, 'calendar-sync.json');
 const GITHUB_SYNC_PATH = path.join(DATA_DIR, 'github-sync.json');
+const STATUS_SYNC_PATH = path.join(DATA_DIR, 'status-sync.json');
+const ISSUE_LINKS_PATH = path.join(DATA_DIR, 'runtime-issue-links.json');
+const SOURCE_ID_INDEX_PATH = path.join(DATA_DIR, 'triage-source-index.json');
+const INGEST_QUEUE_PATH = path.join(DATA_DIR, 'ingest-queue.json');
+const INGEST_DLQ_PATH = path.join(DATA_DIR, 'ingest-dlq.json');
+const AUDIT_LOG_PATH = path.join(DATA_DIR, 'audit.jsonl');
+const SLA_STATE_PATH = path.join(DATA_DIR, 'sla-check.json');
 
 hydrateEnvFromDotEnv();
 
@@ -93,9 +100,32 @@ const DEFAULTS = {
     label: 'calendar',
     defaultState: 'Triage',
   },
+  statusMachine: {
+    enabled: true,
+    activeWindowMinutes: 120,
+    stateInProgress: 'In Progress',
+    stateInReview: 'In Review',
+    stateDone: 'Done',
+    stateBlocked: 'Blocked',
+    commentOnStateChange: true,
+    pollMinutes: 10,
+  },
+  intakeQueue: {
+    enabled: true,
+    maxRetries: 5,
+    pollMinutes: 2,
+  },
+  sla: {
+    enabled: true,
+    inProgressStaleHours: 24,
+    blockedStaleHours: 8,
+    commentCooldownHours: 24,
+    createOpsIssue: true,
+    pollMinutes: 30,
+  },
 };
 
-const HELP_TEXT = `OpenClaw Control Center CLI\n\nUsage:\n  npm run tasks -- <command> [options]\n  node scripts/tasks.js <command> [options]\n\nRead commands:\n  now                          Quick 30-second answer: what is happening + what next\n  jobs                         List cron jobs and status\n  agents                       List subagents (label/status/start/elapsed)\n  sessions                     List active sessions summary\n  report [--json] [--send]     Build health report (Top 5 anomalies + manual actions)\n  watchdog [--auto-linear]     Detect incidents and optionally auto-create Linear issues\n  remind [due|cycle|all]       Send reminders from Linear (due soon/current cycle)\n\nIntegrations:\n  triage --title ...           Create a Triage issue quickly (supports --source/--labels)\n  ingest-server                Start webhook server for external intake + GitHub PR sync\n  github-hooks [--repo PATH]   Install git hooks to enforce/add Linear ID in branch/commit\n  github-sync                  Poll GitHub PRs and sync Linear states (In Review/Done)\n  todoist-sync                 Sync Todoist tasks into Linear Triage\n  calendar-sync                Sync Google Calendar events snapshot (browser logged-in tab)\n\nWrite commands (require one-time confirmation):\n  confirm                      Generate one-time confirmation code\n  run <jobId> --confirm CODE   Run cron job now\n  enable <jobId> --confirm CODE\n  disable <jobId> --confirm CODE\n  kill <subagentId> --confirm CODE\n\nScheduling:\n  schedule [--apply] [--channel CH] [--target TGT]\n    Prepare (or install) crontab block:\n    - 09:00 + 18:00 report\n    - every 5 minutes watchdog\n    - reminders (due soon + cycle planning)\n\nExamples:\n  npm run tasks -- triage --title \"Fix Discord manual model switch\" --source discord\n  npm run tasks -- github-sync\n  npm run tasks -- todoist-sync\n  npm run tasks -- calendar-sync\n`;
+const HELP_TEXT = `OpenClaw Control Center CLI\n\nUsage:\n  npm run tasks -- <command> [options]\n  node scripts/tasks.js <command> [options]\n\nRead commands:\n  now                          Quick 30-second answer: what is happening + what next\n  jobs                         List cron jobs and status\n  agents                       List subagents (label/status/start/elapsed)\n  sessions                     List active sessions summary\n  report [--json] [--send]     Build health report (Top 5 anomalies + manual actions)\n  watchdog [--auto-linear]     Detect incidents and optionally auto-create Linear issues\n  remind [due|cycle|all]       Send reminders from Linear (due soon/current cycle)\n  status-sync [--json]         Auto state machine + comment trail for linked runtime issues\n  queue-drain [--json]         Retry ingest queue and move failed payloads to DLQ\n  sla-check [--json]           Stale/blocked SLA checks with owner mention + escalation issue\n\nIntegrations:\n  triage --title ...           Create a Triage issue quickly (supports --source/--source-id/--labels)\n  ingest-server                Start webhook server for external intake + GitHub PR sync\n  github-hooks [--repo PATH]   Install git hooks to enforce/add Linear ID in branch/commit\n  github-sync                  Poll GitHub PRs and sync Linear states (In Review/Done)\n  todoist-sync                 Sync Todoist tasks into Linear Triage\n  calendar-sync                Sync Google Calendar events snapshot (browser logged-in tab)\n\nWrite commands (require one-time confirmation):\n  confirm                      Generate one-time confirmation code\n  run <jobId> --confirm CODE   Run cron job now\n  enable <jobId> --confirm CODE\n  disable <jobId> --confirm CODE\n  kill <subagentId> --confirm CODE\n\nScheduling:\n  schedule [--apply] [--channel CH] [--target TGT]\n    Prepare (or install) crontab block:\n    - 09:00 + 18:00 report\n    - every 5 minutes watchdog\n    - status machine + queue drain + sla-check\n    - reminders (due soon + cycle planning)\n\nExamples:\n  npm run tasks -- triage --title \"Fix Discord manual model switch\" --source discord --source-id discord:msg:123\n  npm run tasks -- status-sync\n  npm run tasks -- queue-drain\n  npm run tasks -- sla-check\n`;
 
 async function main() {
   const { command, flags } = parseArgv(process.argv.slice(2));
@@ -134,6 +164,18 @@ async function main() {
       case 'remind':
       case 'reminder':
         await cmdRemind(settings, flags);
+        return;
+      case 'status-sync':
+      case 'state-sync':
+        await cmdStatusSync(settings, flags);
+        return;
+      case 'queue-drain':
+      case 'retry-queue':
+        await cmdQueueDrain(settings, flags);
+        return;
+      case 'sla-check':
+      case 'sla':
+        await cmdSlaCheck(settings, flags);
         return;
       case 'ingest-server':
       case 'webhook':
@@ -653,6 +695,11 @@ async function cmdCronControl(action, flags) {
 
   const args = ['cron', action, id];
   const output = runCommand('openclaw', args);
+  appendAuditEvent('control-cron-action', {
+    action,
+    jobId: id,
+    confirm: String(flags.confirm || ''),
+  });
 
   process.stdout.write(`${output.stdout || output.stderr || 'ok'}\n`);
 }
@@ -688,6 +735,12 @@ async function cmdKill(settings, flags) {
     throw new Error(`failed to SIGTERM PID ${target.pid}: ${String(error)}`);
   }
 
+  appendAuditEvent('control-kill-subagent', {
+    subagentId,
+    pid: target.pid,
+    confirm: String(flags.confirm || ''),
+  });
+
   process.stdout.write(`Sent SIGTERM to subagent ${subagentId} (pid ${target.pid}).\n`);
 }
 
@@ -714,13 +767,28 @@ async function cmdSchedule(settings, flags) {
   const githubSyncLog = path.join(DATA_DIR, 'github-sync-cron.log');
   const todoistSyncLog = path.join(DATA_DIR, 'todoist-sync-cron.log');
   const calendarSyncLog = path.join(DATA_DIR, 'calendar-sync-cron.log');
+  const statusSyncLog = path.join(DATA_DIR, 'status-sync-cron.log');
+  const queueDrainLog = path.join(DATA_DIR, 'queue-drain-cron.log');
+  const slaCheckLog = path.join(DATA_DIR, 'sla-check-cron.log');
   const watchdogInterval = Number(flags['watchdog-interval'] || 5);
   const githubPollMinutes = Number(flags['github-poll-minutes'] || settings.github.pollIntervalMinutes || 15);
   const todoistPollMinutes = Number(flags['todoist-poll-minutes'] || 30);
   const calendarPollMinutes = Number(flags['calendar-poll-minutes'] || 60);
+  const statusSyncMinutes = Number(
+    flags['status-sync-minutes'] || settings.statusMachine.pollMinutes || 10,
+  );
+  const queueDrainMinutes = Number(
+    flags['queue-drain-minutes'] || settings.intakeQueue.pollMinutes || 2,
+  );
+  const slaPollMinutes = Number(flags['sla-poll-minutes'] || settings.sla.pollMinutes || 30);
   const githubExpr = cronEveryMinutesExpr(githubPollMinutes);
   const todoistExpr = cronEveryMinutesExpr(todoistPollMinutes);
   const calendarExpr = cronEveryMinutesExpr(calendarPollMinutes);
+  const statusSyncExpr =
+    settings.statusMachine.enabled === false ? '' : cronEveryMinutesExpr(statusSyncMinutes);
+  const queueDrainExpr =
+    settings.intakeQueue.enabled === false ? '' : cronEveryMinutesExpr(queueDrainMinutes);
+  const slaExpr = settings.sla.enabled === false ? '' : cronEveryMinutesExpr(slaPollMinutes);
 
   ensureDir(DATA_DIR);
 
@@ -734,6 +802,9 @@ async function cmdSchedule(settings, flags) {
   const todoistBatchSize = Math.max(1, Number(settings.todoist.syncBatchSize || 10));
   const todoistSyncParts = [nodeBin, scriptPath, 'todoist-sync', '--limit', String(todoistBatchSize)];
   const calendarSyncParts = [nodeBin, scriptPath, 'calendar-sync'];
+  const statusSyncParts = [nodeBin, scriptPath, 'status-sync'];
+  const queueDrainParts = [nodeBin, scriptPath, 'queue-drain'];
+  const slaCheckParts = [nodeBin, scriptPath, 'sla-check'];
   const remindDueParts = [nodeBin, scriptPath, 'remind', 'due'];
   const remindCycleParts = [nodeBin, scriptPath, 'remind', 'cycle'];
   const dueSoonDays = Number(flags.days || settings.reminders.dueSoonDays || 7);
@@ -763,6 +834,21 @@ async function cmdSchedule(settings, flags) {
     ...(calendarExpr
       ? [
           `${calendarExpr} cd ${shellQuote(ROOT_DIR)} && ${joinShell(calendarSyncParts)} >> ${shellQuote(calendarSyncLog)} 2>&1`,
+        ]
+      : []),
+    ...(statusSyncExpr
+      ? [
+          `${statusSyncExpr} cd ${shellQuote(ROOT_DIR)} && ${joinShell(statusSyncParts)} >> ${shellQuote(statusSyncLog)} 2>&1`,
+        ]
+      : []),
+    ...(queueDrainExpr
+      ? [
+          `${queueDrainExpr} cd ${shellQuote(ROOT_DIR)} && ${joinShell(queueDrainParts)} >> ${shellQuote(queueDrainLog)} 2>&1`,
+        ]
+      : []),
+    ...(slaExpr
+      ? [
+          `${slaExpr} cd ${shellQuote(ROOT_DIR)} && ${joinShell(slaCheckParts)} >> ${shellQuote(slaCheckLog)} 2>&1`,
         ]
       : []),
     ...(withReminders
@@ -795,6 +881,7 @@ async function cmdTriage(settings, flags) {
   const title = String(flags.title || '').trim();
   const description = String(flags.description || flags.desc || '').trim();
   const source = String(flags.source || 'manual').trim();
+  const sourceId = String(flags['source-id'] || flags.sourceId || '').trim();
   const author = String(flags.author || '').trim();
   const sourceUrl = String(flags.url || '').trim();
   const state = String(flags.state || 'Triage').trim();
@@ -808,6 +895,7 @@ async function cmdTriage(settings, flags) {
       rawText,
       description,
       source,
+      sourceId,
       author,
       sourceUrl,
       state,
@@ -826,6 +914,9 @@ async function cmdTriage(settings, flags) {
   const lines = [];
   lines.push('Triage issue created:');
   lines.push(`- ${issue.identifier}: ${issue.title}`);
+  if (issue.deduped) {
+    lines.push(`- deduped: yes (${issue.dedupeKey || '-'})`);
+  }
   lines.push(`- state: ${issue.stateName || '-'}`);
   if (issue.url) {
     lines.push(`- url: ${issue.url}`);
@@ -901,6 +992,397 @@ async function cmdRemind(settings, flags) {
   }
 }
 
+async function cmdStatusSync(settings, flags) {
+  if (settings.statusMachine.enabled === false) {
+    throw new Error('statusMachine is disabled in config.');
+  }
+
+  const apiKey = String(settings.linear.apiKey || '').trim();
+  if (!apiKey) {
+    throw new Error('LINEAR_API_KEY is required for status-sync.');
+  }
+
+  const contexts = collectLinkedIssueSignals(settings, flags);
+  const state = readJsonFile(STATUS_SYNC_PATH, { version: 1, updatedAtMs: 0, issues: {} });
+  if (!state.issues || typeof state.issues !== 'object') {
+    state.issues = {};
+  }
+  const nowMs = Date.now();
+  const results = [];
+
+  for (const context of contexts) {
+    const targetStateName = decideIssueTargetState(context, settings);
+    if (!targetStateName) {
+      results.push({
+        identifier: context.identifier,
+        status: 'no_signal',
+      });
+      continue;
+    }
+
+    const transition = await transitionIssueByIdentifier(context.identifier, targetStateName, settings);
+    const issueState = state.issues[context.identifier] || {};
+    issueState.lastSyncAtMs = nowMs;
+    issueState.lastTargetState = targetStateName;
+    issueState.lastTransitionStatus = transition.status;
+    issueState.lastSignal = {
+      activeSessions: context.activeSessions.length,
+      activeSubagents: context.activeSubagents.length,
+      cronWarnings: context.cronWarnings.length,
+      githubOpen: context.githubOpen.length,
+      githubMerged: context.githubMerged.length,
+    };
+
+    let commented = false;
+    if (
+      transition.status === 'updated' &&
+      settings.statusMachine.commentOnStateChange !== false &&
+      transition.issueId
+    ) {
+      const body = renderStatusSyncComment(context, transition, settings);
+      const signature = hashText(body);
+      if (flags['comment-always'] || issueState.lastCommentSignature !== signature) {
+        const comment = await createLinearIssueComment(apiKey, transition.issueId, body);
+        issueState.lastCommentSignature = signature;
+        issueState.lastCommentAtMs = nowMs;
+        issueState.lastCommentId = comment && comment.id ? comment.id : '';
+        commented = true;
+      }
+    }
+
+    state.issues[context.identifier] = issueState;
+    results.push({
+      identifier: context.identifier,
+      targetStateName,
+      transition,
+      commented,
+      signal: {
+        activeSessions: context.activeSessions.length,
+        activeSubagents: context.activeSubagents.length,
+        cronWarnings: context.cronWarnings.length,
+        githubOpen: context.githubOpen.length,
+        githubMerged: context.githubMerged.length,
+      },
+    });
+
+    if (transition.status === 'updated') {
+      appendAuditEvent('status-sync-transition', {
+        identifier: context.identifier,
+        fromState: transition.previousState || '',
+        toState: transition.state || targetStateName,
+        reason: context.reason,
+        signal: issueState.lastSignal,
+        commented,
+      });
+    }
+  }
+
+  state.updatedAtMs = nowMs;
+  writeJsonFile(STATUS_SYNC_PATH, state);
+
+  if (flags.json) {
+    process.stdout.write(
+      `${JSON.stringify({ ok: true, processed: contexts.length, updatedAtMs: nowMs, results }, null, 2)}\n`,
+    );
+    return;
+  }
+
+  const updated = results.filter((item) => item.transition && item.transition.status === 'updated');
+  const commented = results.filter((item) => item.commented);
+  const lines = [];
+  lines.push('Status sync result:');
+  lines.push(`- issues scanned: ${contexts.length}`);
+  lines.push(`- states updated: ${updated.length}`);
+  lines.push(`- comments posted: ${commented.length}`);
+  for (const item of updated.slice(0, 10)) {
+    lines.push(
+      `- ${item.identifier}: ${item.transition.previousState || '-'} -> ${item.transition.state || item.targetStateName}`,
+    );
+  }
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+async function cmdQueueDrain(settings, flags) {
+  const queueState = readJsonFile(INGEST_QUEUE_PATH, { version: 1, items: [] });
+  const dlqState = readJsonFile(INGEST_DLQ_PATH, { version: 1, items: [] });
+  const queueItems = Array.isArray(queueState.items) ? queueState.items : [];
+  const dlqItems = Array.isArray(dlqState.items) ? dlqState.items : [];
+  const nowMs = Date.now();
+  const maxRetries = Math.max(1, Number(settings.intakeQueue.maxRetries || 5));
+
+  const kept = [];
+  const processed = [];
+  let success = 0;
+  let retried = 0;
+  let movedToDlq = 0;
+
+  for (const item of queueItems) {
+    const nextAt = Number(item.nextAttemptAtMs || 0);
+    if (nextAt > nowMs) {
+      kept.push(item);
+      continue;
+    }
+
+    try {
+      const issue = await processQueuedIngestItem(item, settings);
+      success += 1;
+      processed.push({
+        id: item.id,
+        status: 'delivered',
+        issueIdentifier: issue.identifier,
+      });
+      appendAuditEvent('ingest-queue-delivered', {
+        queueId: item.id,
+        kind: item.kind,
+        issueIdentifier: issue.identifier,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const attempts = Number(item.attempts || 0) + 1;
+      if (attempts >= maxRetries) {
+        movedToDlq += 1;
+        dlqItems.push({
+          ...item,
+          attempts,
+          lastError: message,
+          movedToDlqAtMs: nowMs,
+        });
+        processed.push({
+          id: item.id,
+          status: 'dlq',
+          attempts,
+          error: message,
+        });
+        appendAuditEvent('ingest-queue-dlq', {
+          queueId: item.id,
+          kind: item.kind,
+          attempts,
+          error: message,
+        });
+      } else {
+        retried += 1;
+        const backoffMs = computeIngestBackoffMs(attempts);
+        kept.push({
+          ...item,
+          attempts,
+          lastError: message,
+          nextAttemptAtMs: nowMs + backoffMs,
+          updatedAtMs: nowMs,
+        });
+        processed.push({
+          id: item.id,
+          status: 'retry',
+          attempts,
+          nextAttemptAtMs: nowMs + backoffMs,
+          error: message,
+        });
+      }
+    }
+  }
+
+  queueState.updatedAtMs = nowMs;
+  queueState.items = kept;
+  dlqState.updatedAtMs = nowMs;
+  dlqState.items = dlqItems;
+  writeJsonFile(INGEST_QUEUE_PATH, queueState);
+  writeJsonFile(INGEST_DLQ_PATH, dlqState);
+
+  if (flags.json) {
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          ok: true,
+          queuedBefore: queueItems.length,
+          queuedAfter: kept.length,
+          success,
+          retried,
+          movedToDlq,
+          processed,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    return;
+  }
+
+  const lines = [];
+  lines.push('Queue drain result:');
+  lines.push(`- queued before: ${queueItems.length}`);
+  lines.push(`- delivered: ${success}`);
+  lines.push(`- retried: ${retried}`);
+  lines.push(`- moved to DLQ: ${movedToDlq}`);
+  lines.push(`- queued after: ${kept.length}`);
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+async function cmdSlaCheck(settings, flags) {
+  if (settings.sla.enabled === false) {
+    throw new Error('sla is disabled in config.');
+  }
+
+  const apiKey = String(settings.linear.apiKey || '').trim();
+  if (!apiKey) {
+    throw new Error('LINEAR_API_KEY is required for sla-check.');
+  }
+
+  const teamId = settings.linear.teamId || (await resolveLinearTeamId(apiKey, settings.linear.teamKey));
+  if (!teamId) {
+    throw new Error('Unable to resolve Linear team id for sla-check.');
+  }
+
+  const nowMs = Date.now();
+  const inProgressStaleHours = Math.max(
+    1,
+    Number(flags['in-progress-hours'] || settings.sla.inProgressStaleHours || 24),
+  );
+  const blockedStaleHours = Math.max(
+    1,
+    Number(flags['blocked-hours'] || settings.sla.blockedStaleHours || 8),
+  );
+  const cooldownHours = Math.max(
+    1,
+    Number(flags['cooldown-hours'] || settings.sla.commentCooldownHours || 24),
+  );
+  const cooldownMs = cooldownHours * 60 * 60 * 1000;
+  const escalateEnabled = !Boolean(flags['no-escalate']) && settings.sla.createOpsIssue !== false;
+  const issues = await fetchOpenLinearIssuesForSla(apiKey, teamId);
+
+  const state = readJsonFile(SLA_STATE_PATH, { version: 1, updatedAtMs: 0, issues: {} });
+  if (!state.issues || typeof state.issues !== 'object') {
+    state.issues = {};
+  }
+
+  const results = [];
+  for (const issue of issues) {
+    const updatedAtMs = Date.parse(String(issue.updatedAt || ''));
+    if (!Number.isFinite(updatedAtMs) || updatedAtMs <= 0) {
+      continue;
+    }
+
+    const ageHours = Math.max(0, (nowMs - updatedAtMs) / (60 * 60 * 1000));
+    const stateName = String((issue.state && issue.state.name) || '').trim();
+    const isBlocked = isBlockedStateName(stateName, settings);
+    const isInProgress = isInProgressStateName(stateName, issue.state && issue.state.type, settings);
+
+    let slaType = '';
+    let thresholdHours = 0;
+    if (isBlocked && ageHours >= blockedStaleHours) {
+      slaType = 'blocked';
+      thresholdHours = blockedStaleHours;
+    } else if (isInProgress && ageHours >= inProgressStaleHours) {
+      slaType = 'in-progress';
+      thresholdHours = inProgressStaleHours;
+    } else {
+      continue;
+    }
+
+    const signature = hashText(
+      `${issue.identifier}|${stateName}|${issue.updatedAt}|${slaType}|${Math.floor(ageHours)}`,
+    );
+    const record = state.issues[issue.identifier] || {};
+    const lastCommentAtMs = Number(record.lastCommentAtMs || 0);
+    const shouldComment =
+      Boolean(flags['comment-always']) ||
+      record.lastSignature !== signature ||
+      nowMs - lastCommentAtMs >= cooldownMs;
+
+    let commented = false;
+    let escalation = null;
+    if (shouldComment) {
+      const commentBody = renderSlaComment(issue, slaType, ageHours, thresholdHours, settings);
+      await createLinearIssueComment(apiKey, issue.id, commentBody);
+      record.lastCommentAtMs = nowMs;
+      record.lastSignature = signature;
+      commented = true;
+      appendAuditEvent('sla-comment', {
+        identifier: issue.identifier,
+        slaType,
+        ageHours: Number(ageHours.toFixed(2)),
+        thresholdHours,
+      });
+    }
+
+    if (escalateEnabled && slaType === 'blocked') {
+      escalation = await createTriageIssueFromInput(
+        {
+          title: `[SLA][Blocked] ${issue.identifier} stale ${Math.floor(ageHours)}h`,
+          description: [
+            `Escalation for blocked issue exceeding SLA.`,
+            `issue: ${issue.identifier}`,
+            `state: ${stateName}`,
+            `ageHours: ${ageHours.toFixed(2)}`,
+            `thresholdHours: ${thresholdHours}`,
+            issue.url ? `url: ${issue.url}` : '',
+          ]
+            .filter(Boolean)
+            .join('\n'),
+          source: 'sla-check',
+          sourceId: `blocked:${issue.identifier}:${issue.updatedAt}`,
+          labels: ['ops', 'sla'],
+          state: 'Triage',
+          priority: 2,
+        },
+        settings,
+      );
+      appendAuditEvent('sla-escalation', {
+        identifier: issue.identifier,
+        escalationIdentifier: escalation.identifier,
+      });
+    }
+
+    record.lastSeenAtMs = nowMs;
+    record.lastStateName = stateName;
+    record.lastAgeHours = Number(ageHours.toFixed(2));
+    state.issues[issue.identifier] = record;
+
+    results.push({
+      identifier: issue.identifier,
+      state: stateName,
+      slaType,
+      ageHours: Number(ageHours.toFixed(2)),
+      thresholdHours,
+      commented,
+      escalationIdentifier: escalation ? escalation.identifier : '',
+      escalationDeduped: Boolean(escalation && escalation.deduped),
+    });
+  }
+
+  state.updatedAtMs = nowMs;
+  writeJsonFile(SLA_STATE_PATH, state);
+
+  if (flags.json) {
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          ok: true,
+          checked: issues.length,
+          stale: results.length,
+          commented: results.filter((item) => item.commented).length,
+          escalated: results.filter((item) => item.escalationIdentifier).length,
+          results,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    return;
+  }
+
+  const lines = [];
+  lines.push('SLA check result:');
+  lines.push(`- open issues checked: ${issues.length}`);
+  lines.push(`- stale issues: ${results.length}`);
+  lines.push(`- comments posted: ${results.filter((item) => item.commented).length}`);
+  lines.push(`- escalations: ${results.filter((item) => item.escalationIdentifier).length}`);
+  for (const item of results.slice(0, 10)) {
+    lines.push(
+      `- ${item.identifier} ${item.slaType} age=${item.ageHours}h threshold=${item.thresholdHours}h${item.escalationIdentifier ? ` escalation=${item.escalationIdentifier}` : ''}`,
+    );
+  }
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
 async function cmdIngestServer(settings, flags) {
   const host = String(flags.host || settings.ingest.host || '127.0.0.1').trim();
   const port = Number(flags.port || settings.ingest.port || 8788);
@@ -932,23 +1414,38 @@ async function cmdIngestServer(settings, flags) {
         }
 
         const body = await readJsonBody(req, maxBodyBytes);
-        const issue = await createTriageIssueFromInput(
-          {
-            title: String(body.title || '').trim(),
-            rawText: String(body.text || body.message || '').trim(),
-            description: String(body.description || '').trim(),
-            source: String(body.source || 'webhook').trim(),
-            author: String(body.author || '').trim(),
-            sourceUrl: String(body.url || '').trim(),
-            state: String(body.state || 'Triage').trim(),
-            labels: normalizeLabelNames(body.labels || ''),
-            dueDate: String(body.dueDate || '').trim(),
-            priority: Number(body.priority || 3),
-          },
-          settings,
-        );
+        const input = {
+          title: String(body.title || '').trim(),
+          rawText: String(body.text || body.message || '').trim(),
+          description: String(body.description || '').trim(),
+          source: String(body.source || 'webhook').trim(),
+          sourceId: normalizeSourceId(
+            String(body.sourceId || body.eventId || body.messageId || body.id || body.url || '')
+              .trim(),
+          ),
+          author: String(body.author || '').trim(),
+          sourceUrl: String(body.url || '').trim(),
+          state: String(body.state || 'Triage').trim(),
+          labels: normalizeLabelNames(body.labels || ''),
+          dueDate: String(body.dueDate || '').trim(),
+          priority: Number(body.priority || 3),
+        };
 
-        sendJson(res, 200, { ok: true, issue });
+        try {
+          const issue = await createTriageIssueFromInput(input, settings);
+          sendJson(res, 200, { ok: true, issue });
+        } catch (error) {
+          if (settings.intakeQueue.enabled === false) {
+            throw error;
+          }
+          const queued = enqueueIngestItem('triage', input, error, settings);
+          sendJson(res, 202, {
+            ok: true,
+            queued: true,
+            queueId: queued.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
         return;
       }
 
@@ -1179,6 +1676,7 @@ async function cmdTodoistSync(settings, flags) {
           .filter(Boolean)
           .join('\n'),
         source: 'todoist',
+        sourceId: key,
         state: String(settings.todoist.defaultState || 'Triage'),
         labels: [String(settings.todoist.label || 'todoist')],
         dueDate: task.due && task.due.date ? String(task.due.date) : '',
@@ -1292,6 +1790,7 @@ async function cmdCalendarSync(settings, flags) {
           title: `[Calendar] ${trimMessage(event.text, 120)}`,
           description: `Google Calendar event snapshot\nid: ${event.id}\nsource: ${tab.url}`,
           source: 'google-calendar',
+          sourceId: event.id,
           labels: [String(settings.calendar.label || 'calendar')],
           state: String(settings.calendar.defaultState || 'Triage'),
           priority: 3,
@@ -1370,6 +1869,27 @@ async function createTriageIssueFromInput(input, settings) {
     throw new Error('LINEAR_API_KEY is required to create triage issues.');
   }
 
+  const source = String(input.source || '').trim().toLowerCase();
+  const sourceIdRaw = String(input.sourceId || '').trim();
+  const sourceId = sourceIdRaw ? normalizeSourceId(sourceIdRaw) : '';
+  const dedupeKey = source && sourceId ? `${source}:${sourceId}` : '';
+  if (dedupeKey) {
+    const index = readJsonFile(SOURCE_ID_INDEX_PATH, { version: 1, items: {} });
+    const existing = index.items && typeof index.items === 'object' ? index.items[dedupeKey] : null;
+    if (existing && existing.identifier) {
+      return {
+        id: existing.issueId || '',
+        identifier: String(existing.identifier),
+        title: String(existing.title || existing.identifier),
+        url: String(existing.url || ''),
+        stateName: String(existing.stateName || ''),
+        labels: [],
+        deduped: true,
+        dedupeKey,
+      };
+    }
+  }
+
   const teamId = settings.linear.teamId || (await resolveLinearTeamId(apiKey, settings.linear.teamKey));
   if (!teamId) {
     throw new Error('Unable to resolve Linear team id for triage.');
@@ -1428,6 +1948,23 @@ async function createTriageIssueFromInput(input, settings) {
     throw new Error('Linear issueCreate returned no issue.');
   }
 
+  if (dedupeKey) {
+    const index = readJsonFile(SOURCE_ID_INDEX_PATH, { version: 1, items: {} });
+    if (!index.items || typeof index.items !== 'object') {
+      index.items = {};
+    }
+    index.items[dedupeKey] = {
+      identifier: issue.identifier,
+      issueId: issue.id,
+      title: issue.title,
+      url: issue.url || '',
+      source,
+      sourceId,
+      createdAtMs: Date.now(),
+    };
+    writeJsonFile(SOURCE_ID_INDEX_PATH, index);
+  }
+
   return {
     id: issue.id,
     identifier: issue.identifier,
@@ -1435,6 +1972,8 @@ async function createTriageIssueFromInput(input, settings) {
     url: issue.url,
     stateName: issue.state ? issue.state.name : '',
     labels: (((issue.labels || {}).nodes || []).map((item) => item.name)).filter(Boolean),
+    deduped: false,
+    dedupeKey,
   };
 }
 
@@ -1764,22 +2303,36 @@ async function resolveLinearIssueByIdentifier(apiKey, identifier, fallbackTeamKe
 async function transitionIssueByIdentifier(identifier, targetStateName, settings) {
   const apiKey = String(settings.linear.apiKey || '').trim();
   if (!apiKey) {
-    throw new Error('LINEAR_API_KEY is required for GitHub->Linear transitions.');
+    throw new Error('LINEAR_API_KEY is required for issue state transitions.');
   }
 
   const issue = await resolveLinearIssueByIdentifier(apiKey, identifier, settings.linear.teamKey);
   if (!issue) {
-    return { identifier, status: 'not_found' };
+    return { identifier, status: 'not_found', targetStateName };
   }
 
   const currentState = issue.state ? String(issue.state.name || '') : '';
   if (currentState.trim().toLowerCase() === String(targetStateName || '').trim().toLowerCase()) {
-    return { identifier: issue.identifier, status: 'unchanged', state: currentState, url: issue.url };
+    return {
+      issueId: issue.id,
+      identifier: issue.identifier,
+      status: 'unchanged',
+      state: currentState,
+      previousState: currentState,
+      targetStateName,
+      url: issue.url,
+    };
   }
 
   const stateId = await resolveLinearStateId(apiKey, issue.team.id, targetStateName);
   if (!stateId) {
-    return { identifier: issue.identifier, status: 'state_not_found', targetStateName };
+    return {
+      issueId: issue.id,
+      identifier: issue.identifier,
+      status: 'state_not_found',
+      previousState: currentState,
+      targetStateName,
+    };
   }
 
   const payload = await linearRequest(
@@ -1805,8 +2358,11 @@ async function transitionIssueByIdentifier(identifier, targetStateName, settings
 
   const moved = payload && payload.issueUpdate ? payload.issueUpdate.issue : null;
   return {
+    issueId: issue.id,
     identifier: moved ? moved.identifier : issue.identifier,
     status: moved ? 'updated' : 'unknown',
+    previousState: currentState,
+    targetStateName,
     state: moved && moved.state ? moved.state.name : targetStateName,
     url: moved ? moved.url : issue.url,
   };
@@ -1869,6 +2425,483 @@ async function handleGithubPullRequestEvent(eventName, payload, settings) {
     identifiers,
     updates,
   };
+}
+
+function collectLinkedIssueSignals(settings, flags) {
+  const bindings = readJsonFile(ISSUE_LINKS_PATH, {});
+  const activeWindowMinutes = Math.max(
+    5,
+    Number(flags['active-minutes'] || settings.statusMachine.activeWindowMinutes || 120),
+  );
+  const activeWindowMs = activeWindowMinutes * 60 * 1000;
+
+  const byIssue = new Map();
+  const ensureContext = (identifier) => {
+    const normalized = normalizeLinearIssueId(identifier);
+    if (!normalized) {
+      return null;
+    }
+    if (!byIssue.has(normalized)) {
+      byIssue.set(normalized, {
+        identifier: normalized,
+        reason: '',
+        activeSessions: [],
+        activeSubagents: [],
+        cronWarnings: [],
+        githubOpen: [],
+        githubMerged: [],
+      });
+    }
+    return byIssue.get(normalized);
+  };
+
+  const sessions = loadSessions(settings)
+    .filter((session) => Number(session.ageMs || Number.POSITIVE_INFINITY) <= activeWindowMs)
+    .sort((a, b) => Number(a.ageMs || 0) - Number(b.ageMs || 0));
+  for (const session of sessions) {
+    const taskId = `session:${session.agentId}:${session.key}`;
+    const identifier = resolveIssueFromBindings(bindings, {
+      taskId,
+      sessionId: session.sessionId || '',
+      sessionKey: session.key || '',
+    });
+    const context = ensureContext(identifier);
+    if (!context) {
+      continue;
+    }
+    context.activeSessions.push({
+      taskId,
+      agentId: session.agentId,
+      key: session.key,
+      sessionId: session.sessionId || '',
+      ageMs: Number(session.ageMs || 0),
+      updatedAt: Number(session.updatedAt || 0),
+      model: session.model || '',
+    });
+  }
+
+  const subagents = loadSubagents(settings).filter((item) => item.isActive);
+  for (const item of subagents) {
+    const taskId = `subagent:${item.id}`;
+    const identifier = resolveIssueFromBindings(bindings, {
+      taskId,
+      subagentId: item.id,
+    });
+    const context = ensureContext(identifier);
+    if (!context) {
+      continue;
+    }
+    context.activeSubagents.push({
+      taskId,
+      subagentId: item.id,
+      label: item.label,
+      durationMs: Number(item.durationMs || 0),
+      status: item.status || '',
+    });
+  }
+
+  const cronWarnings = loadCronJobs(settings).filter((job) => {
+    const state = job.state || {};
+    const lastStatus = String(state.lastStatus || '').toLowerCase();
+    const consecutiveErrors = Number(state.consecutiveErrors || 0);
+    const lastError = String(state.lastError || '');
+    return (
+      lastStatus === 'error' ||
+      lastStatus === 'failed' ||
+      consecutiveErrors > 0 ||
+      isTimeoutError(lastError)
+    );
+  });
+  for (const job of cronWarnings) {
+    const taskId = `cron:${job.id}`;
+    const identifier = resolveIssueFromBindings(bindings, {
+      taskId,
+      cronId: job.id,
+    });
+    const context = ensureContext(identifier);
+    if (!context) {
+      continue;
+    }
+    context.cronWarnings.push({
+      taskId,
+      cronId: job.id,
+      name: job.name || job.id,
+      status: (job.state && job.state.lastStatus) || '-',
+      consecutiveErrors: Number((job.state && job.state.consecutiveErrors) || 0),
+      lastError: (job.state && job.state.lastError) || '',
+    });
+  }
+
+  const githubSnapshot = readJsonFile(GITHUB_SYNC_PATH, { updates: [] });
+  const updates = Array.isArray(githubSnapshot.updates) ? githubSnapshot.updates : [];
+  for (const item of updates) {
+    const identifier = normalizeLinearIssueId(item.identifier);
+    if (!identifier) {
+      continue;
+    }
+    const context = ensureContext(identifier);
+    if (!context) {
+      continue;
+    }
+    const action = String(item.action || '').toLowerCase();
+    if (action === 'merged') {
+      context.githubMerged.push({
+        repo: item.repo || '',
+        prNumber: Number(item.prNumber || 0),
+        prTitle: item.prTitle || '',
+      });
+    } else if (action === 'open') {
+      context.githubOpen.push({
+        repo: item.repo || '',
+        prNumber: Number(item.prNumber || 0),
+        prTitle: item.prTitle || '',
+      });
+    }
+  }
+
+  return Array.from(byIssue.values()).sort((a, b) => {
+    const aScore =
+      Number(a.cronWarnings.length > 0) * 100 +
+      Number(a.githubMerged.length > 0) * 50 +
+      Number(a.githubOpen.length > 0) * 30 +
+      Number(a.activeSessions.length + a.activeSubagents.length > 0) * 10;
+    const bScore =
+      Number(b.cronWarnings.length > 0) * 100 +
+      Number(b.githubMerged.length > 0) * 50 +
+      Number(b.githubOpen.length > 0) * 30 +
+      Number(b.activeSessions.length + b.activeSubagents.length > 0) * 10;
+    if (aScore !== bScore) {
+      return bScore - aScore;
+    }
+    return String(a.identifier).localeCompare(String(b.identifier));
+  });
+}
+
+function decideIssueTargetState(context, settings) {
+  if (context.cronWarnings.length > 0) {
+    context.reason = 'cron-warning';
+    return String(settings.statusMachine.stateBlocked || 'Blocked');
+  }
+  if (context.githubMerged.length > 0) {
+    context.reason = 'github-merged';
+    return String(settings.statusMachine.stateDone || settings.github.stateDone || 'Done');
+  }
+  if (context.githubOpen.length > 0) {
+    context.reason = 'github-open-pr';
+    return String(settings.statusMachine.stateInReview || settings.github.stateInReview || 'In Review');
+  }
+  if (context.activeSessions.length > 0 || context.activeSubagents.length > 0) {
+    context.reason = 'runtime-active';
+    return String(settings.statusMachine.stateInProgress || 'In Progress');
+  }
+  context.reason = 'no-signal';
+  return '';
+}
+
+function resolveIssueFromBindings(bindings, refs) {
+  const candidates = [
+    lookupBindingValue(bindings.byTaskId, refs.taskId),
+    lookupBindingValue(bindings.bySessionId, refs.sessionId),
+    lookupBindingValue(bindings.bySessionKey, refs.sessionKey),
+    lookupBindingValue(bindings.bySubagentId, refs.subagentId),
+    lookupBindingValue(bindings.byCronId, refs.cronId),
+  ];
+
+  for (const value of candidates) {
+    const identifier = normalizeLinearIssueId(value);
+    if (identifier) {
+      return identifier;
+    }
+  }
+  return '';
+}
+
+function lookupBindingValue(map, key) {
+  if (!map || typeof map !== 'object' || !key) {
+    return '';
+  }
+  if (map[key]) {
+    return String(map[key]);
+  }
+  const lookup = String(key).toLowerCase();
+  for (const [candidateKey, candidateValue] of Object.entries(map)) {
+    if (String(candidateKey).toLowerCase() === lookup) {
+      return String(candidateValue || '');
+    }
+  }
+  return '';
+}
+
+function normalizeLinearIssueId(value) {
+  const text = String(value || '').trim().toUpperCase();
+  const match = text.match(/^([A-Z][A-Z0-9]+)-(\d+)$/);
+  if (!match) {
+    return '';
+  }
+  return `${match[1]}-${Number(match[2])}`;
+}
+
+function renderStatusSyncComment(context, transition, settings) {
+  const nowMs = Date.now();
+  const lines = [];
+  lines.push('### Mission Control Auto Status Update');
+  lines.push(
+    `- transition: ${transition.previousState || '-'} -> ${transition.state || transition.targetStateName || '-'}`,
+  );
+  lines.push(`- reason: ${context.reason}`);
+  lines.push(
+    `- signals: sessions=${context.activeSessions.length}, subagents=${context.activeSubagents.length}, cronWarnings=${context.cronWarnings.length}, githubOpen=${context.githubOpen.length}, githubMerged=${context.githubMerged.length}`,
+  );
+
+  if (context.activeSessions.length > 0) {
+    lines.push('');
+    lines.push('#### Active Sessions');
+    for (const item of context.activeSessions.slice(0, 5)) {
+      const logPath = item.sessionId
+        ? path.join(settings.openclawHome, 'agents', item.agentId, 'sessions', `${item.sessionId}.jsonl`)
+        : '-';
+      lines.push(
+        `- ${item.agentId} age=${formatDuration(item.ageMs)} key=${singleLine(item.key)}${item.model ? ` model=${item.model}` : ''}`,
+      );
+      if (logPath !== '-') {
+        lines.push(`  - log: ${logPath}`);
+      }
+    }
+  }
+
+  if (context.activeSubagents.length > 0) {
+    lines.push('');
+    lines.push('#### Active Subagents');
+    for (const item of context.activeSubagents.slice(0, 5)) {
+      lines.push(
+        `- ${item.label || item.subagentId} status=${item.status || '-'} elapsed=${formatDuration(item.durationMs)}`,
+      );
+    }
+  }
+
+  if (context.cronWarnings.length > 0) {
+    lines.push('');
+    lines.push('#### Cron Warnings');
+    for (const item of context.cronWarnings.slice(0, 5)) {
+      lines.push(
+        `- ${item.name} (${item.cronId}) status=${item.status || '-'} errors=${item.consecutiveErrors || 0}`,
+      );
+      if (item.lastError) {
+        lines.push(`  - error: ${singleLine(trimMessage(item.lastError, 200))}`);
+      }
+      lines.push(`  - run log: ${path.join(settings.openclawHome, 'cron', 'runs', `${item.cronId}.jsonl`)}`);
+    }
+  }
+
+  if (context.githubOpen.length > 0 || context.githubMerged.length > 0) {
+    lines.push('');
+    lines.push('#### GitHub Signals');
+    for (const item of context.githubOpen.slice(0, 5)) {
+      lines.push(`- open PR: ${item.repo}#${item.prNumber} ${singleLine(item.prTitle)}`);
+    }
+    for (const item of context.githubMerged.slice(0, 5)) {
+      lines.push(`- merged PR: ${item.repo}#${item.prNumber} ${singleLine(item.prTitle)}`);
+    }
+  }
+
+  const runbookHints = buildRunbookHints(context, settings);
+  if (runbookHints.length > 0) {
+    lines.push('');
+    lines.push('#### Suggested Runbook');
+    for (const hint of runbookHints) {
+      lines.push(`- ${hint}`);
+    }
+  }
+
+  lines.push('');
+  lines.push(`_generated ${formatTime(nowMs, settings.timezone)} by mission-control status-sync_`);
+  return trimMessage(lines.join('\n'), 3500);
+}
+
+async function createLinearIssueComment(apiKey, issueId, body) {
+  const payload = await linearRequest(
+    apiKey,
+    `mutation CreateComment($input: CommentCreateInput!) {
+      commentCreate(input: $input) {
+        success
+        comment {
+          id
+        }
+      }
+    }`,
+    {
+      input: {
+        issueId,
+        body,
+      },
+    },
+  );
+
+  const node = payload && payload.commentCreate ? payload.commentCreate.comment : null;
+  if (!node || !node.id) {
+    throw new Error('Linear commentCreate returned no comment.');
+  }
+  return node;
+}
+
+async function fetchOpenLinearIssuesForSla(apiKey, teamId) {
+  const payload = await linearRequest(
+    apiKey,
+    `query OpenIssuesForSla($teamId: ID!) {
+      issues(
+        first: 250
+        filter: {
+          team: { id: { eq: $teamId } }
+          state: { type: { nin: ["completed", "canceled"] } }
+        }
+      ) {
+        nodes {
+          id
+          identifier
+          title
+          url
+          updatedAt
+          state { id name type }
+          assignee { id name displayName }
+        }
+      }
+    }`,
+    { teamId },
+  );
+
+  const nodes = (((payload || {}).issues || {}).nodes || []).filter(Boolean);
+  return nodes;
+}
+
+function isBlockedStateName(stateName, settings) {
+  const value = String(stateName || '').trim().toLowerCase();
+  const configured = String(settings.statusMachine.stateBlocked || 'Blocked').trim().toLowerCase();
+  return value === configured || value.includes('blocked') || value.includes('block');
+}
+
+function isInProgressStateName(stateName, stateType, settings) {
+  const value = String(stateName || '').trim().toLowerCase();
+  const configured = String(settings.statusMachine.stateInProgress || 'In Progress').trim().toLowerCase();
+  if (value === configured || value.includes('in progress')) {
+    return true;
+  }
+  return String(stateType || '').trim().toLowerCase() === 'started';
+}
+
+function renderSlaComment(issue, slaType, ageHours, thresholdHours, settings) {
+  const assignee =
+    issue && issue.assignee
+      ? String(issue.assignee.displayName || issue.assignee.name || '').trim()
+      : '';
+  const mentionText = assignee ? `@${assignee}` : '@owner';
+  const lines = [];
+  lines.push('### Mission Control SLA Alert');
+  lines.push(`- issue: ${issue.identifier}`);
+  lines.push(`- state: ${issue.state ? issue.state.name : '-'}`);
+  lines.push(`- stale type: ${slaType}`);
+  lines.push(`- age: ${ageHours.toFixed(2)}h (threshold ${thresholdHours}h)`);
+  lines.push(`- owner: ${mentionText}`);
+  lines.push('');
+  lines.push('Please update status or add unblock plan. If blocked, include next concrete action and owner ETA.');
+  lines.push('');
+  lines.push(`_generated ${formatTime(Date.now(), settings.timezone)} by mission-control sla-check_`);
+  return trimMessage(lines.join('\n'), 3000);
+}
+
+function normalizeSourceId(value) {
+  const text = singleLine(String(value || '')).toLowerCase();
+  if (!text) {
+    return '';
+  }
+  if (text.length <= 180) {
+    return text;
+  }
+  return `h:${hashText(text)}`;
+}
+
+function buildRunbookHints(context, settings) {
+  const hints = [];
+  const joined = [
+    ...context.activeSessions.map((item) => `${item.key} ${item.model || ''}`),
+    ...context.cronWarnings.map((item) => `${item.name} ${item.lastError || ''}`),
+  ]
+    .join(' ')
+    .toLowerCase();
+
+  if (joined.includes('failover') || joined.includes('model') || joined.includes('切换')) {
+    hints.push('Model switch/failover suspected: verify active model route and fallback policy first.');
+    hints.push('Check current session/tool channel binding and confirm manual switch command path is enabled.');
+    hints.push(
+      `Capture latest runtime evidence: ${path.join(
+        settings.openclawHome,
+        'logs',
+      )} + affected session/cron jsonl files before restart.`,
+    );
+  }
+
+  if (context.cronWarnings.length > 0) {
+    hints.push('For cron failures: reproduce once manually, then validate next two scheduled runs before closing.');
+  }
+
+  return dedupeStrings(hints);
+}
+
+function enqueueIngestItem(kind, payload, error, settings) {
+  const queue = readJsonFile(INGEST_QUEUE_PATH, { version: 1, items: [] });
+  const items = Array.isArray(queue.items) ? queue.items : [];
+  const nowMs = Date.now();
+  const item = {
+    id: crypto.randomUUID(),
+    kind,
+    payload,
+    attempts: 0,
+    createdAtMs: nowMs,
+    updatedAtMs: nowMs,
+    nextAttemptAtMs: nowMs,
+    lastError: error instanceof Error ? error.message : String(error),
+  };
+  items.push(item);
+  queue.version = 1;
+  queue.updatedAtMs = nowMs;
+  queue.items = items;
+  writeJsonFile(INGEST_QUEUE_PATH, queue);
+  appendAuditEvent('ingest-queue-enqueue', {
+    queueId: item.id,
+    kind,
+    source: payload && payload.source ? payload.source : '',
+    sourceId: payload && payload.sourceId ? payload.sourceId : '',
+    error: item.lastError,
+    enabled: settings.intakeQueue.enabled !== false,
+  });
+  return item;
+}
+
+async function processQueuedIngestItem(item, settings) {
+  const kind = String(item.kind || '');
+  if (kind === 'triage') {
+    return createTriageIssueFromInput(item.payload || {}, settings);
+  }
+  throw new Error(`unknown queue kind: ${kind}`);
+}
+
+function computeIngestBackoffMs(attempts) {
+  const n = Math.max(1, Number(attempts || 1));
+  const raw = 30 * 1000 * Math.pow(2, n - 1);
+  return Math.min(60 * 60 * 1000, raw);
+}
+
+function appendAuditEvent(eventType, detail) {
+  ensureDir(DATA_DIR);
+  const line = {
+    ts: new Date().toISOString(),
+    eventType: String(eventType || ''),
+    detail: detail || {},
+  };
+  fs.appendFileSync(AUDIT_LOG_PATH, `${JSON.stringify(line)}\n`, 'utf8');
+}
+
+function hashText(text) {
+  return crypto.createHash('sha1').update(String(text || '')).digest('hex').slice(0, 16);
 }
 
 function verifyGithubSignature(req, rawBody, secret) {

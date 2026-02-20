@@ -69,5 +69,28 @@
     "syncToLinear": false,
     "label": "calendar",
     "defaultState": "Triage"
+  },
+  "statusMachine": {
+    "enabled": true,
+    "activeWindowMinutes": 120,
+    "stateInProgress": "In Progress",
+    "stateInReview": "In Review",
+    "stateDone": "Done",
+    "stateBlocked": "Blocked",
+    "commentOnStateChange": true,
+    "pollMinutes": 10
+  },
+  "intakeQueue": {
+    "enabled": true,
+    "maxRetries": 5,
+    "pollMinutes": 2
+  },
+  "sla": {
+    "enabled": true,
+    "inProgressStaleHours": 24,
+    "blockedStaleHours": 8,
+    "commentCooldownHours": 24,
+    "createOpsIssue": true,
+    "pollMinutes": 30
   }
 }
