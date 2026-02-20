@@ -1,0 +1,21 @@
+@import "tailwindcss";
+
+:root {
+  --surface: #f6f8fc;
+  --ink: #0f172a;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at 20% 0%, #d7f3ff 0%, transparent 42%),
+    radial-gradient(circle at 82% 100%, #ffe7ce 0%, transparent 40%),
+    var(--surface);
+  font-family: var(--font-geist-sans), "Avenir Next", "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}

@@ -1,0 +1,28 @@
+{
+  "timezone": "Asia/Shanghai",
+  "report": {
+    "topLimit": 5,
+    "channel": "discord",
+    "target": "channel:1468117725040742527",
+    "maxSendLength": 3000
+  },
+  "watchdog": {
+    "silenceMultiplier": 2.5,
+    "silenceFloorMinutes": 10,
+    "cronSilenceHours": 48,
+    "subagentLongRunMinutes": 120,
+    "contextHotThreshold": 0.85
+  },
+  "control": {
+    "confirmTtlMinutes": 10,
+    "killWhitelist": [
+      "example-subagent-id"
+    ]
+  },
+  "linear": {
+    "enabled": true,
+    "teamKey": "OPS",
+    "teamId": "",
+    "projectId": ""
+  }
+}
