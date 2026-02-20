@@ -1971,8 +1971,7 @@ async function cmdMemoSave(settings, flags) {
     throw new Error('memo-save requires --channel-id and --message-id');
   }
 
-  const memo = await buildDiscordMemo({ channelId, messageId, title }, settings);
-  const saved = saveObsidianMemo(memo, settings);
+  const memo = await buildDiscordMemo({ channelId, messageId, title, labels }, settings);
 
   let triageIssue = null;
   if (createLinear) {
@@ -1980,7 +1979,7 @@ async function cmdMemoSave(settings, flags) {
       {
         title: memo.title,
         rawText: memo.tldr,
-        description: `${memo.body}\n\n---\nMemo: ${saved.relativePath}`,
+        description: `${memo.body}\n\n---\nSource: ${memo.sourceUrl}`,
         source: 'memo',
         sourceId: memo.sourceId,
         author: memo.author,
@@ -1992,6 +1991,28 @@ async function cmdMemoSave(settings, flags) {
       },
       settings,
     );
+
+    memo.linearUrl = triageIssue && triageIssue.url ? triageIssue.url : '';
+  }
+
+  const saved = saveObsidianMemo(memo, settings);
+
+  if (triageIssue && triageIssue.url) {
+    try {
+      const apiKey = String(settings.linear.apiKey || '').trim();
+      if (apiKey && triageIssue.id) {
+        await createLinearIssueComment(
+          apiKey,
+          triageIssue.id,
+          trimMessage(
+            ['### Memo Captured', `- Obsidian: ${saved.relativePath}`, `- Source: ${memo.sourceUrl}`].join('\n'),
+            1800,
+          ),
+        );
+      }
+    } catch {
+      // ignore comment failure
+    }
   }
 
   const result = {
@@ -5053,8 +5074,46 @@ function formatDateId(ms, timezone) {
 }
 
 function buildMemoMarkdown(memo) {
+  const tags = Array.isArray(memo.tags)
+    ? memo.tags
+        .map((item) => String(item || '').trim())
+        .filter(Boolean)
+        .map((item) => (item.startsWith('#') ? item : `#${item}`))
+    : [];
+
+  const links = [];
+  if (memo.sourceUrl) {
+    links.push(`- Source: ${memo.sourceUrl}`);
+  }
+  if (memo.linearUrl) {
+    links.push(`- Linear: ${memo.linearUrl}`);
+  }
+
   const lines = [];
+  lines.push('---');
+  lines.push(`title: ${String(memo.title || '').replace(/\n/g, ' ').trim()}`);
+  if (memo.sourceId) {
+    lines.push(`sourceId: ${String(memo.sourceId)}`);
+  }
+  if (memo.channelId) {
+    lines.push(`discordChannelId: ${String(memo.channelId)}`);
+  }
+  if (memo.messageId) {
+    lines.push(`discordMessageId: ${String(memo.messageId)}`);
+  }
+  lines.push(`createdAt: ${new Date(Number(memo.generatedAtMs || Date.now())).toISOString()}`);
+  if (tags.length > 0) {
+    lines.push(`tags: [${tags.map((t) => `\"${t.replace(/\"/g, '')}\"`).join(', ')}]`);
+  }
+  lines.push('---');
+  lines.push('');
+
   lines.push(`# ${memo.title}`);
+  if (tags.length > 0) {
+    lines.push('');
+    lines.push(tags.join(' '));
+  }
+
   lines.push('');
   lines.push('## TL;DR');
   lines.push(memo.tldr ? `- ${memo.tldr}` : '-');
@@ -5082,12 +5141,11 @@ function buildMemoMarkdown(memo) {
   } else {
     lines.push('-');
   }
+
   lines.push('');
   lines.push('## Links');
-  lines.push(`- Source: ${memo.sourceUrl || '-'}`);
-  if (memo.linearUrl) {
-    lines.push(`- Linear: ${memo.linearUrl}`);
-  }
+  lines.push(links.length > 0 ? links.join('\n') : '-');
+
   lines.push('');
   lines.push('## Raw Notes');
   lines.push('```text');
@@ -5098,10 +5156,38 @@ function buildMemoMarkdown(memo) {
   return lines.join('\n');
 }
 
+function inferMemoCategory(memo) {
+  const tags = Array.isArray(memo.tags)
+    ? memo.tags.map((item) => String(item || '').trim().toLowerCase()).filter(Boolean)
+    : [];
+  const raw = String(memo.rawNotes || '').toLowerCase();
+
+  if (tags.some((t) => t.includes('distill') || t.includes('蒸馏')) || raw.includes('distill')) {
+    return 'Models/Distill';
+  }
+  if (tags.some((t) => t.includes('router') || t.includes('routing') || t.includes('路由')) || raw.includes('router')) {
+    return 'Systems/Routing';
+  }
+  if (tags.some((t) => t.includes('ops')) || raw.includes('watchdog') || raw.includes('cron')) {
+    return 'Ops';
+  }
+  if (tags.some((t) => t.includes('decision')) || raw.includes('tradeoff') || raw.includes('对比')) {
+    return 'Decisions';
+  }
+
+  return 'Inbox';
+}
+
 function saveObsidianMemo(memo, settings) {
-  const vaultPath = path.resolve(settings.obsidian && settings.obsidian.vaultPath ? settings.obsidian.vaultPath : path.join(ROOT_DIR, '..', 'Obsidian'));
-  const relDir = (settings.obsidian && settings.obsidian.memoDir) ? settings.obsidian.memoDir : 'Knowledge';
-  const memoDir = path.join(vaultPath, relDir);
+  const vaultPath = path.resolve(
+    settings.obsidian && settings.obsidian.vaultPath
+      ? settings.obsidian.vaultPath
+      : path.join(ROOT_DIR, '..', 'Obsidian'),
+  );
+  const relDir = settings.obsidian && settings.obsidian.memoDir ? settings.obsidian.memoDir : 'Knowledge';
+
+  const category = inferMemoCategory(memo);
+  const memoDir = path.join(vaultPath, relDir, category);
   ensureDirSync(memoDir);
 
   const dateId = formatDateId(memo.generatedAtMs, settings.timezone || 'UTC');
@@ -5126,6 +5212,7 @@ function saveObsidianMemo(memo, settings) {
 async function buildDiscordMemo(input, settings) {
   const channelId = String(input.channelId || '').trim();
   const messageId = String(input.messageId || '').trim();
+  const tags = normalizeLabelNames(input.labels || input.tags || []);
   const nowMs = Date.now();
 
   const messages = await fetchDiscordMessagesViaOpenClaw(channelId, messageId, 30);
@@ -5181,6 +5268,9 @@ async function buildDiscordMemo(input, settings) {
     author: String(authorName || '').trim(),
     sourceUrl,
     sourceId,
+    channelId,
+    messageId,
+    tags,
     generatedAtMs: nowMs,
     timezone: settings.timezone || 'UTC',
     linearUrl: '',
