@@ -33,11 +33,12 @@ Primary focus:
   - `scripts/tasks.js` (`status-sync`)
   - `data/control-center/status-sync.json`
 
-3. 去重与幂等（sourceId）
-- Status: `Done (v1)`
+3. 去重与幂等（sourceId + signature）
+- Status: `Done (v2)`
 - Evidence:
   - `scripts/tasks.js` (`triage` + intake adapters)
   - `data/control-center/triage-source-index.json`
+  - `data/control-center/triage-signature-index.json`
 
 4. 可靠投递层（queue + retry + DLQ）
 - Status: `Done (v1)`
@@ -65,6 +66,17 @@ Primary focus:
   - `docs/sop/SOP_MC_Audit_Permissions_v1.md`
   - `scripts/tasks.js` audit appends
   - `data/control-center/audit.jsonl`
+
+8. 日/周 Briefing 自动化
+- Status: `Done (v1)`
+- Evidence:
+  - `scripts/tasks.js` (`briefing`)
+  - `docs/sop/SOP_MC_Briefing_Automation_v1.md`
+
+9. Calendar 已映射 issue 更新
+- Status: `Done (v1)`
+- Evidence:
+  - `scripts/tasks.js` (`calendar-sync --to-linear` update path)
 
 ## Current Upstream Links
 
@@ -191,3 +203,20 @@ Use this template for each update:
 - Links:
   - `docs/sop/SOP_MC_Runbook_AutoFix_v2.md`
   - `docs/sop/SOP_MC_Audit_Permissions_v1.md`
+
+### 2026-02-20 22:35
+- What changed:
+  - Added `briefing` command (daily/weekly) with optional message send and schedule integration.
+  - Added reminder SLA watch + optional blocked auto-escalation.
+  - Completed calendar mapped-issue update path (`calendar-sync --to-linear` now updates existing issue).
+  - Added signature-based triage dedupe index (`triage-signature-index.json`).
+  - Added SOP docs for briefing automation and signature dedupe.
+- Current state:
+  - P0/P1/P2 baseline automation loop is runnable end-to-end in Mission Control.
+- Blockers:
+  - none.
+- Next action:
+  - create official upstream issue checklist and split PR patches by risk.
+- Links:
+  - `docs/sop/SOP_MC_Briefing_Automation_v1.md`
+  - `docs/sop/SOP_MC_Triage_Signature_Dedupe_v1.md`

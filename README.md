@@ -26,23 +26,29 @@ Tracking page for ongoing OpenClaw development projects:
 
 - `tasks agents`: list backend subagents (`label/status/start/elapsed`)
 - `tasks report`: runtime health report with Top 5 anomalies + human actions
+- `tasks briefing`: daily/weekly briefing template (report + cycle + SLA watch), optional send
 - `tasks watchdog`: incident loop for cron failures/timeout/silence, with optional Linear auto issue creation
 - `tasks triage`: external input to Linear Triage issue
 - `tasks remind`: due-soon + current-cycle reminders
-- `tasks ingest-server`: webhook intake (`/triage`) + GitHub PR state sync (`/github/pr`)
+- `tasks ingest-server`: webhook intake (`/triage` + `/discord/message`) + GitHub PR state sync (`/github/pr`)
 - `tasks github-hooks`: install git hooks to enforce/add Linear ID in branch/commit
 - `tasks github-sync`: poll GitHub PRs and sync Linear state (In Review/Done) without webhook dependency
 - `tasks todoist-sync`: pull Todoist tasks and create Linear triage issues
+- `tasks todoist-backsync`: mark Todoist tasks done when linked Linear issue reaches Done
 - `tasks calendar-sync`: capture Google Calendar events from logged-in browser tab
 - `tasks status-sync`: auto status machine (`Triage -> In Progress -> In Review -> Done/Blocked`) for linked runtime issues
 - `tasks queue-drain`: retry ingest queue and move exhausted items to DLQ
 - `tasks sla-check`: stale issue SLA check (Blocked/In Progress) with owner mention + escalation issue
+- `tasks eval-replay`: export replay artifact for eval/distillation workflow
 - `tasks runbook-exec`: run SOP runbook cards in dry-run or guarded execute mode
+- `tasks trigger`: one-click run for sync/report/watchdog jobs with confirmation token
+- `tasks autopr`: guarded low-risk auto PR flow (dry-run default)
 - `tasks run|enable|disable|kill`: control actions with one-time confirmation token
 - `tasks schedule`: generate/install crontab for:
   - Daily report at `09:00` and `18:00`
   - Watchdog every `5` minutes
   - Due-soon reminder daily + cycle reminder weekly
+  - Daily + weekly briefing
 
 ## Quick start
 
@@ -141,6 +147,12 @@ npm run tasks -- triage --title "..." --source discord --source-id discord:msg:1
 # Reminder report from Linear
 npm run tasks -- remind all --send
 
+# Daily briefing template
+npm run tasks -- briefing daily --send
+
+# Weekly briefing template
+npm run tasks -- briefing weekly --send
+
 # Start webhook server for external systems
 npm run tasks -- ingest-server --port 8788
 
@@ -153,6 +165,9 @@ npm run tasks -- github-sync
 # Todoist -> Linear triage sync
 npm run tasks -- todoist-sync
 
+# Linear Done -> Todoist complete
+npm run tasks -- todoist-backsync
+
 # Google Calendar snapshot sync (requires logged-in tab in openclaw browser profile)
 npm run tasks -- calendar-sync
 
@@ -164,6 +179,15 @@ npm run tasks -- queue-drain
 
 # Stale SLA checks + escalation
 npm run tasks -- sla-check
+
+# Trigger one-click control job (requires confirm token)
+npm run tasks -- trigger github-sync --confirm "CONFIRM <CODE>"
+
+# Guarded auto PR (dry-run default)
+npm run tasks -- autopr --issue CLAW-123
+
+# Eval replay artifact for distillation
+npm run tasks -- eval-replay --emit-plan
 
 # Runbook v2 (default dry-run)
 npm run tasks -- runbook-exec --card cron-recover --issue CLAW-123
@@ -212,10 +236,13 @@ npm run tasks -- disable <jobId> --confirm "CONFIRM <CODE>"
 npm run tasks -- enable <jobId> --confirm "CONFIRM <CODE>"
 npm run tasks -- run <jobId> --confirm "CONFIRM <CODE>"
 npm run tasks -- kill <subagentId> --confirm "CONFIRM <CODE>"
+npm run tasks -- trigger github-sync --confirm "CONFIRM <CODE>"
+npm run tasks -- autopr --issue CLAW-123 --confirm "CONFIRM <CODE>" --execute
 npm run tasks -- runbook-exec --card queue-backlog --issue CLAW-123 --confirm "CONFIRM <CODE>" --execute
 ```
 
 `kill` is blocked unless the subagent ID is in whitelist.
+`autopr --execute` is blocked unless `autopr.allowExecute=true`.
 `runbook-exec --execute` is blocked unless `runbook.allowExecute=true`.
 
 ## Scheduling
@@ -242,6 +269,12 @@ Disable reminder cron lines:
 
 ```bash
 npm run tasks -- schedule --without-reminders
+```
+
+Disable briefing cron lines:
+
+```bash
+npm run tasks -- schedule --without-briefing
 ```
 
 Disable integration poll lines:
@@ -279,7 +312,9 @@ Issue body includes:
 - `jobId` + job metadata
 - latest error summary
 - run log location (`~/.openclaw/cron/runs/<jobId>.jsonl`)
-- suggested fix steps
+- failure signature + runbook card
+- executable next-step commands
+- possible causes list
 
 ### External intake (Discord / forms / mail / Notion / Todoist)
 
@@ -303,12 +338,28 @@ curl -X POST "http://127.0.0.1:8788/triage" \
   }'
 ```
 
+Create triage issue from Discord webhook payload directly:
+
+```bash
+curl -X POST "http://127.0.0.1:8788/discord/message" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messageId":"123456789",
+    "channelId":"987654321",
+    "guildId":"1122334455",
+    "content":"CLAW-123 discord 上手动切换模型不可用，报 timeout",
+    "author":"frank",
+    "url":"https://discord.com/channels/1122334455/987654321/123456789"
+  }'
+```
+
 ### GitHub -> Linear state sync
 
 `/github/pr` endpoint supports GitHub `pull_request` webhook:
 
 - PR opened/reopened/ready_for_review/review_requested -> move issue to `In Review`
 - PR merged -> move issue to `Done`
+- on state transition, webhook posts evidence comment back to Linear
 
 Linear ID is extracted from PR title/body/branch, for example `CLAW-123`.
 
@@ -337,6 +388,12 @@ npm run tasks -- todoist-sync
 
 If token is not set, CLI tries to extract it from a logged-in Todoist tab in `openclaw` browser profile and persists to local `config/control-center.json`.
 
+Close Todoist tasks from Linear completion:
+
+```bash
+npm run tasks -- todoist-backsync
+```
+
 ### SourceId idempotency (dedupe)
 
 To avoid duplicate issues from multi-channel intake (Discord/Todoist/Calendar/webhook), provide:
@@ -349,6 +406,12 @@ The pair is indexed at:
 - `data/control-center/triage-source-index.json`
 
 If the same `source + sourceId` arrives again, Mission Control returns the existing issue instead of creating a duplicate.
+
+Additional dedupe layer:
+
+- `data/control-center/triage-signature-index.json`
+
+This suppresses repeats with the same intake signature (especially repeated repo+error alerts).
 
 ### Ingest queue + DLQ
 
@@ -378,9 +441,24 @@ Queue behavior:
 - `Blocked` over threshold -> owner mention + optional escalation issue
 - `In Progress` stale over threshold -> owner mention reminder
 
+`remind` can include SLA watch and optional blocked auto-escalation:
+
+```bash
+npm run tasks -- remind all --auto-escalate --send
+```
+
 State file:
 
 - `data/control-center/sla-check.json`
+
+### Briefing automation
+
+`briefing` combines runtime health report + cycle focus + SLA watch into one daily/weekly message.
+
+```bash
+npm run tasks -- briefing daily --send
+npm run tasks -- briefing weekly --send
+```
 
 ### Runtime status machine
 
@@ -427,6 +505,8 @@ Optional: create Linear triage issues from captured events:
 npm run tasks -- calendar-sync --to-linear
 ```
 
+If an event is already mapped to a Linear issue, `calendar-sync --to-linear` updates that issue title/description with latest snapshot text.
+
 ## Config
 
 Copy template and edit:
@@ -444,6 +524,7 @@ Fields:
 - `linear.*`
 - `ingest.*`
 - `reminders.*`
+- `briefing.*`
 - `github.*`
 - `todoist.*`
 - `calendar.*`
@@ -460,6 +541,7 @@ Runtime files created by CLI/dashboard:
 - `data/control-center/incidents.json`
 - `data/control-center/status-sync.json`
 - `data/control-center/triage-source-index.json`
+- `data/control-center/triage-signature-index.json`
 - `data/control-center/ingest-queue.json`
 - `data/control-center/ingest-dlq.json`
 - `data/control-center/sla-check.json`

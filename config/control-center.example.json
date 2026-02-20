@@ -17,6 +17,18 @@
     "confirmTtlMinutes": 10,
     "killWhitelist": [
       "example-subagent-id"
+    ],
+    "triggerWhitelist": [
+      "github-sync",
+      "todoist-sync",
+      "calendar-sync",
+      "watchdog",
+      "report",
+      "briefing",
+      "remind",
+      "status-sync",
+      "queue-drain",
+      "sla-check"
     ]
   },
   "linear": {
@@ -29,6 +41,7 @@
     "host": "127.0.0.1",
     "port": 8788,
     "triagePath": "/triage",
+    "discordPath": "/discord/message",
     "githubPath": "/github/pr",
     "token": "",
     "maxBodyBytes": 1048576
@@ -36,17 +49,35 @@
   "reminders": {
     "enabled": true,
     "dueSoonDays": 7,
+    "staleInProgressDays": 3,
+    "blockedEscalationHours": 24,
+    "autoEscalateBlocked": false,
     "dueSoonCron": "0 10 * * *",
     "cycleCron": "30 9 * * 1",
     "channel": "discord",
     "target": "channel:123456789012345678",
     "maxSendLength": 3000
   },
+  "briefing": {
+    "enabled": true,
+    "dailyCron": "15 9 * * *",
+    "weeklyCron": "0 9 * * 1",
+    "channel": "discord",
+    "target": "channel:123456789012345678",
+    "maxSendLength": 3000,
+    "includeSla": true,
+    "staleInProgressDays": 3,
+    "blockedEscalationHours": 24,
+    "autoEscalateBlocked": false
+  },
   "github": {
     "stateInReview": "In Review",
     "stateDone": "Done",
     "webhookSecret": "",
     "token": "",
+    "autoReviewers": [
+      "reviewer-login"
+    ],
     "repos": [
       "frank8ai/openclaw-workspace",
       "frank8ai/openclaw-mission-control"
@@ -58,6 +89,7 @@
     "enabled": true,
     "apiToken": "",
     "syncToLinear": true,
+    "syncFromLinearDone": true,
     "label": "todoist",
     "defaultState": "Triage",
     "syncBatchSize": 10
@@ -92,6 +124,94 @@
     "commentCooldownHours": 24,
     "createOpsIssue": true,
     "pollMinutes": 30
+  },
+  "triageRouting": {
+    "enabled": true,
+    "defaultState": "Triage",
+    "defaultPriority": 3,
+    "defaultLabels": [],
+    "defaultAssigneeEmail": "",
+    "sourceRules": {
+      "discord": {
+        "labels": [
+          "discord"
+        ]
+      },
+      "github": {
+        "labels": [
+          "github"
+        ]
+      },
+      "todoist": {
+        "labels": [
+          "todoist"
+        ]
+      },
+      "calendar": {
+        "labels": [
+          "calendar"
+        ]
+      },
+      "google-calendar": {
+        "labels": [
+          "calendar"
+        ]
+      }
+    },
+    "keywordRules": [
+      {
+        "pattern": "timeout|timed out|超时",
+        "labels": [
+          "timeout",
+          "ops"
+        ],
+        "priority": 2
+      },
+      {
+        "pattern": "blocked|卡住|无法",
+        "labels": [
+          "blocked"
+        ],
+        "priority": 2
+      },
+      {
+        "pattern": "urgent|紧急|p0",
+        "priority": 1
+      }
+    ],
+    "signatureDedupe": {
+      "enabled": true,
+      "lookbackDays": 14,
+      "maxEntries": 2000,
+      "minChars": 30,
+      "sourceAllowlist": [
+        "discord",
+        "github",
+        "webhook",
+        "manual",
+        "mission-control",
+        "sla-check"
+      ]
+    }
+  },
+  "autopr": {
+    "enabled": true,
+    "allowExecute": false,
+    "defaultDryRun": true,
+    "baseBranch": "main",
+    "maxChangedFiles": 30,
+    "allowedPathPrefixes": [
+      "docs/",
+      ".github/",
+      "README.md",
+      "config/"
+    ],
+    "testCommand": "npm run lint"
+  },
+  "evalReplay": {
+    "enabled": true,
+    "maxSessions": 200,
+    "maxRunsPerJob": 20
   },
   "runbook": {
     "enabled": true,

@@ -16,3 +16,7 @@ This index lists project-level SOPs for OpenClaw Mission Control automation.
   - Purpose: guarded semi-automatic runbook execution with confirmation token, allowlist, and audit.
 - `SOP_MC_Audit_Permissions_v1.md`
   - Purpose: enforce read-by-default with explicit confirmation and auditable write actions.
+- `SOP_MC_Briefing_Automation_v1.md`
+  - Purpose: generate/send daily-weekly briefing from runtime + cycle + SLA signals.
+- `SOP_MC_Triage_Signature_Dedupe_v1.md`
+  - Purpose: suppress repeated intake issues via repo/error signature fingerprint.

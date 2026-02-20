@@ -23,6 +23,7 @@ const GITHUB_SYNC_PATH = path.join(DATA_DIR, 'github-sync.json');
 const STATUS_SYNC_PATH = path.join(DATA_DIR, 'status-sync.json');
 const ISSUE_LINKS_PATH = path.join(DATA_DIR, 'runtime-issue-links.json');
 const SOURCE_ID_INDEX_PATH = path.join(DATA_DIR, 'triage-source-index.json');
+const TRIAGE_SIGNATURE_INDEX_PATH = path.join(DATA_DIR, 'triage-signature-index.json');
 const INGEST_QUEUE_PATH = path.join(DATA_DIR, 'ingest-queue.json');
 const INGEST_DLQ_PATH = path.join(DATA_DIR, 'ingest-dlq.json');
 const AUDIT_LOG_PATH = path.join(DATA_DIR, 'audit.jsonl');
@@ -51,6 +52,18 @@ const DEFAULTS = {
   control: {
     confirmTtlMinutes: 10,
     killWhitelist: [],
+    triggerWhitelist: [
+      'github-sync',
+      'todoist-sync',
+      'calendar-sync',
+      'watchdog',
+      'report',
+      'briefing',
+      'remind',
+      'status-sync',
+      'queue-drain',
+      'sla-check',
+    ],
   },
   linear: {
     enabled: true,
@@ -63,6 +76,7 @@ const DEFAULTS = {
     host: process.env.CONTROL_CENTER_INGEST_HOST || '127.0.0.1',
     port: Number(process.env.CONTROL_CENTER_INGEST_PORT || 8788),
     triagePath: process.env.CONTROL_CENTER_TRIAGE_PATH || '/triage',
+    discordPath: process.env.CONTROL_CENTER_DISCORD_PATH || '/discord/message',
     githubPath: process.env.CONTROL_CENTER_GITHUB_PATH || '/github/pr',
     token: process.env.CONTROL_CENTER_INGEST_TOKEN || '',
     maxBodyBytes: 1024 * 1024,
@@ -70,17 +84,33 @@ const DEFAULTS = {
   reminders: {
     enabled: true,
     dueSoonDays: 7,
+    staleInProgressDays: 3,
+    blockedEscalationHours: 24,
+    autoEscalateBlocked: false,
     dueSoonCron: '0 10 * * *',
     cycleCron: '30 9 * * 1',
     channel: process.env.CONTROL_CENTER_REMINDER_CHANNEL || '',
     target: process.env.CONTROL_CENTER_REMINDER_TARGET || '',
     maxSendLength: 3000,
   },
+  briefing: {
+    enabled: true,
+    dailyCron: '15 9 * * *',
+    weeklyCron: '0 9 * * 1',
+    channel: process.env.CONTROL_CENTER_BRIEFING_CHANNEL || '',
+    target: process.env.CONTROL_CENTER_BRIEFING_TARGET || '',
+    maxSendLength: 3000,
+    includeSla: true,
+    staleInProgressDays: 3,
+    blockedEscalationHours: 24,
+    autoEscalateBlocked: false,
+  },
   github: {
     stateInReview: 'In Review',
     stateDone: 'Done',
     webhookSecret: process.env.GITHUB_WEBHOOK_SECRET || '',
     token: process.env.GITHUB_TOKEN || '',
+    autoReviewers: [],
     repos: [],
     pollIntervalMinutes: 15,
     lookbackHours: 72,
@@ -89,6 +119,7 @@ const DEFAULTS = {
     enabled: true,
     apiToken: process.env.TODOIST_API_TOKEN || '',
     syncToLinear: true,
+    syncFromLinearDone: true,
     label: 'todoist',
     defaultState: 'Triage',
     syncBatchSize: 10,
@@ -100,6 +131,10 @@ const DEFAULTS = {
     syncToLinear: false,
     label: 'calendar',
     defaultState: 'Triage',
+  },
+  obsidian: {
+    vaultPath: process.env.OBSIDIAN_VAULT_PATH || path.join(ROOT_DIR, '..', 'Obsidian'),
+    memoDir: process.env.OBSIDIAN_MEMO_DIR || 'Knowledge',
   },
   statusMachine: {
     enabled: true,
@@ -124,6 +159,67 @@ const DEFAULTS = {
     createOpsIssue: true,
     pollMinutes: 30,
   },
+  triageRouting: {
+    enabled: true,
+    defaultState: 'Triage',
+    defaultPriority: 3,
+    defaultLabels: [],
+    defaultAssigneeEmail: '',
+    sourceRules: {
+      discord: {
+        labels: ['discord'],
+      },
+      github: {
+        labels: ['github'],
+      },
+      todoist: {
+        labels: ['todoist'],
+      },
+      calendar: {
+        labels: ['calendar'],
+      },
+      'google-calendar': {
+        labels: ['calendar'],
+      },
+    },
+    keywordRules: [
+      {
+        pattern: 'timeout|timed out|超时',
+        labels: ['timeout', 'ops'],
+        priority: 2,
+      },
+      {
+        pattern: 'blocked|卡住|无法',
+        labels: ['blocked'],
+        priority: 2,
+      },
+      {
+        pattern: 'urgent|紧急|p0',
+        priority: 1,
+      },
+    ],
+    signatureDedupe: {
+      enabled: true,
+      lookbackDays: 14,
+      maxEntries: 2000,
+      minChars: 30,
+      sourceAllowlist: ['discord', 'github', 'webhook', 'manual', 'mission-control', 'sla-check'],
+    },
+  },
+  autopr: {
+    enabled: true,
+    allowExecute: false,
+    defaultDryRun: true,
+    baseBranch: 'main',
+    maxChangedFiles: 30,
+    allowedPathPrefixes: ['docs/', '.github/', 'README.md', 'config/'],
+    testCommand: 'npm run lint',
+  },
+  evalReplay: {
+    enabled: true,
+    maxSessions: 200,
+    maxRunsPerJob: 20,
+  },
   runbook: {
     enabled: true,
     allowExecute: false,
@@ -145,18 +241,22 @@ Read commands:
   agents                       List subagents (label/status/start/elapsed)
   sessions                     List active sessions summary
   report [--json] [--send]     Build health report (Top 5 anomalies + manual actions)
+  briefing [daily|weekly]      Build daily/weekly briefing template and optional send
   watchdog [--auto-linear]     Detect incidents and optionally auto-create Linear issues
   remind [due|cycle|all]       Send reminders from Linear (due soon/current cycle)
   status-sync [--json]         Auto state machine + comment trail for linked runtime issues
   queue-drain [--json]         Retry ingest queue and move failed payloads to DLQ
   sla-check [--json]           Stale/blocked SLA checks with owner mention + escalation issue
+  eval-replay [--json]         Build replay artifact for evaluation/distillation workflow
 
 Integrations:
   triage --title ...           Create a Triage issue quickly (supports --source/--source-id/--labels)
+  memo-save --channel-id ...    Save a Discord memo into Obsidian and create a linked Linear issue
   ingest-server                Start webhook server for external intake + GitHub PR sync
   github-hooks [--repo PATH]   Install git hooks to enforce/add Linear ID in branch/commit
   github-sync                  Poll GitHub PRs and sync Linear states (In Review/Done)
   todoist-sync                 Sync Todoist tasks into Linear Triage
+  todoist-backsync             Mark Todoist tasks complete when linked Linear issues are Done
   calendar-sync                Sync Google Calendar events snapshot (browser logged-in tab)
 
 Write commands (require one-time confirmation):
@@ -165,6 +265,8 @@ Write commands (require one-time confirmation):
   enable <jobId> --confirm CODE
   disable <jobId> --confirm CODE
   kill <subagentId> --confirm CODE
+  trigger <jobId> --confirm CODE [--json]
+  autopr [--issue CLAW-123] --confirm CODE [--execute]
   runbook-exec --card CARD [--issue CLAW-123] [--cron-id ID] --confirm CODE [--execute]
 
 Scheduling:
@@ -173,13 +275,17 @@ Scheduling:
     - 09:00 + 18:00 report
     - every 5 minutes watchdog
     - status machine + queue drain + sla-check
-    - reminders (due soon + cycle planning)
+    - reminders + daily/weekly briefing
 
 Examples:
   npm run tasks -- triage --title "Fix Discord manual model switch" --source discord --source-id discord:msg:123
+  npm run tasks -- memo-save --channel-id 1473599984338472980 --message-id 1474299084822020127 --title "Distill+router plan" --labels "research,decision" --create-linear
   npm run tasks -- status-sync
   npm run tasks -- queue-drain
   npm run tasks -- sla-check
+  npm run tasks -- briefing daily --send
+  npm run tasks -- trigger github-sync --confirm "CONFIRM ABC123"
+  npm run tasks -- autopr --issue CLAW-123 --confirm "CONFIRM ABC123"
   npm run tasks -- runbook-exec --card cron-recover --issue CLAW-123 --confirm "CONFIRM ABC123" --execute
 `;
 
@@ -211,11 +317,19 @@ async function main() {
       case 'report':
         await cmdReport(settings, flags);
         return;
+      case 'briefing':
+      case 'brief':
+        await cmdBriefing(settings, flags);
+        return;
       case 'watchdog':
         await cmdWatchdog(settings, flags);
         return;
       case 'triage':
         await cmdTriage(settings, flags);
+        return;
+      case 'memo-save':
+      case 'memo':
+        await cmdMemoSave(settings, flags);
         return;
       case 'remind':
       case 'reminder':
@@ -232,6 +346,11 @@ async function main() {
       case 'sla-check':
       case 'sla':
         await cmdSlaCheck(settings, flags);
+        return;
+      case 'eval-replay':
+      case 'replay-eval':
+      case 'distill-replay':
+        await cmdEvalReplay(settings, flags);
         return;
       case 'runbook-exec':
       case 'runbook':
@@ -253,6 +372,10 @@ async function main() {
       case 'todoist':
         await cmdTodoistSync(settings, flags);
         return;
+      case 'todoist-backsync':
+      case 'todoist-done-sync':
+        await cmdTodoistBacksync(settings, flags);
+        return;
       case 'calendar-sync':
       case 'gcal-sync':
       case 'calendar':
@@ -272,6 +395,15 @@ async function main() {
         return;
       case 'kill':
         await cmdKill(settings, flags);
+        return;
+      case 'trigger':
+      case 'run-job':
+      case 'job-trigger':
+        await cmdTrigger(settings, flags);
+        return;
+      case 'autopr':
+      case 'auto-pr':
+        await cmdAutoPr(settings, flags);
         return;
       case 'schedule':
         await cmdSchedule(settings, flags);
@@ -612,6 +744,100 @@ async function cmdReport(settings, flags) {
   }
 }
 
+async function cmdBriefing(settings, flags) {
+  if (settings.briefing && settings.briefing.enabled === false) {
+    throw new Error('briefing is disabled in config.');
+  }
+
+  const mode = String(flags._[0] || flags.mode || 'daily').trim().toLowerCase();
+  if (!['daily', 'weekly'].includes(mode)) {
+    throw new Error(`invalid briefing mode: ${mode}. expected daily|weekly`);
+  }
+
+  const snapshot = collectSnapshot(settings);
+  const report = buildReport(snapshot, settings);
+
+  const reminderMode = mode === 'weekly' ? 'cycle' : 'all';
+  const reminderDays = Number(
+    flags.days || (mode === 'weekly' ? Math.max(7, Number(settings.reminders.dueSoonDays || 7)) : settings.reminders.dueSoonDays || 7),
+  );
+  const includeSla =
+    !Boolean(flags['without-sla']) &&
+    Boolean(flags['include-sla'] || settings.briefing.includeSla !== false);
+  const staleInProgressDays = Math.max(
+    1,
+    Number(
+      flags['stale-days'] ||
+        settings.briefing.staleInProgressDays ||
+        settings.reminders.staleInProgressDays ||
+        3,
+    ),
+  );
+  const blockedEscalationHours = Math.max(
+    1,
+    Number(
+      flags['blocked-hours'] ||
+        settings.briefing.blockedEscalationHours ||
+        settings.reminders.blockedEscalationHours ||
+        24,
+    ),
+  );
+  const autoEscalateBlocked = Boolean(
+    flags['auto-escalate'] ||
+      flags.escalate ||
+      settings.briefing.autoEscalateBlocked === true,
+  );
+  const reminderBundle = await buildReminderPayload(settings, {
+    mode: reminderMode,
+    dueDays: reminderDays,
+    includeSla,
+    staleInProgressDays,
+    blockedEscalationHours,
+    autoEscalateBlocked,
+  });
+
+  const briefing = {
+    mode,
+    generatedAtMs: Date.now(),
+    report,
+    reminder: reminderBundle.data,
+    autoEscalated: reminderBundle.escalated || [],
+  };
+
+  const rendered = renderBriefing(briefing, settings);
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify({ ok: true, ...briefing, rendered }, null, 2)}\n`);
+  } else {
+    process.stdout.write(`${rendered}\n`);
+  }
+
+  if (flags.send) {
+    const channel = String(
+      flags.channel || settings.briefing.channel || settings.report.channel || '',
+    ).trim();
+    const target = String(
+      flags.target || settings.briefing.target || settings.report.target || '',
+    ).trim();
+    if (!channel || !target) {
+      throw new Error('briefing --send requires --channel and --target (or values in config).');
+    }
+
+    const maxLength = Number(flags['max-message-length'] || settings.briefing.maxSendLength || 3000);
+    const text = trimMessage(rendered, maxLength);
+    runCommand('openclaw', [
+      'message',
+      'send',
+      '--channel',
+      channel,
+      '--target',
+      target,
+      '--message',
+      text,
+    ]);
+    process.stdout.write(`Briefing sent via openclaw message send (${channel} -> ${target}).\n`);
+  }
+}
+
 async function cmdWatchdog(settings, flags) {
   const snapshot = collectSnapshot(settings);
   const report = buildReport(snapshot, settings);
@@ -661,6 +887,11 @@ async function cmdWatchdog(settings, flags) {
       jobId: candidate.job.id,
       jobName: candidate.job.name || '',
       summary: candidate.summary,
+      runbookCard: candidate.runbook ? candidate.runbook.card : '',
+      runbookSignature: candidate.runbook ? candidate.runbook.signature : '',
+      runbookNextCommands: candidate.runbook && Array.isArray(candidate.runbook.nextCommands)
+        ? candidate.runbook.nextCommands
+        : [],
       issueId: issue ? issue.id : '',
       issueIdentifier: issue ? issue.identifier : '',
       issueUrl: issue ? issue.url : '',
@@ -704,7 +935,9 @@ async function cmdWatchdog(settings, flags) {
       const issueText = item.issueIdentifier
         ? `${item.issueIdentifier} ${item.issueUrl || ''}`.trim()
         : 'local-only record';
-      lines.push(`- ${item.jobId} (${item.reason}) -> ${issueText}`);
+      lines.push(
+        `- ${item.jobId} (${item.reason}) [${item.runbookCard || '-'}:${item.runbookSignature || '-'}] -> ${issueText}`,
+      );
     }
   }
 
@@ -804,6 +1037,382 @@ async function cmdKill(settings, flags) {
   process.stdout.write(`Sent SIGTERM to subagent ${subagentId} (pid ${target.pid}).\n`);
 }
 
+async function cmdTrigger(settings, flags) {
+  const jobId = normalizeTriggerJobId(flags._[0] || flags.job || '');
+  if (!jobId) {
+    throw new Error(
+      'trigger requires a job id. Allowed: github-sync,todoist-sync,calendar-sync,watchdog,report,briefing,remind,status-sync,queue-drain,sla-check',
+    );
+  }
+
+  consumeConfirmation(flags.confirm);
+
+  const whitelist = new Set(
+    (Array.isArray(settings.control.triggerWhitelist) ? settings.control.triggerWhitelist : [])
+      .map((item) => normalizeTriggerJobId(item))
+      .filter(Boolean),
+  );
+  if (!whitelist.has(jobId)) {
+    throw new Error(`job ${jobId} is not allowed. Update control.triggerWhitelist first.`);
+  }
+
+  const scriptPath = path.join(ROOT_DIR, 'scripts', 'tasks.js');
+  const childArgs = buildTriggerChildArgs(jobId, settings, flags);
+  const commandText = `${process.execPath} ${[scriptPath, ...childArgs].map(shellQuote).join(' ')}`;
+
+  let payload = null;
+  try {
+    const output = runCommand(process.execPath, [scriptPath, ...childArgs]);
+    payload = extractJson(output.stdout || '');
+    appendAuditEvent('control-trigger-job', {
+      jobId,
+      command: commandText,
+      ok: true,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    appendAuditEvent('control-trigger-job-error', {
+      jobId,
+      command: commandText,
+      ok: false,
+      error: message,
+    });
+    throw error;
+  }
+
+  const result = {
+    ok: true,
+    jobId,
+    command: commandText,
+    payload,
+  };
+
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+
+  const lines = [];
+  lines.push('Trigger result:');
+  lines.push(`- job: ${jobId}`);
+  lines.push(`- command: ${commandText}`);
+  if (payload && typeof payload === 'object') {
+    lines.push(`- payload keys: ${Object.keys(payload).join(', ')}`);
+  } else {
+    lines.push('- payload: non-json output');
+  }
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+async function cmdAutoPr(settings, flags) {
+  if (settings.autopr && settings.autopr.enabled === false) {
+    throw new Error('autopr is disabled in config.');
+  }
+
+  const repoPath = path.resolve(String(flags.repo || path.resolve(ROOT_DIR, '..')).trim());
+  const issueIdentifier = normalizeLinearIssueId(flags.issue || flags.identifier || '');
+  const baseBranch = String(flags.base || settings.autopr.baseBranch || 'main').trim();
+  const defaultDryRun = settings.autopr.defaultDryRun !== false;
+  const explicitExecute = Boolean(flags.execute || flags.apply);
+  const explicitDryRun = Boolean(flags['dry-run'] || flags.dryRun);
+  const dryRun = explicitExecute ? false : explicitDryRun ? true : defaultDryRun;
+  const testCommand = String(flags['test-command'] || settings.autopr.testCommand || '').trim();
+  const maxChangedFiles = Math.max(1, Number(settings.autopr.maxChangedFiles || 30));
+  const allowedPrefixes = Array.isArray(settings.autopr.allowedPathPrefixes)
+    ? settings.autopr.allowedPathPrefixes.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+
+  const remote = getGitRemote(repoPath);
+  const githubRepo = normalizeGithubRepo(remote);
+  if (!githubRepo) {
+    throw new Error(`Unable to resolve GitHub repo from remote: ${remote || '(missing)'}`);
+  }
+
+  const branchCurrent = String(
+    runCommand('git', ['-C', repoPath, 'branch', '--show-current']).stdout || '',
+  ).trim();
+  if (!branchCurrent) {
+    throw new Error('Unable to resolve current git branch.');
+  }
+
+  const statusOutput = runCommand('git', ['-C', repoPath, 'status', '--porcelain']).stdout || '';
+  const changedFiles = parseGitChangedFiles(statusOutput);
+  if (changedFiles.length === 0) {
+    throw new Error('autopr found no local changes.');
+  }
+  if (changedFiles.length > maxChangedFiles) {
+    throw new Error(`autopr changed files ${changedFiles.length} exceed maxChangedFiles=${maxChangedFiles}.`);
+  }
+
+  const lowRisk = evaluateAutoPrRisk(changedFiles, allowedPrefixes);
+  if (!lowRisk.ok) {
+    throw new Error(`autopr blocked by risk gate. Non-allowed files: ${lowRisk.blockedFiles.join(', ')}`);
+  }
+
+  const branchNeedsFork = ['main', 'master', baseBranch].includes(branchCurrent);
+  const branchName = branchNeedsFork
+    ? String(
+        flags.branch ||
+          `auto/${(issueIdentifier || 'ops').toLowerCase()}-${new Date()
+            .toISOString()
+            .replace(/[^0-9]/g, '')
+            .slice(0, 12)}`,
+      ).trim()
+    : branchCurrent;
+
+  const prTitle = String(flags.title || '').trim() || buildAutoPrTitle(issueIdentifier, changedFiles);
+  const prBody =
+    String(flags.body || '').trim() ||
+    buildAutoPrBody({
+      issueIdentifier,
+      changedFiles,
+      baseBranch,
+      testCommand,
+    });
+  const draft = Boolean(flags.draft);
+
+  const plan = {
+    repoPath,
+    githubRepo,
+    baseBranch,
+    branchCurrent,
+    branchName,
+    issueIdentifier,
+    dryRun,
+    testCommand,
+    changedFiles,
+    allowedPrefixes,
+    title: prTitle,
+    draft,
+  };
+
+  appendAuditEvent('autopr-plan', {
+    repoPath,
+    githubRepo,
+    baseBranch,
+    branchCurrent,
+    branchName,
+    issueIdentifier,
+    dryRun,
+    changedFiles: changedFiles.length,
+  });
+
+  if (dryRun) {
+    if (flags.json) {
+      process.stdout.write(`${JSON.stringify({ ok: true, dryRun: true, plan }, null, 2)}\n`);
+      return;
+    }
+    const lines = [];
+    lines.push('Auto PR plan (dry-run):');
+    lines.push(`- repo: ${githubRepo}`);
+    lines.push(`- base: ${baseBranch}`);
+    lines.push(`- branch: ${branchName}`);
+    lines.push(`- files: ${changedFiles.length}`);
+    lines.push(`- title: ${prTitle}`);
+    process.stdout.write(`${lines.join('\n')}\n`);
+    return;
+  }
+
+  if (settings.autopr.allowExecute === false) {
+    throw new Error('autopr execute mode is disabled. Set autopr.allowExecute=true in config first.');
+  }
+  consumeConfirmation(flags.confirm);
+
+  const token = String(flags.token || settings.github.token || '').trim();
+  if (!token) {
+    throw new Error('GitHub token missing. Set GITHUB_TOKEN before autopr execute.');
+  }
+
+  if (branchNeedsFork) {
+    runCommand('git', ['-C', repoPath, 'checkout', '-b', branchName]);
+  }
+
+  runCommand('git', ['-C', repoPath, 'add', '-A']);
+
+  const commitMessage =
+    String(flags['commit-message'] || '').trim() ||
+    `${issueIdentifier ? `${issueIdentifier} ` : ''}chore: auto PR update`;
+  runCommand('git', ['-C', repoPath, 'commit', '-m', commitMessage]);
+
+  if (testCommand) {
+    runShellCommand(testCommand, repoPath);
+  }
+
+  runCommand('git', ['-C', repoPath, 'push', '-u', 'origin', branchName]);
+
+  const pullRequest = await createGithubPullRequest(
+    token,
+    githubRepo,
+    {
+      title: prTitle,
+      body: prBody,
+      head: branchName,
+      base: baseBranch,
+      draft,
+    },
+  );
+
+  const result = {
+    ok: true,
+    dryRun: false,
+    githubRepo,
+    branch: branchName,
+    base: baseBranch,
+    pullRequest,
+  };
+
+  appendAuditEvent('autopr-created', {
+    repo: githubRepo,
+    branch: branchName,
+    base: baseBranch,
+    prNumber: pullRequest.number,
+    prUrl: pullRequest.url,
+    draft,
+  });
+
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+
+  process.stdout.write(
+    `Auto PR created: ${githubRepo}#${pullRequest.number}\n${pullRequest.url}\n`,
+  );
+}
+
+async function cmdEvalReplay(settings, flags) {
+  if (settings.evalReplay && settings.evalReplay.enabled === false) {
+    throw new Error('evalReplay is disabled in config.');
+  }
+
+  const issueFilter = normalizeLinearIssueId(flags.issue || flags.identifier || '');
+  const maxSessions = Math.max(1, Number(flags['max-sessions'] || settings.evalReplay.maxSessions || 200));
+  const maxRunsPerJob = Math.max(
+    1,
+    Number(flags['max-runs-per-job'] || settings.evalReplay.maxRunsPerJob || 20),
+  );
+
+  const snapshot = collectSnapshot(settings);
+  const bindings = readJsonFile(ISSUE_LINKS_PATH, {});
+  const records = [];
+
+  const sessions = [...snapshot.sessions]
+    .sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0))
+    .slice(0, maxSessions);
+  for (const session of sessions) {
+    const issueIdentifier = resolveIssueFromBindings(bindings, {
+      taskId: `session:${session.agentId}:${session.key}`,
+      sessionId: session.sessionId || '',
+      sessionKey: session.key || '',
+    });
+    if (issueFilter && issueIdentifier !== issueFilter) {
+      continue;
+    }
+    records.push({
+      type: 'session',
+      issueIdentifier,
+      agentId: session.agentId || '',
+      sessionId: session.sessionId || '',
+      sessionKey: session.key || '',
+      model: session.model || '',
+      ageMs: Number(session.ageMs || 0),
+      updatedAtMs: Number(session.updatedAt || 0),
+      totalTokens: session.totalTokens != null ? Number(session.totalTokens) : null,
+      contextTokens: session.contextTokens != null ? Number(session.contextTokens) : null,
+      abortedLastRun: Boolean(session.abortedLastRun),
+    });
+  }
+
+  for (const job of snapshot.cronJobs) {
+    const issueIdentifier = resolveIssueFromBindings(bindings, {
+      taskId: `cron:${job.id}`,
+      cronId: job.id,
+    });
+    if (issueFilter && issueIdentifier !== issueFilter) {
+      continue;
+    }
+
+    const runs = loadCronRuns(job.id, maxRunsPerJob, settings);
+    for (const run of runs) {
+      records.push({
+        type: 'cron-run',
+        issueIdentifier,
+        cronId: job.id,
+        cronName: job.name || job.id,
+        status: String(run.status || ''),
+        ts: Number(run.ts || run.runAtMs || 0),
+        durationMs: Number(run.durationMs || 0),
+        summary: String(run.summary || ''),
+        sessionId: String(run.sessionId || ''),
+      });
+    }
+  }
+
+  const nowMs = Date.now();
+  const failures = records.filter(
+    (item) =>
+      item.type === 'cron-run' &&
+      ['error', 'failed', 'timeout'].includes(String(item.status || '').toLowerCase()),
+  ).length;
+  const replay = {
+    generatedAtMs: nowMs,
+    generatedAt: new Date(nowMs).toISOString(),
+    issueFilter,
+    metrics: {
+      sessions: records.filter((item) => item.type === 'session').length,
+      cronRuns: records.filter((item) => item.type === 'cron-run').length,
+      failures,
+    },
+    records,
+  };
+
+  const replayDir = path.join(DATA_DIR, 'eval-replay');
+  ensureDir(replayDir);
+  const stamp = new Date(nowMs).toISOString().replace(/[^0-9]/g, '').slice(0, 14);
+  const replayPath = path.join(replayDir, `replay-${stamp}.json`);
+  writeJsonFile(replayPath, replay);
+
+  let planPath = '';
+  if (flags['emit-plan'] || flags.emitPlan) {
+    const plan = renderEvalReplayPlan(replay, replayPath, settings);
+    planPath = path.join(replayDir, `distill-plan-${stamp}.md`);
+    fs.writeFileSync(planPath, `${plan}\n`, 'utf8');
+  }
+
+  appendAuditEvent('eval-replay-generated', {
+    issueFilter,
+    sessions: replay.metrics.sessions,
+    cronRuns: replay.metrics.cronRuns,
+    failures: replay.metrics.failures,
+    replayPath,
+    planPath,
+  });
+
+  const result = {
+    ok: true,
+    issueFilter,
+    replayPath,
+    planPath,
+    metrics: replay.metrics,
+  };
+
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+
+  const lines = [];
+  lines.push('Eval replay generated:');
+  lines.push(`- replay: ${replayPath}`);
+  if (planPath) {
+    lines.push(`- plan: ${planPath}`);
+  }
+  lines.push(`- sessions: ${replay.metrics.sessions}`);
+  lines.push(`- cron runs: ${replay.metrics.cronRuns}`);
+  lines.push(`- failures: ${replay.metrics.failures}`);
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
 async function cmdSchedule(settings, flags) {
   const timezone = String(flags.tz || settings.timezone || 'Asia/Shanghai').trim();
   const apply = Boolean(flags.apply);
@@ -818,12 +1427,22 @@ async function cmdSchedule(settings, flags) {
   ).trim();
   const withReminders =
     !Boolean(flags['without-reminders']) && Boolean(settings.reminders.enabled !== false);
+  const briefingChannel = String(
+    flags['briefing-channel'] || settings.briefing.channel || channel || '',
+  ).trim();
+  const briefingTarget = String(
+    flags['briefing-target'] || settings.briefing.target || target || '',
+  ).trim();
+  const withBriefing =
+    !Boolean(flags['without-briefing']) && Boolean(settings.briefing.enabled !== false);
   const nodeBin = process.execPath;
   const scriptPath = path.join(ROOT_DIR, 'scripts', 'tasks.js');
   const reportLog = path.join(DATA_DIR, 'report-cron.log');
   const watchdogLog = path.join(DATA_DIR, 'watchdog-cron.log');
   const reminderDueLog = path.join(DATA_DIR, 'reminder-due-cron.log');
   const reminderCycleLog = path.join(DATA_DIR, 'reminder-cycle-cron.log');
+  const briefingDailyLog = path.join(DATA_DIR, 'briefing-daily-cron.log');
+  const briefingWeeklyLog = path.join(DATA_DIR, 'briefing-weekly-cron.log');
   const githubSyncLog = path.join(DATA_DIR, 'github-sync-cron.log');
   const todoistSyncLog = path.join(DATA_DIR, 'todoist-sync-cron.log');
   const calendarSyncLog = path.join(DATA_DIR, 'calendar-sync-cron.log');
@@ -867,6 +1486,8 @@ async function cmdSchedule(settings, flags) {
   const slaCheckParts = [nodeBin, scriptPath, 'sla-check'];
   const remindDueParts = [nodeBin, scriptPath, 'remind', 'due'];
   const remindCycleParts = [nodeBin, scriptPath, 'remind', 'cycle'];
+  const briefingDailyParts = [nodeBin, scriptPath, 'briefing', 'daily'];
+  const briefingWeeklyParts = [nodeBin, scriptPath, 'briefing', 'weekly'];
   const dueSoonDays = Number(flags.days || settings.reminders.dueSoonDays || 7);
   if (dueSoonDays > 0) {
     remindDueParts.push('--days', String(dueSoonDays));
@@ -874,6 +1495,10 @@ async function cmdSchedule(settings, flags) {
   if (reminderChannel && reminderTarget) {
     remindDueParts.push('--send', '--channel', reminderChannel, '--target', reminderTarget);
     remindCycleParts.push('--send', '--channel', reminderChannel, '--target', reminderTarget);
+  }
+  if (briefingChannel && briefingTarget) {
+    briefingDailyParts.push('--send', '--channel', briefingChannel, '--target', briefingTarget);
+    briefingWeeklyParts.push('--send', '--channel', briefingChannel, '--target', briefingTarget);
   }
 
   const blockLines = [
@@ -915,6 +1540,12 @@ async function cmdSchedule(settings, flags) {
       ? [
           `${settings.reminders.dueSoonCron || '0 10 * * *'} cd ${shellQuote(ROOT_DIR)} && ${joinShell(remindDueParts)} >> ${shellQuote(reminderDueLog)} 2>&1`,
           `${settings.reminders.cycleCron || '30 9 * * 1'} cd ${shellQuote(ROOT_DIR)} && ${joinShell(remindCycleParts)} >> ${shellQuote(reminderCycleLog)} 2>&1`,
+        ]
+      : []),
+    ...(withBriefing
+      ? [
+          `${settings.briefing.dailyCron || '15 9 * * *'} cd ${shellQuote(ROOT_DIR)} && ${joinShell(briefingDailyParts)} >> ${shellQuote(briefingDailyLog)} 2>&1`,
+          `${settings.briefing.weeklyCron || '0 9 * * 1'} cd ${shellQuote(ROOT_DIR)} && ${joinShell(briefingWeeklyParts)} >> ${shellQuote(briefingWeeklyLog)} 2>&1`,
         ]
       : []),
     '# OPENCLAW_CONTROL_CENTER_END',
@@ -993,31 +1624,30 @@ async function cmdRemind(settings, flags) {
     throw new Error(`invalid remind mode: ${mode}. expected due|cycle|all`);
   }
 
-  const apiKey = String(settings.linear.apiKey || '').trim();
-  if (!apiKey) {
-    throw new Error('LINEAR_API_KEY is required for remind.');
-  }
-
-  const teamId = settings.linear.teamId || (await resolveLinearTeamId(apiKey, settings.linear.teamKey));
-  if (!teamId) {
-    throw new Error('Unable to resolve Linear team id for reminder.');
-  }
-
-  const dueDays = Number(flags.days || settings.reminders.dueSoonDays || 7);
-  const data = {
-    generatedAtMs: Date.now(),
+  const dueDays = Math.max(1, Number(flags.days || settings.reminders.dueSoonDays || 7));
+  const includeSla = !Boolean(flags['without-sla']);
+  const staleInProgressDays = Math.max(
+    1,
+    Number(flags['stale-days'] || settings.reminders.staleInProgressDays || 3),
+  );
+  const blockedEscalationHours = Math.max(
+    1,
+    Number(flags['blocked-hours'] || settings.reminders.blockedEscalationHours || 24),
+  );
+  const autoEscalateBlocked = Boolean(
+    flags['auto-escalate'] ||
+      flags.escalate ||
+      settings.reminders.autoEscalateBlocked === true,
+  );
+  const reminderBundle = await buildReminderPayload(settings, {
     mode,
     dueDays,
-    due: [],
-    cycle: [],
-  };
-
-  if (mode === 'all' || mode === 'due') {
-    data.due = await fetchDueSoonIssues(apiKey, teamId, dueDays);
-  }
-  if (mode === 'all' || mode === 'cycle') {
-    data.cycle = await fetchCurrentCycleIssues(apiKey, teamId);
-  }
+    includeSla,
+    staleInProgressDays,
+    blockedEscalationHours,
+    autoEscalateBlocked,
+  });
+  const data = reminderBundle.data;
 
   if (flags.json) {
     process.stdout.write(`${JSON.stringify(data, null, 2)}\n`);
@@ -1050,6 +1680,172 @@ async function cmdRemind(settings, flags) {
     ]);
     process.stdout.write(`Reminder sent via openclaw message send (${channel} -> ${target}).\n`);
   }
+}
+
+async function buildReminderPayload(settings, options = {}) {
+  const mode = String(options.mode || 'all').trim().toLowerCase();
+  const dueDays = Math.max(1, Number(options.dueDays || settings.reminders.dueSoonDays || 7));
+  const includeSla = options.includeSla !== false;
+  const staleInProgressDays = Math.max(
+    1,
+    Number(options.staleInProgressDays || settings.reminders.staleInProgressDays || 3),
+  );
+  const blockedEscalationHours = Math.max(
+    1,
+    Number(options.blockedEscalationHours || settings.reminders.blockedEscalationHours || 24),
+  );
+  const autoEscalateBlocked = Boolean(options.autoEscalateBlocked);
+
+  const apiKey = String(settings.linear.apiKey || '').trim();
+  if (!apiKey) {
+    throw new Error('LINEAR_API_KEY is required for remind.');
+  }
+
+  const teamId = settings.linear.teamId || (await resolveLinearTeamId(apiKey, settings.linear.teamKey));
+  if (!teamId) {
+    throw new Error('Unable to resolve Linear team id for reminder.');
+  }
+
+  const data = {
+    generatedAtMs: Date.now(),
+    mode,
+    dueDays,
+    staleInProgressDays,
+    blockedEscalationHours,
+    due: [],
+    cycle: [],
+    staleInProgress: [],
+    blockedEscalation: [],
+    autoEscalated: [],
+  };
+
+  if (mode === 'all' || mode === 'due') {
+    data.due = await fetchDueSoonIssues(apiKey, teamId, dueDays);
+  }
+  if (mode === 'all' || mode === 'cycle') {
+    data.cycle = await fetchCurrentCycleIssues(apiKey, teamId);
+  }
+
+  if (includeSla) {
+    const openIssues = await fetchOpenLinearIssuesForSla(apiKey, teamId);
+    const stale = classifyReminderSlaIssues(
+      openIssues,
+      Date.now(),
+      staleInProgressDays,
+      blockedEscalationHours,
+      settings,
+    );
+    data.staleInProgress = stale.inProgress;
+    data.blockedEscalation = stale.blocked;
+    if (autoEscalateBlocked && stale.blocked.length > 0) {
+      data.autoEscalated = await autoEscalateReminderBlockedIssues(
+        apiKey,
+        stale.blocked,
+        blockedEscalationHours,
+        settings,
+      );
+    }
+  }
+
+  return {
+    apiKey,
+    teamId,
+    data,
+    escalated: data.autoEscalated,
+  };
+}
+
+function classifyReminderSlaIssues(issues, nowMs, staleInProgressDays, blockedEscalationHours, settings) {
+  const staleInProgressHours = Math.max(1, Number(staleInProgressDays || 3) * 24);
+  const blockedHours = Math.max(1, Number(blockedEscalationHours || 24));
+  const result = {
+    inProgress: [],
+    blocked: [],
+  };
+
+  for (const issue of Array.isArray(issues) ? issues : []) {
+    const updatedAtMs = Date.parse(String(issue.updatedAt || ''));
+    if (!Number.isFinite(updatedAtMs) || updatedAtMs <= 0) {
+      continue;
+    }
+    const ageHours = Math.max(0, (nowMs - updatedAtMs) / (60 * 60 * 1000));
+    const stateName = String((issue.state && issue.state.name) || '').trim();
+    const isBlocked = isBlockedStateName(stateName, settings);
+    const isInProgress = isInProgressStateName(stateName, issue.state && issue.state.type, settings);
+
+    const item = {
+      id: String(issue.id || ''),
+      identifier: String(issue.identifier || ''),
+      title: String(issue.title || ''),
+      url: String(issue.url || ''),
+      state: stateName || '-',
+      priority: Number.isFinite(Number(issue.priority)) ? Number(issue.priority) : 0,
+      ageHours: Number(ageHours.toFixed(2)),
+      updatedAt: String(issue.updatedAt || ''),
+      assignee:
+        issue && issue.assignee
+          ? String(issue.assignee.displayName || issue.assignee.name || '').trim()
+          : '',
+    };
+
+    if (isBlocked && ageHours >= blockedHours) {
+      result.blocked.push(item);
+      continue;
+    }
+    if (isInProgress && ageHours >= staleInProgressHours) {
+      result.inProgress.push(item);
+    }
+  }
+
+  result.inProgress.sort((a, b) => b.ageHours - a.ageHours);
+  result.blocked.sort((a, b) => b.ageHours - a.ageHours);
+  return result;
+}
+
+async function autoEscalateReminderBlockedIssues(apiKey, blockedItems, blockedEscalationHours, settings) {
+  const escalated = [];
+  for (const item of blockedItems.slice(0, 20)) {
+    if (!item.id || !item.identifier) {
+      continue;
+    }
+    const previousPriority = Number.isFinite(Number(item.priority)) ? Number(item.priority) : 0;
+    if (previousPriority === 1) {
+      continue;
+    }
+    try {
+      const updated = await updateLinearIssuePriority(apiKey, item.id, 1);
+      await createLinearIssueComment(
+        apiKey,
+        item.id,
+        trimMessage(
+          [
+            '### Mission Control Reminder Escalation',
+            `- reason: blocked > ${Number(blockedEscalationHours || 24)}h`,
+            `- previous priority: ${previousPriority || '-'}`,
+            '- new priority: 1',
+            '',
+            `generated ${formatTime(Date.now(), settings.timezone)} by mission-control remind`,
+          ].join('\n'),
+          1800,
+        ),
+      );
+      escalated.push({
+        identifier: item.identifier,
+        priority: updated.priority,
+      });
+      appendAuditEvent('remind-auto-escalate', {
+        identifier: item.identifier,
+        previousPriority,
+        newPriority: updated.priority,
+      });
+    } catch (error) {
+      escalated.push({
+        identifier: item.identifier,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return escalated;
 }
 
 async function cmdStatusSync(settings, flags) {
@@ -1160,6 +1956,98 @@ async function cmdStatusSync(settings, flags) {
     );
   }
   process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+async function cmdMemoSave(settings, flags) {
+  const channelId = String(flags['channel-id'] || flags.channelId || '').trim();
+  const messageId = String(flags['message-id'] || flags.messageId || '').trim();
+  const title = String(flags.title || '').trim();
+  const labels = normalizeLabelNames(flags.labels || flags.label || 'memo');
+  const createLinear = Boolean(flags['create-linear'] || flags.createLinear);
+  const sourceChannel = String(flags.channel || settings.report.channel || 'discord').trim();
+  const sourceTarget = String(flags.target || settings.report.target || '').trim();
+
+  if (!channelId || !messageId) {
+    throw new Error('memo-save requires --channel-id and --message-id');
+  }
+
+  const memo = await buildDiscordMemo({ channelId, messageId, title }, settings);
+  const saved = saveObsidianMemo(memo, settings);
+
+  let triageIssue = null;
+  if (createLinear) {
+    triageIssue = await createTriageIssueFromInput(
+      {
+        title: memo.title,
+        rawText: memo.tldr,
+        description: `${memo.body}\n\n---\nMemo: ${saved.relativePath}`,
+        source: 'memo',
+        sourceId: memo.sourceId,
+        author: memo.author,
+        sourceUrl: memo.sourceUrl,
+        state: 'Triage',
+        labels: dedupeStrings(['memo', ...labels]),
+        dueDate: '',
+        priority: 3,
+      },
+      settings,
+    );
+  }
+
+  const result = {
+    ok: true,
+    memo: {
+      title: memo.title,
+      relativePath: saved.relativePath,
+      sourceUrl: memo.sourceUrl,
+      sourceId: memo.sourceId,
+    },
+    linear: triageIssue
+      ? {
+          identifier: triageIssue.identifier,
+          url: triageIssue.url,
+          stateName: triageIssue.stateName,
+        }
+      : null,
+  };
+
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  } else {
+    const lines = [];
+    lines.push('Memo saved:');
+    lines.push(`- title: ${memo.title}`);
+    lines.push(`- path: ${saved.relativePath}`);
+    lines.push(`- source: ${memo.sourceUrl}`);
+    if (triageIssue) {
+      lines.push(`- linear: ${triageIssue.identifier}`);
+      if (triageIssue.url) {
+        lines.push(`  - url: ${triageIssue.url}`);
+      }
+    }
+    process.stdout.write(`${lines.join('\n')}\n`);
+  }
+
+  if (sourceChannel && sourceTarget && flags.send) {
+    const msgLines = [];
+    msgLines.push('Memo captured:');
+    msgLines.push(`- ${memo.title}`);
+    if (triageIssue && triageIssue.url) {
+      msgLines.push(`- Linear: ${triageIssue.url}`);
+    }
+    msgLines.push(`- Obsidian: ${saved.relativePath}`);
+    msgLines.push(`- Source: ${memo.sourceUrl}`);
+    runCommand('openclaw', [
+      'message',
+      'send',
+      '--channel',
+      sourceChannel,
+      '--target',
+      sourceTarget,
+      '--message',
+      trimMessage(msgLines.join('\n'), 2800),
+    ]);
+  }
 }
 
 async function cmdQueueDrain(settings, flags) {
@@ -1767,6 +2655,7 @@ async function cmdIngestServer(settings, flags) {
   const host = String(flags.host || settings.ingest.host || '127.0.0.1').trim();
   const port = Number(flags.port || settings.ingest.port || 8788);
   const triagePath = String(flags.path || settings.ingest.triagePath || '/triage').trim();
+  const discordPath = String(flags['discord-path'] || settings.ingest.discordPath || '/discord/message').trim();
   const githubPath = String(flags['github-path'] || settings.ingest.githubPath || '/github/pr').trim();
   const token = String(flags.token || settings.ingest.token || '').trim();
   const maxBodyBytes = Number(flags['max-body-bytes'] || settings.ingest.maxBodyBytes || 1024 * 1024);
@@ -1829,6 +2718,36 @@ async function cmdIngestServer(settings, flags) {
         return;
       }
 
+      if (requestPath === discordPath) {
+        if (token) {
+          const provided = String(req.headers['x-openclaw-token'] || '').trim();
+          if (!provided || provided !== token) {
+            sendJson(res, 403, { ok: false, error: 'forbidden' });
+            return;
+          }
+        }
+
+        const body = await readJsonBody(req, maxBodyBytes);
+        const input = buildDiscordTriageInput(body);
+        try {
+          const issue = await createTriageIssueFromInput(input, settings);
+          sendJson(res, 200, { ok: true, issue, source: 'discord' });
+        } catch (error) {
+          if (settings.intakeQueue.enabled === false) {
+            throw error;
+          }
+          const queued = enqueueIngestItem('triage', input, error, settings);
+          sendJson(res, 202, {
+            ok: true,
+            source: 'discord',
+            queued: true,
+            queueId: queued.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        return;
+      }
+
       if (requestPath === githubPath) {
         const rawBody = await readJsonBody(req, maxBodyBytes, true);
         const githubSecret = String(flags['github-secret'] || settings.github.webhookSecret || '').trim();
@@ -1839,7 +2758,11 @@ async function cmdIngestServer(settings, flags) {
 
         const body = rawBody.parsed;
         const event = String(req.headers['x-github-event'] || '').toLowerCase();
-        const result = await handleGithubPullRequestEvent(event, body, settings);
+        const delivery = String(req.headers['x-github-delivery'] || '').trim();
+        const result = await handleGithubPullRequestEvent(event, body, settings, {
+          delivery,
+          via: 'webhook',
+        });
         sendJson(res, 200, { ok: true, event, result });
         return;
       }
@@ -1857,6 +2780,7 @@ async function cmdIngestServer(settings, flags) {
       process.stdout.write(
         `Ingest server listening on http://${host}:${port}\n` +
           `- triage path: ${triagePath}\n` +
+          `- discord path: ${discordPath}\n` +
           `- github path: ${githubPath}\n`,
       );
       resolve(null);
@@ -2107,6 +3031,117 @@ async function cmdTodoistSync(settings, flags) {
   process.stdout.write(`${lines.join('\n')}\n`);
 }
 
+async function cmdTodoistBacksync(settings, flags) {
+  if (settings.todoist.enabled === false) {
+    throw new Error('todoist integration disabled in config.');
+  }
+  if (settings.todoist.syncFromLinearDone === false) {
+    throw new Error('todoist.syncFromLinearDone is disabled in config.');
+  }
+
+  const apiKey = String(settings.linear.apiKey || '').trim();
+  if (!apiKey) {
+    throw new Error('LINEAR_API_KEY is required for todoist-backsync.');
+  }
+
+  let apiToken = String(flags.token || settings.todoist.apiToken || '').trim();
+  if (!apiToken) {
+    apiToken = await extractTodoistTokenFromBrowser('openclaw');
+    if (apiToken) {
+      persistControlCenterValue(['todoist', 'apiToken'], apiToken);
+    }
+  }
+  if (!apiToken) {
+    throw new Error('Todoist token missing. Set TODOIST_API_TOKEN or keep Todoist tab logged in.');
+  }
+
+  const mapping = readJsonFile(TODOIST_SYNC_PATH, { version: 1, items: {} });
+  const items = mapping.items && typeof mapping.items === 'object' ? mapping.items : {};
+  const entries = Object.entries(items).filter(([, value]) => value && value.linearIdentifier);
+  const limit = Math.max(1, Number(flags.limit || 50));
+  const selected = entries.slice(0, limit);
+  const closed = [];
+  const skipped = [];
+
+  for (const [todoistId, value] of selected) {
+    const linearIdentifier = String(value.linearIdentifier || '').trim();
+    if (!linearIdentifier) {
+      skipped.push({ todoistId, reason: 'missing-linear-identifier' });
+      continue;
+    }
+    if (value.todoistClosedAtMs) {
+      skipped.push({ todoistId, reason: 'already-closed', linearIdentifier });
+      continue;
+    }
+
+    const issue = await resolveLinearIssueByIdentifier(apiKey, linearIdentifier, settings.linear.teamKey);
+    if (!issue || !issue.state) {
+      skipped.push({ todoistId, reason: 'linear-not-found', linearIdentifier });
+      continue;
+    }
+    const stateType = String(issue.state.type || '').toLowerCase();
+    const stateName = String(issue.state.name || '').toLowerCase();
+    const done = stateType === 'completed' || stateType === 'canceled' || stateName.includes('done');
+    if (!done) {
+      skipped.push({ todoistId, reason: 'linear-not-done', linearIdentifier, state: issue.state.name || '' });
+      continue;
+    }
+
+    try {
+      await closeTodoistTask(apiToken, todoistId);
+      items[todoistId] = {
+        ...value,
+        todoistClosedAtMs: Date.now(),
+        todoistClosedBy: 'linear-done-sync',
+      };
+      closed.push({
+        todoistId,
+        linearIdentifier,
+      });
+      appendAuditEvent('todoist-backsync-close', {
+        todoistId,
+        linearIdentifier,
+        state: issue.state.name || '',
+      });
+    } catch (error) {
+      skipped.push({
+        todoistId,
+        reason: 'todoist-close-failed',
+        linearIdentifier,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  writeJsonFile(TODOIST_SYNC_PATH, {
+    version: 1,
+    updatedAtMs: Date.now(),
+    items,
+  });
+
+  const result = {
+    ok: true,
+    checked: selected.length,
+    closed,
+    skipped,
+  };
+
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+
+  const lines = [];
+  lines.push('Todoist backsync result:');
+  lines.push(`- checked: ${selected.length}`);
+  lines.push(`- closed: ${closed.length}`);
+  lines.push(`- skipped: ${skipped.length}`);
+  for (const item of closed.slice(0, 10)) {
+    lines.push(`- ${item.todoistId} <= ${item.linearIdentifier}`);
+  }
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
 async function cmdCalendarSync(settings, flags) {
   if (settings.calendar.enabled === false) {
     throw new Error('calendar integration disabled in config.');
@@ -2157,12 +3192,43 @@ async function cmdCalendarSync(settings, flags) {
 
   const toLinear = Boolean(flags['to-linear'] || settings.calendar.syncToLinear);
   const created = [];
+  const updated = [];
+  const updateErrors = [];
   if (toLinear) {
     const mapping = readJsonFile(CALENDAR_SYNC_PATH.replace('.json', '-linear.json'), { items: {} });
     const items = mapping.items || {};
     for (const event of events.slice(0, 100)) {
       const key = event.id;
-      if (items[key] && items[key].linearIssueId) {
+      const existing = items[key];
+      if (existing && existing.linearIssueId) {
+        if (settings.linear.apiKey) {
+          try {
+            const refreshed = await updateLinearIssueFromCalendar(
+              String(settings.linear.apiKey || ''),
+              String(existing.linearIssueId || ''),
+              event,
+              String(tab.url || ''),
+              settings,
+            );
+            updated.push({
+              id: key,
+              linearIdentifier: refreshed.identifier || existing.linearIdentifier || '',
+            });
+            items[key] = {
+              ...existing,
+              text: event.text,
+              linearIdentifier: refreshed.identifier || existing.linearIdentifier || '',
+              linearUrl: refreshed.url || existing.linearUrl || '',
+              updatedAtMs: Date.now(),
+            };
+          } catch (error) {
+            updateErrors.push({
+              id: key,
+              linearIdentifier: existing.linearIdentifier || '',
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
         continue;
       }
       const issue = await createTriageIssueFromInput(
@@ -2190,7 +3256,7 @@ async function cmdCalendarSync(settings, flags) {
   }
 
   if (flags.json) {
-    process.stdout.write(`${JSON.stringify({ ok: true, snapshot, created }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({ ok: true, snapshot, created, updated, updateErrors }, null, 2)}\n`);
     return;
   }
 
@@ -2200,10 +3266,84 @@ async function cmdCalendarSync(settings, flags) {
   lines.push(`- tab: ${tab.url}`);
   lines.push(`- events captured: ${events.length}`);
   lines.push(`- toLinear created: ${created.length}`);
+  lines.push(`- toLinear updated: ${updated.length}`);
+  lines.push(`- toLinear update errors: ${updateErrors.length}`);
+  for (const item of updateErrors.slice(0, 5)) {
+    lines.push(
+      `- update error ${item.id}${item.linearIdentifier ? ` (${item.linearIdentifier})` : ''}: ${singleLine(item.error)}`,
+    );
+  }
   for (const event of events.slice(0, 8)) {
     lines.push(`- ${trimMessage(event.text, 120)}`);
   }
   process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+async function updateLinearIssueFromCalendar(apiKey, issueId, event, sourceUrl, settings) {
+  const id = String(issueId || '').trim();
+  if (!id) {
+    throw new Error('calendar update requires linear issue id.');
+  }
+  const eventId = String(event && event.id ? event.id : '').trim();
+  const eventText = singleLine(String(event && event.text ? event.text : '')).trim();
+  if (!eventId || !eventText) {
+    throw new Error('calendar update requires event.id and event.text.');
+  }
+
+  const title = `[Calendar] ${trimMessage(eventText, 120)}`;
+  const description = [
+    'Google Calendar event snapshot',
+    `id: ${eventId}`,
+    `source: ${sourceUrl || '-'}`,
+    `lastSync: ${formatTime(Date.now(), settings.timezone)}`,
+    '',
+    '## Raw event text',
+    '```text',
+    trimMessage(eventText, 3000),
+    '```',
+  ].join('\n');
+
+  const payload = await linearRequest(
+    apiKey,
+    `mutation UpdateIssueFromCalendar($id: String!, $input: IssueUpdateInput!) {
+      issueUpdate(id: $id, input: $input) {
+        success
+        issue {
+          id
+          identifier
+          title
+          url
+          state { id name }
+        }
+      }
+    }`,
+    {
+      id,
+      input: {
+        title,
+        description,
+      },
+    },
+  );
+
+  const node = payload && payload.issueUpdate ? payload.issueUpdate.issue : null;
+  if (!node || !node.id) {
+    throw new Error(`Linear issueUpdate returned no issue for ${id}`);
+  }
+
+  appendAuditEvent('calendar-sync-update', {
+    issueId: node.id,
+    identifier: node.identifier || '',
+    eventId,
+  });
+
+  return {
+    id: node.id,
+    identifier: node.identifier || '',
+    title: node.title || title,
+    url: node.url || '',
+    state: node && node.state ? node.state.name : '',
+  };
 }
 
 function resolveGithubRepos(settings, flags) {
@@ -2270,29 +3410,55 @@ async function createTriageIssueFromInput(input, settings) {
     }
   }
 
+  const signature = buildTriageSignatureCandidate(input, settings);
+  if (signature && signature.signature) {
+    const existingBySignature = findTriageSignatureDuplicate(signature.signature, settings);
+    if (existingBySignature && existingBySignature.identifier) {
+      return {
+        id: existingBySignature.issueId || '',
+        identifier: String(existingBySignature.identifier),
+        title: String(existingBySignature.title || existingBySignature.identifier),
+        url: String(existingBySignature.url || ''),
+        stateName: String(existingBySignature.stateName || ''),
+        labels: [],
+        deduped: true,
+        dedupeKey: `signature:${signature.signature}`,
+      };
+    }
+  }
+
   const teamId = settings.linear.teamId || (await resolveLinearTeamId(apiKey, settings.linear.teamKey));
   if (!teamId) {
     throw new Error('Unable to resolve Linear team id for triage.');
   }
 
-  const stateName = String(input.state || 'Triage').trim();
+  const routedInput = applyTriageRouting(input, settings);
+  if (signature && signature.signature) {
+    routedInput.intakeSignature = signature.signature;
+    routedInput.intakeSignatureRepo = signature.repoHint;
+    routedInput.intakeSignatureSignal = signature.errorSignal;
+  }
+  const stateName = String(routedInput.state || 'Triage').trim();
   const stateId = await resolveLinearStateId(apiKey, teamId, stateName);
   if (!stateId) {
     throw new Error(`Linear state not found: ${stateName}`);
   }
 
-  const title = buildTriageTitle(input);
+  const title = buildTriageTitle(routedInput);
   if (!title) {
     throw new Error('triage requires --title or --text.');
   }
 
-  const description = buildTriageDescription(input);
+  const description = buildTriageDescription(routedInput);
   const labelIds = await resolveLinearLabelIds(
     apiKey,
     teamId,
-    Array.isArray(input.labels) ? input.labels : [],
+    Array.isArray(routedInput.labels) ? routedInput.labels : [],
     true,
   );
+  const assigneeId = routedInput.assigneeEmail
+    ? await resolveLinearUserIdByEmail(apiKey, routedInput.assigneeEmail)
+    : '';
 
   const payload = await linearRequest(
     apiKey,
@@ -2315,10 +3481,11 @@ async function createTriageIssueFromInput(input, settings) {
         stateId,
         title,
         description,
-        priority: Number.isFinite(Number(input.priority)) ? Number(input.priority) : 3,
+        priority: Number.isFinite(Number(routedInput.priority)) ? Number(routedInput.priority) : 3,
         labelIds: labelIds.length > 0 ? labelIds : undefined,
+        assigneeId: assigneeId || undefined,
         projectId: settings.linear.projectId || undefined,
-        dueDate: input.dueDate || undefined,
+        dueDate: routedInput.dueDate || undefined,
       },
     },
   );
@@ -2344,6 +3511,9 @@ async function createTriageIssueFromInput(input, settings) {
     };
     writeJsonFile(SOURCE_ID_INDEX_PATH, index);
   }
+  if (signature && signature.signature) {
+    storeTriageSignatureMapping(signature, issue, input, settings);
+  }
 
   return {
     id: issue.id,
@@ -2352,8 +3522,10 @@ async function createTriageIssueFromInput(input, settings) {
     url: issue.url,
     stateName: issue.state ? issue.state.name : '',
     labels: (((issue.labels || {}).nodes || []).map((item) => item.name)).filter(Boolean),
+    assigneeId: assigneeId || '',
+    routeHits: Array.isArray(routedInput.routeHits) ? routedInput.routeHits : [],
     deduped: false,
-    dedupeKey,
+    dedupeKey: dedupeKey || (signature && signature.signature ? `signature:${signature.signature}` : ''),
   };
 }
 
@@ -2390,6 +3562,25 @@ function buildTriageDescription(input) {
   }
   if (meta.length > 0) {
     blocks.push(['## Intake metadata', ...meta].join('\n'));
+  }
+
+  const routeHits = Array.isArray(input.routeHits)
+    ? input.routeHits.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  if (routeHits.length > 0) {
+    blocks.push(['## Auto triage routing', ...routeHits.map((item) => `- ${item}`)].join('\n'));
+  }
+
+  const signature = String(input.intakeSignature || '').trim();
+  if (signature) {
+    const signatureMeta = [`- signature: ${signature}`];
+    if (input.intakeSignatureRepo) {
+      signatureMeta.push(`- repo: ${singleLine(String(input.intakeSignatureRepo))}`);
+    }
+    if (input.intakeSignatureSignal) {
+      signatureMeta.push(`- signal: ${singleLine(String(input.intakeSignatureSignal))}`);
+    }
+    blocks.push(['## Intake signature', ...signatureMeta].join('\n'));
   }
 
   const raw = String(input.rawText || '').trim();
@@ -2526,10 +3717,113 @@ function renderReminder(data, settings) {
     lines.push('');
   }
 
+  const staleInProgress = Array.isArray(data.staleInProgress) ? data.staleInProgress : [];
+  const blockedEscalation = Array.isArray(data.blockedEscalation) ? data.blockedEscalation : [];
+  if (staleInProgress.length > 0 || blockedEscalation.length > 0) {
+    lines.push('## SLA Watch');
+    lines.push(`- stale In Progress (> ${data.staleInProgressDays || 3} days): ${staleInProgress.length}`);
+    for (const item of staleInProgress.slice(0, 8)) {
+      lines.push(
+        `- stale: ${item.identifier} age ${item.ageHours}h [${item.state}] ${singleLine(item.title)}`,
+      );
+    }
+    lines.push(
+      `- blocked escalation (> ${data.blockedEscalationHours || 24}h): ${blockedEscalation.length}`,
+    );
+    for (const item of blockedEscalation.slice(0, 8)) {
+      lines.push(
+        `- blocked: ${item.identifier} age ${item.ageHours}h [${item.state}] ${singleLine(item.title)}`,
+      );
+    }
+    lines.push('');
+  }
+
+  const autoEscalated = Array.isArray(data.autoEscalated) ? data.autoEscalated : [];
+  if (autoEscalated.length > 0) {
+    lines.push('## Auto Escalated');
+    for (const item of autoEscalated.slice(0, 8)) {
+      if (item.error) {
+        lines.push(`- ${item.identifier}: error ${singleLine(item.error)}`);
+      } else {
+        lines.push(`- ${item.identifier}: priority -> ${item.priority}`);
+      }
+    }
+    lines.push('');
+  }
+
   lines.push('## Next Actions');
   lines.push('1. Pull one Blocked item into owner discussion and unblock within 24h.');
   lines.push('2. Close or re-scope stale In Progress items before adding new scope.');
+  lines.push('3. Keep incoming work in Triage unless current cycle scope is stable.');
 
+  return lines.join('\n');
+}
+
+function renderBriefing(briefing, settings) {
+  const mode = String(briefing.mode || 'daily').toLowerCase();
+  const report = briefing.report || {};
+  const reminder = briefing.reminder || {};
+  const lines = [];
+  lines.push(
+    `# Mission ${mode === 'weekly' ? 'Weekly' : 'Daily'} Briefing (${formatTime(
+      briefing.generatedAtMs,
+      settings.timezone,
+    )})`,
+  );
+  lines.push('');
+  lines.push('## Runtime Snapshot');
+  lines.push(
+    `- cron: ${(report.metrics && report.metrics.enabledCronJobs) || 0}/${(report.metrics && report.metrics.totalCronJobs) || 0} enabled`,
+  );
+  lines.push(`- cron error jobs: ${(report.metrics && report.metrics.cronErrorJobs) || 0}`);
+  lines.push(`- active sessions: ${(report.metrics && report.metrics.activeSessions) || 0}`);
+  lines.push(`- active subagents: ${(report.metrics && report.metrics.activeSubagents) || 0}`);
+  lines.push('');
+
+  lines.push(`## ${mode === 'weekly' ? 'This Week Focus' : 'Today Focus'}`);
+  const cycle = Array.isArray(reminder.cycle) ? reminder.cycle : [];
+  const due = Array.isArray(reminder.due) ? reminder.due : [];
+  const topFocus = mode === 'weekly' ? cycle.slice(0, 8) : [...due.slice(0, 5), ...cycle.slice(0, 5)];
+  if (topFocus.length === 0) {
+    lines.push('- none');
+  } else {
+    const seen = new Set();
+    for (const issue of topFocus) {
+      const identifier = String(issue.identifier || '').trim();
+      if (!identifier || seen.has(identifier)) {
+        continue;
+      }
+      seen.add(identifier);
+      lines.push(`- ${identifier} [${(issue.state && issue.state.name) || '-'}] ${singleLine(issue.title || '')}`);
+    }
+  }
+  lines.push('');
+
+  lines.push('## Risks / Blockers');
+  const blocked = Array.isArray(reminder.blockedEscalation) ? reminder.blockedEscalation : [];
+  const anomalies = Array.isArray(report.topAnomalies) ? report.topAnomalies : [];
+  if (blocked.length === 0 && anomalies.length === 0) {
+    lines.push('- none');
+  } else {
+    for (const item of blocked.slice(0, 6)) {
+      lines.push(`- blocked ${item.identifier} age ${item.ageHours}h ${singleLine(item.title || '')}`);
+    }
+    for (const item of anomalies.slice(0, 4)) {
+      lines.push(`- anomaly [${item.scope}] [${item.severity}] ${singleLine(item.title || '')}`);
+    }
+  }
+  lines.push('');
+
+  lines.push('## Next Actions');
+  const manualActions = Array.isArray(report.manualActions) ? report.manualActions : [];
+  if (manualActions.length === 0) {
+    lines.push('1. Review Triage and pick one high-impact item into In Progress.');
+    lines.push('2. Update owner and ETA for each blocked issue.');
+  } else {
+    for (let i = 0; i < Math.min(3, manualActions.length); i += 1) {
+      lines.push(`${i + 1}. ${manualActions[i]}`);
+    }
+  }
   return lines.join('\n');
 }
 
@@ -2587,6 +3881,139 @@ async function resolveLinearLabelIds(apiKey, teamId, labels, createMissing) {
   }
 
   return dedupeStrings(labelIds);
+}
+
+function applyTriageRouting(input, settings) {
+  const routing = settings.triageRouting && typeof settings.triageRouting === 'object'
+    ? settings.triageRouting
+    : {};
+  const enabled = routing.enabled !== false;
+  const normalized = {
+    ...input,
+    state: String(input.state || routing.defaultState || 'Triage').trim(),
+    priority: Number.isFinite(Number(input.priority))
+      ? Number(input.priority)
+      : Number(routing.defaultPriority || 3),
+    labels: dedupeStrings([
+      ...normalizeLabelNames(input.labels || []),
+      ...normalizeLabelNames(routing.defaultLabels || []),
+    ]),
+    assigneeEmail: String(input.assigneeEmail || input.assignee || routing.defaultAssigneeEmail || '').trim(),
+    routeHits: [],
+  };
+  if (!enabled) {
+    return normalized;
+  }
+
+  const source = String(input.source || '').trim().toLowerCase();
+  const sourceRules = routing.sourceRules && typeof routing.sourceRules === 'object'
+    ? routing.sourceRules
+    : {};
+  const sourceRule = source ? sourceRules[source] : null;
+  if (sourceRule && typeof sourceRule === 'object') {
+    if (sourceRule.state) {
+      normalized.state = String(sourceRule.state).trim();
+    }
+    if (Number.isFinite(Number(sourceRule.priority))) {
+      normalized.priority = mergeLinearPriority(normalized.priority, Number(sourceRule.priority));
+    }
+    if (sourceRule.assigneeEmail && !normalized.assigneeEmail) {
+      normalized.assigneeEmail = String(sourceRule.assigneeEmail).trim();
+    }
+    normalized.labels = dedupeStrings([
+      ...normalized.labels,
+      ...normalizeLabelNames(sourceRule.labels || []),
+    ]);
+    normalized.routeHits.push(`source:${source}`);
+  }
+
+  const textForMatch = [normalized.title, normalized.rawText, normalized.description]
+    .map((item) => String(item || ''))
+    .join('\n');
+  const keywordRules = Array.isArray(routing.keywordRules) ? routing.keywordRules : [];
+  for (const rule of keywordRules) {
+    if (!rule || typeof rule !== 'object') {
+      continue;
+    }
+    const pattern = String(rule.pattern || '').trim();
+    if (!pattern) {
+      continue;
+    }
+    let matched = false;
+    try {
+      matched = new RegExp(pattern, 'i').test(textForMatch);
+    } catch {
+      matched = false;
+    }
+    if (!matched) {
+      continue;
+    }
+
+    if (rule.state) {
+      normalized.state = String(rule.state).trim();
+    }
+    if (Number.isFinite(Number(rule.priority))) {
+      normalized.priority = mergeLinearPriority(normalized.priority, Number(rule.priority));
+    }
+    if (rule.assigneeEmail && !normalized.assigneeEmail) {
+      normalized.assigneeEmail = String(rule.assigneeEmail).trim();
+    }
+    normalized.labels = dedupeStrings([
+      ...normalized.labels,
+      ...normalizeLabelNames(rule.labels || []),
+    ]);
+    normalized.routeHits.push(`keyword:${pattern}`);
+  }
+
+  if (!Number.isFinite(Number(normalized.priority))) {
+    normalized.priority = 3;
+  }
+
+  return normalized;
+}
+
+function mergeLinearPriority(currentValue, nextValue) {
+  const current = Number(currentValue);
+  const next = Number(nextValue);
+  if (!Number.isFinite(current)) {
+    return next;
+  }
+  if (!Number.isFinite(next)) {
+    return current;
+  }
+  return Math.min(current, next);
+}
+
+const LINEAR_USER_ID_CACHE = new Map();
+
+async function resolveLinearUserIdByEmail(apiKey, email) {
+  const wanted = String(email || '').trim().toLowerCase();
+  if (!wanted) {
+    return '';
+  }
+  if (LINEAR_USER_ID_CACHE.has(wanted)) {
+    return LINEAR_USER_ID_CACHE.get(wanted);
+  }
+
+  const payload = await linearRequest(
+    apiKey,
+    `query UsersForRouting {
+      users(first: 250) {
+        nodes { id email name displayName active }
+      }
+    }`,
+    {},
+  );
+  const nodes = (((payload || {}).users || {}).nodes || []).filter(Boolean);
+  const match = nodes.find(
+    (item) =>
+      String(item.email || '')
+        .trim()
+        .toLowerCase() === wanted,
+  );
+  const id = match && match.id ? String(match.id) : '';
+  LINEAR_USER_ID_CACHE.set(wanted, id);
+  return id;
 }
 
 async function createLinearLabel(apiKey, teamId, name) {
@@ -2761,7 +4188,7 @@ function extractLinearIssueIds(...inputs) {
   return Array.from(set.values());
 }
 
-async function handleGithubPullRequestEvent(eventName, payload, settings) {
+async function handleGithubPullRequestEvent(eventName, payload, settings, meta = {}) {
   if (eventName !== 'pull_request') {
     return { handled: false, reason: `ignored_event_${eventName}` };
   }
@@ -2793,16 +4220,95 @@ async function handleGithubPullRequestEvent(eventName, payload, settings) {
   }
 
   const updates = [];
+  const snapshotEntries = [];
+  const apiKey = String(settings.linear.apiKey || '').trim();
+  const repoFullName = String(
+    (payload && payload.repository && payload.repository.full_name) || '',
+  ).trim();
+  const prNumber = Number(pr.number || 0);
+  const prTitle = String(pr.title || '').trim();
+  const prUrl = String(pr.html_url || '').trim();
+  const actor = String((payload && payload.sender && payload.sender.login) || '').trim();
+  const delivery = String(meta.delivery || '').trim();
+  const shouldRequestReviewers = ['opened', 'reopened', 'ready_for_review'].includes(action);
+  let reviewersResult = null;
+  if (shouldRequestReviewers) {
+    const reviewers = Array.isArray(settings.github.autoReviewers)
+      ? settings.github.autoReviewers.map((item) => String(item || '').trim()).filter(Boolean)
+      : [];
+    const githubToken = String(settings.github.token || '').trim();
+    if (reviewers.length > 0 && githubToken && repoFullName && prNumber > 0) {
+      try {
+        reviewersResult = await requestGithubPullReviewers(githubToken, repoFullName, prNumber, reviewers);
+      } catch (error) {
+        reviewersResult = {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
+  }
+
   for (const identifier of identifiers) {
     const result = await transitionIssueByIdentifier(identifier, targetStateName, settings);
+    let commented = false;
+    if (apiKey && result && result.issueId && result.status === 'updated') {
+      const body = renderGithubWebhookComment({
+        action,
+        identifier,
+        transition: result,
+        repo: repoFullName,
+        prNumber,
+        prTitle,
+        prUrl,
+        actor,
+        delivery,
+        settings,
+      });
+      try {
+        await createLinearIssueComment(apiKey, result.issueId, body);
+        commented = true;
+      } catch {
+        commented = false;
+      }
+    }
+
+    snapshotEntries.push({
+      repo: repoFullName,
+      action: action === 'closed' && Boolean(pr.merged) ? 'merged' : 'open',
+      prNumber,
+      prTitle,
+      prUrl,
+      identifier,
+      result,
+      source: String(meta.via || 'webhook'),
+      delivery,
+      updatedAtMs: Date.now(),
+    });
+    appendAuditEvent('github-webhook-transition', {
+      repo: repoFullName,
+      action,
+      identifier,
+      prNumber,
+      delivery,
+      status: result.status,
+      toState: result.state || targetStateName,
+      commented,
+    });
     updates.push(result);
   }
+
+  appendGithubSignalSnapshot(snapshotEntries);
 
   return {
     handled: true,
     action,
     targetStateName,
     identifiers,
+    repo: repoFullName,
+    prNumber,
+    delivery,
+    reviewersResult,
     updates,
   };
 }
@@ -3098,6 +4604,45 @@ function renderStatusSyncComment(context, transition, settings) {
   return trimMessage(lines.join('\n'), 3500);
 }
 
+function renderGithubWebhookComment(input) {
+  const lines = [];
+  lines.push('### Mission Control GitHub Webhook Update');
+  lines.push(
+    `- transition: ${input.transition.previousState || '-'} -> ${input.transition.state || input.transition.targetStateName || '-'}`,
+  );
+  lines.push(`- event: pull_request.${input.action}`);
+  lines.push(`- repo: ${input.repo || '-'}`);
+  lines.push(`- pr: #${Number(input.prNumber || 0)} ${singleLine(input.prTitle || '')}`);
+  if (input.prUrl) {
+    lines.push(`- pr url: ${input.prUrl}`);
+  }
+  if (input.actor) {
+    lines.push(`- actor: ${input.actor}`);
+  }
+  if (input.delivery) {
+    lines.push(`- delivery: ${input.delivery}`);
+  }
+  lines.push('');
+  lines.push(`_generated ${formatTime(Date.now(), input.settings.timezone)} by mission-control github webhook_`);
+  return trimMessage(lines.join('\n'), 2500);
+}
+
+function appendGithubSignalSnapshot(entries) {
+  const list = Array.isArray(entries) ? entries.filter(Boolean) : [];
+  if (list.length === 0) {
+    return;
+  }
+  const current = readJsonFile(GITHUB_SYNC_PATH, { updatedAtMs: 0, updates: [], errors: [] });
+  const updates = Array.isArray(current.updates) ? current.updates : [];
+  const merged = [...list, ...updates].slice(0, 500);
+  current.updatedAtMs = Date.now();
+  current.updates = merged;
+  if (!Array.isArray(current.errors)) {
+    current.errors = [];
+  }
+  writeJsonFile(GITHUB_SYNC_PATH, current);
+}
+
 async function createLinearIssueComment(apiKey, issueId, body) {
   const payload = await linearRequest(
     apiKey,
@@ -3124,6 +4669,39 @@ async function createLinearIssueComment(apiKey, issueId, body) {
   return node;
 }
 
+async function updateLinearIssuePriority(apiKey, issueId, priority) {
+  const normalizedPriority = Math.max(0, Math.min(4, Number(priority || 0)));
+  const payload = await linearRequest(
+    apiKey,
+    `mutation UpdateIssuePriority($id: String!, $input: IssueUpdateInput!) {
+      issueUpdate(id: $id, input: $input) {
+        success
+        issue {
+          id
+          identifier
+          priority
+        }
+      }
+    }`,
+    {
+      id: String(issueId || ''),
+      input: {
+        priority: normalizedPriority,
+      },
+    },
+  );
+
+  const node = payload && payload.issueUpdate ? payload.issueUpdate.issue : null;
+  if (!node || !node.id) {
+    throw new Error(`failed to update issue priority for ${issueId}`);
+  }
+  return {
+    id: node.id,
+    identifier: node.identifier || '',
+    priority: Number.isFinite(Number(node.priority)) ? Number(node.priority) : normalizedPriority,
+  };
+}
+
 async function fetchOpenLinearIssuesForSla(apiKey, teamId) {
   const payload = await linearRequest(
     apiKey,
@@ -3140,6 +4718,7 @@ async function fetchOpenLinearIssuesForSla(apiKey, teamId) {
           identifier
           title
           url
+          priority
           updatedAt
           state { id name type }
           assignee { id name displayName }
@@ -3199,6 +4778,190 @@ function normalizeSourceId(value) {
   return `h:${hashText(text)}`;
 }
 
+function buildTriageSignatureCandidate(input, settings) {
+  const config =
+    settings &&
+    settings.triageRouting &&
+    settings.triageRouting.signatureDedupe &&
+    typeof settings.triageRouting.signatureDedupe === 'object'
+      ? settings.triageRouting.signatureDedupe
+      : {};
+  if (config.enabled === false) {
+    return null;
+  }
+
+  const source = String(input && input.source ? input.source : '')
+    .trim()
+    .toLowerCase();
+  const sourceAllowlist = Array.isArray(config.sourceAllowlist)
+    ? config.sourceAllowlist.map((item) => String(item || '').trim().toLowerCase()).filter(Boolean)
+    : [];
+  if (sourceAllowlist.length > 0 && source && !sourceAllowlist.includes(source)) {
+    return null;
+  }
+
+  const combinedText = [input && input.title, input && input.rawText, input && input.description]
+    .map((item) => String(item || ''))
+    .join('\n');
+  const normalizedText = normalizeSignatureText(combinedText);
+  const minChars = Math.max(10, Number(config.minChars || 30));
+  if (normalizedText.length < minChars) {
+    return null;
+  }
+
+  const repoHint = extractRepoHint(input);
+  const errorSignal = detectErrorSignal(combinedText);
+  if (!repoHint && !errorSignal) {
+    return null;
+  }
+
+  const tokenWindow = normalizedText
+    .split(' ')
+    .map((token) => token.trim())
+    .filter(Boolean)
+    .slice(0, 40)
+    .join(' ');
+  const base = [source || '-', repoHint || '-', errorSignal || '-', tokenWindow].join('|');
+  return {
+    signature: `sig:${hashText(base)}`,
+    source,
+    repoHint,
+    errorSignal,
+  };
+}
+
+function normalizeSignatureText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/\b[a-z][a-z0-9-]+-\d+\b/g, ' ')
+    .replace(/[`"'()[\]{}<>]/g, ' ')
+    .replace(/[^\w:/.\-\u4e00-\u9fff]+/g, ' ')
+    .replace(/\b\d+\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractRepoHint(input) {
+  const probes = [
+    input && input.sourceUrl,
+    input && input.rawText,
+    input && input.description,
+    input && input.title,
+  ]
+    .map((item) => String(item || ''))
+    .filter(Boolean);
+  const pattern = /\b([a-z0-9_.-]+\/[a-z0-9_.-]+)\b/i;
+  for (const probe of probes) {
+    const match = probe.match(pattern);
+    if (!match) {
+      continue;
+    }
+    const repo = String(match[1] || '').toLowerCase();
+    if (repo.includes('discord.com/channels')) {
+      continue;
+    }
+    if (repo.includes('http')) {
+      continue;
+    }
+    return repo;
+  }
+  return '';
+}
+
+function detectErrorSignal(value) {
+  const text = normalizeSignatureText(value);
+  if (!text) {
+    return '';
+  }
+  const signals = [
+    { key: 'timeout', pattern: /timed out|timeout|超时/i },
+    { key: 'rate-limit', pattern: /\b429\b|rate limit|throttle|限流/i },
+    { key: 'auth', pattern: /unauthorized|forbidden|permission|auth|token|凭证|权限/i },
+    { key: 'network', pattern: /econn|enotfound|dns|network|socket|connect/i },
+    { key: 'blocked', pattern: /blocked|卡住|无法|stuck/i },
+    { key: 'failover', pattern: /failover|fallback|switch model|切换模型|model switch/i },
+    { key: 'ci', pattern: /ci|test failed|lint failed|build failed/i },
+    { key: 'exception', pattern: /exception|traceback|panic|fatal|error/i },
+  ];
+  for (const signal of signals) {
+    if (signal.pattern.test(text)) {
+      return signal.key;
+    }
+  }
+  return '';
+}
+
+function findTriageSignatureDuplicate(signature, settings) {
+  const wanted = String(signature || '').trim();
+  if (!wanted) {
+    return null;
+  }
+  const config =
+    settings &&
+    settings.triageRouting &&
+    settings.triageRouting.signatureDedupe &&
+    typeof settings.triageRouting.signatureDedupe === 'object'
+      ? settings.triageRouting.signatureDedupe
+      : {};
+  const lookbackDays = Math.max(1, Number(config.lookbackDays || 14));
+  const lookbackMs = lookbackDays * 24 * 60 * 60 * 1000;
+  const nowMs = Date.now();
+  const index = readJsonFile(TRIAGE_SIGNATURE_INDEX_PATH, { version: 1, updatedAtMs: 0, items: {} });
+  const items = index.items && typeof index.items === 'object' ? index.items : {};
+  const candidate = items[wanted];
+  if (!candidate || !candidate.identifier) {
+    return null;
+  }
+  const createdAtMs = Number(candidate.createdAtMs || 0);
+  if (createdAtMs > 0 && nowMs - createdAtMs > lookbackMs) {
+    return null;
+  }
+  return candidate;
+}
+
+function storeTriageSignatureMapping(signatureInfo, issue, input, settings) {
+  const signature = signatureInfo && signatureInfo.signature ? String(signatureInfo.signature) : '';
+  if (!signature) {
+    return;
+  }
+  const config =
+    settings &&
+    settings.triageRouting &&
+    settings.triageRouting.signatureDedupe &&
+    typeof settings.triageRouting.signatureDedupe === 'object'
+      ? settings.triageRouting.signatureDedupe
+      : {};
+  const maxEntries = Math.max(100, Number(config.maxEntries || 2000));
+  const index = readJsonFile(TRIAGE_SIGNATURE_INDEX_PATH, { version: 1, updatedAtMs: 0, items: {} });
+  if (!index.items || typeof index.items !== 'object') {
+    index.items = {};
+  }
+  index.items[signature] = {
+    signature,
+    identifier: issue.identifier,
+    issueId: issue.id,
+    title: issue.title,
+    url: issue.url || '',
+    source: String(input && input.source ? input.source : '').trim().toLowerCase(),
+    repoHint: signatureInfo.repoHint || '',
+    errorSignal: signatureInfo.errorSignal || '',
+    createdAtMs: Date.now(),
+  };
+
+  const entries = Object.entries(index.items);
+  if (entries.length > maxEntries) {
+    entries.sort((a, b) => Number(b[1].createdAtMs || 0) - Number(a[1].createdAtMs || 0));
+    const trimmed = entries.slice(0, maxEntries);
+    index.items = {};
+    for (const [key, value] of trimmed) {
+      index.items[key] = value;
+    }
+  }
+  index.updatedAtMs = Date.now();
+  writeJsonFile(TRIAGE_SIGNATURE_INDEX_PATH, index);
+}
+
 function buildRunbookHints(context, settings) {
   const hints = [];
   const joined = [
@@ -3224,6 +4987,254 @@ function buildRunbookHints(context, settings) {
   }
 
   return dedupeStrings(hints);
+}
+
+function buildDiscordTriageInput(body) {
+  const payload = body && typeof body === 'object' ? body : {};
+  const messageId = String(payload.messageId || payload.id || '').trim();
+  const channelId = String(payload.channelId || (payload.channel && payload.channel.id) || '').trim();
+  const guildId = String(payload.guildId || (payload.guild && payload.guild.id) || '@me').trim() || '@me';
+  const rawText = String(payload.content || payload.text || payload.message || '').trim();
+  const author = String(
+    payload.author ||
+      payload.username ||
+      (payload.user && (payload.user.username || payload.user.name)) ||
+      '',
+  ).trim();
+  const url =
+    String(payload.url || payload.jumpUrl || '').trim() ||
+    (messageId && channelId ? `https://discord.com/channels/${guildId}/${channelId}/${messageId}` : '');
+  const sourceId = normalizeSourceId(
+    String(
+      payload.sourceId ||
+        payload.eventId ||
+        payload.messageKey ||
+        (messageId ? `discord:${guildId}:${channelId}:${messageId}` : ''),
+    ).trim(),
+  );
+  const title =
+    String(payload.title || '').trim() ||
+    (rawText ? `[discord] ${singleLine(rawText).slice(0, 100)}` : `[discord] message ${messageId || 'event'}`);
+
+  return {
+    title,
+    rawText,
+    description: String(payload.description || '').trim(),
+    source: 'discord',
+    sourceId,
+    author,
+    sourceUrl: url,
+    state: String(payload.state || 'Triage').trim(),
+    labels: dedupeStrings(['discord', ...normalizeLabelNames(payload.labels || [])]),
+    dueDate: String(payload.dueDate || '').trim(),
+    priority: Number(payload.priority || 3),
+  };
+}
+
+function ensureDirSync(dirPath) {
+  fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function sanitizeFilename(value) {
+  return String(value || '')
+    .trim()
+    .replace(/[\\/\0<>:"|?*]+/g, '-')
+    .replace(/\s+/g, ' ')
+    .slice(0, 160)
+    .trim();
+}
+
+function formatDateId(ms, timezone) {
+  const dt = new Date(ms);
+  const year = new Intl.DateTimeFormat('en-US', { timeZone: timezone, year: 'numeric' }).format(dt);
+  const month = new Intl.DateTimeFormat('en-US', { timeZone: timezone, month: '2-digit' }).format(dt);
+  const day = new Intl.DateTimeFormat('en-US', { timeZone: timezone, day: '2-digit' }).format(dt);
+  return `${year}-${month}-${day}`;
+}
+
+function buildMemoMarkdown(memo) {
+  const lines = [];
+  lines.push(`# ${memo.title}`);
+  lines.push('');
+  lines.push('## TL;DR');
+  lines.push(memo.tldr ? `- ${memo.tldr}` : '-');
+  lines.push('');
+  lines.push('## Background');
+  lines.push(memo.background ? memo.background : '-');
+  lines.push('');
+  lines.push('## Proposal');
+  lines.push(memo.proposal ? memo.proposal : '-');
+  lines.push('');
+  lines.push('## Next Steps');
+  if (memo.nextSteps && memo.nextSteps.length > 0) {
+    for (const step of memo.nextSteps) {
+      lines.push(`- ${step}`);
+    }
+  } else {
+    lines.push('-');
+  }
+  lines.push('');
+  lines.push('## Risks');
+  if (memo.risks && memo.risks.length > 0) {
+    for (const item of memo.risks) {
+      lines.push(`- ${item}`);
+    }
+  } else {
+    lines.push('-');
+  }
+  lines.push('');
+  lines.push('## Links');
+  lines.push(`- Source: ${memo.sourceUrl || '-'}`);
+  if (memo.linearUrl) {
+    lines.push(`- Linear: ${memo.linearUrl}`);
+  }
+  lines.push('');
+  lines.push('## Raw Notes');
+  lines.push('```text');
+  lines.push(memo.rawNotes || '');
+  lines.push('```');
+  lines.push('');
+  lines.push(`_generated ${formatTime(memo.generatedAtMs, memo.timezone)} by mission-control memo-save_`);
+  return lines.join('\n');
+}
+
+function saveObsidianMemo(memo, settings) {
+  const vaultPath = path.resolve(settings.obsidian && settings.obsidian.vaultPath ? settings.obsidian.vaultPath : path.join(ROOT_DIR, '..', 'Obsidian'));
+  const relDir = (settings.obsidian && settings.obsidian.memoDir) ? settings.obsidian.memoDir : 'Knowledge';
+  const memoDir = path.join(vaultPath, relDir);
+  ensureDirSync(memoDir);
+
+  const dateId = formatDateId(memo.generatedAtMs, settings.timezone || 'UTC');
+  const safeTitle = sanitizeFilename(memo.title || 'memo');
+  const filename = `${dateId}_${safeTitle}.md`;
+  const filePath = path.join(memoDir, filename);
+
+  const markdown = buildMemoMarkdown(memo);
+  fs.writeFileSync(filePath, markdown, 'utf8');
+
+  const relativePath = path.relative(path.resolve(ROOT_DIR, '..'), filePath);
+  appendAuditEvent('memo-saved', {
+    relativePath,
+    sourceId: memo.sourceId,
+    sourceUrl: memo.sourceUrl,
+    title: memo.title,
+  });
+
+  return { filePath, relativePath };
+}
+
+async function buildDiscordMemo(input, settings) {
+  const channelId = String(input.channelId || '').trim();
+  const messageId = String(input.messageId || '').trim();
+  const nowMs = Date.now();
+
+  const messages = await fetchDiscordMessagesViaOpenClaw(channelId, messageId, 30);
+  const rawLines = [];
+  for (const msg of messages) {
+    const author = (msg && msg.author && (msg.author.global_name || msg.author.username)) ? (msg.author.global_name || msg.author.username) : 'unknown';
+    const content = singleLine(String(msg.content || '')).trim();
+    if (!content) {
+      continue;
+    }
+    rawLines.push(`[${author}] ${content}`);
+  }
+
+  const rawNotes = rawLines.join('\n');
+  const top = messages.find((m) => String(m.id) === String(messageId)) || messages[0] || {};
+
+  const guildId = String(top.guild_id || top.guildId || (top.guild && top.guild.id) || '').trim();
+  const authorName = (top.author && (top.author.global_name || top.author.username)) ? (top.author.global_name || top.author.username) : '';
+  const sourceUrl = guildId
+    ? `https://discord.com/channels/${guildId}/${channelId}/${messageId}`
+    : `https://discord.com/channels/@me/${channelId}/${messageId}`;
+
+  const sourceId = normalizeSourceId(`discord:${guildId || '@me'}:${channelId}:${messageId}`);
+
+  const title =
+    String(input.title || '').trim() ||
+    trimMessage(singleLine(String(top.content || rawNotes || 'Discord memo')).trim(), 120);
+
+  const body = rawNotes;
+
+  const tldr = trimMessage(singleLine(rawNotes).slice(0, 180), 180);
+  const background = 'Captured from Discord discussion. Refine as needed.';
+  const proposal = 'See Raw Notes. Convert into v1/v2/v3 milestones when executing.';
+  const nextSteps = [
+    'v1: Verify-first + N-best patch search (measurable improvement)',
+    'v2: pattern library + retrieval + rerank + hard negatives',
+    'v3: distill from trajectories (SFT/DPO) to reduce fallback usage',
+  ];
+  const risks = [
+    'Do not include secrets in notes (tokens, API keys).',
+    'Avoid broad scope; start with 3 task types (fix-tests/fix-lint/upgrade-deps).',
+  ];
+
+  return {
+    title,
+    tldr,
+    background,
+    proposal,
+    nextSteps,
+    risks,
+    body,
+    rawNotes,
+    author: String(authorName || '').trim(),
+    sourceUrl,
+    sourceId,
+    generatedAtMs: nowMs,
+    timezone: settings.timezone || 'UTC',
+    linearUrl: '',
+  };
+}
+
+async function fetchDiscordMessagesViaOpenClaw(channelId, messageId, contextLimit) {
+  const args = [
+    'message',
+    'read',
+    '--channel',
+    'discord',
+    '--target',
+    channelId,
+    '--limit',
+    String(contextLimit),
+    '--around',
+    String(messageId),
+  ];
+  const tmpPath = path.join(os.tmpdir(), `openclaw-discord-read-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
+  const result = spawnSync(
+    'openclaw',
+    [...args, '--json'],
+    {
+      encoding: 'utf8',
+      maxBuffer: 10 * 1024 * 1024,
+      stdio: ['ignore', fs.openSync(tmpPath, 'w'), 'pipe'],
+    },
+  );
+  if (result.status !== 0) {
+    throw new Error(`openclaw message read failed: ${String(result.stderr || '').trim()}`);
+  }
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse(fs.readFileSync(tmpPath, 'utf8'));
+  } catch (error) {
+    throw new Error(`unable to parse openclaw message read output: ${String(error)}`);
+  } finally {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // ignore
+    }
+  }
+  const payload = parsed && typeof parsed === 'object' ? (parsed.payload && typeof parsed.payload === 'object' ? parsed.payload : parsed) : {};
+  const msgs = payload && Array.isArray(payload.messages) ? payload.messages : [];
+  const messageIndex = msgs.findIndex((m) => String(m.id) === String(messageId));
+  if (messageIndex === -1) {
+    return msgs;
+  }
+  // include the target + a small window of newer/older messages as they appear in the read result
+  const window = msgs.slice(Math.max(0, messageIndex - 15), Math.min(msgs.length, messageIndex + 15));
+  return window.length > 0 ? window : msgs;
 }
 
 function enqueueIngestItem(kind, payload, error, settings) {
@@ -3658,7 +5669,8 @@ function buildIncidentCandidates(report, snapshot, settings) {
     }
 
     const runs = loadCronRuns(jobId, 3, settings);
-    const key = `${jobId}:${anomaly.reason}`;
+    const runbook = deriveIncidentRunbook(job, anomaly, settings);
+    const key = `${jobId}:${anomaly.reason}:${runbook.signature}`;
     const summary = anomaly.title;
 
     candidates.push({
@@ -3668,14 +5680,15 @@ function buildIncidentCandidates(report, snapshot, settings) {
       anomaly,
       job,
       runs,
-      description: renderIncidentDescription(job, anomaly, runs, settings),
+      runbook,
+      description: renderIncidentDescription(job, anomaly, runs, runbook, settings),
     });
   }
 
   return candidates;
 }
 
-function renderIncidentDescription(job, anomaly, runs, settings) {
+function renderIncidentDescription(job, anomaly, runs, runbook, settings) {
   const state = job.state || {};
   const lines = [];
 
@@ -3703,6 +5716,9 @@ function renderIncidentDescription(job, anomaly, runs, settings) {
   lines.push('## Logs / run references');
   lines.push(`- file: ${path.join(settings.openclawHome, 'cron', 'runs', `${job.id}.jsonl`)}`);
   lines.push(`- inspect: openclaw cron runs --id ${job.id} --limit 20`);
+  for (const logPath of runbook.logPaths || []) {
+    lines.push(`- file: ${logPath}`);
+  }
 
   if (runs.length > 0) {
     lines.push('');
@@ -3718,12 +5734,78 @@ function renderIncidentDescription(job, anomaly, runs, settings) {
   }
 
   lines.push('');
-  lines.push('## Suggested fix steps');
-  lines.push(`1. Reproduce quickly: openclaw cron run ${job.id}`);
-  lines.push('2. Check script/task timeout behavior and external dependencies.');
-  lines.push('3. Apply fix and watch next 2 scheduled runs.');
+  lines.push('## Failure Signature');
+  lines.push(`- signature: ${runbook.signature}`);
+  lines.push(`- runbook card: ${runbook.card}`);
+  lines.push(`- reason: ${runbook.reason}`);
+  lines.push('');
+  lines.push('## Executable Runbook');
+  for (let i = 0; i < runbook.nextCommands.length; i += 1) {
+    lines.push(`${i + 1}. \`${runbook.nextCommands[i]}\``);
+  }
+  lines.push('');
+  lines.push('## Possible Causes');
+  for (const cause of runbook.possibleCauses) {
+    lines.push(`- ${cause}`);
+  }
+  lines.push('');
+  lines.push('## Verification');
+  lines.push(`1. Validate immediate rerun: \`openclaw cron run ${job.id}\``);
+  lines.push('2. Verify next 2 scheduled runs are successful.');
+  lines.push('3. Update linked issue with root-cause summary and preventive action.');
 
   return lines.join('\n');
+}
+
+function deriveIncidentRunbook(job, anomaly, settings) {
+  const state = job && job.state ? job.state : {};
+  const lastError = String((state && state.lastError) || anomaly.detail || '').toLowerCase();
+  const signatureBase = `${job.id}:${anomaly.reason}:${trimMessage(lastError, 180)}`;
+  const signature = `sig-${hashText(signatureBase)}`;
+  const logPaths = [path.join(settings.openclawHome, 'cron', 'runs', `${job.id}.jsonl`)];
+  const possibleCauses = [];
+  let card = 'cron-recover';
+
+  if (anomaly.reason === 'timeout' || /timeout|timed out/i.test(lastError)) {
+    possibleCauses.push('External API/database latency spike exceeded task timeout.');
+    possibleCauses.push('Task scope too large for current timeout budget.');
+    possibleCauses.push('Downstream dependency stuck (network, DNS, or rate limit).');
+    card = 'cron-recover';
+  } else if (anomaly.reason === 'consecutive-errors') {
+    possibleCauses.push('Deterministic script bug introduced in recent change.');
+    possibleCauses.push('Credential or permission drift in runtime environment.');
+    possibleCauses.push('Input payload schema changed and parser is outdated.');
+    card = 'cron-recover';
+  } else if (anomaly.reason === 'silent') {
+    possibleCauses.push('Scheduler stalled or cron trigger missed.');
+    possibleCauses.push('Job disabled inadvertently or stuck in lock state.');
+    possibleCauses.push('Host sleep/restart interrupted scheduled execution.');
+    card = 'cron-recover';
+  } else {
+    possibleCauses.push('Unknown runtime failure; inspect latest run logs first.');
+  }
+
+  const nextCommands = [
+    `npm run tasks -- runbook-exec --card ${card} --cron-id ${job.id}`,
+    `openclaw cron runs --id ${job.id} --limit 20`,
+    `npm run tasks -- status-sync --json`,
+  ];
+  if (anomaly.reason === 'timeout') {
+    nextCommands.splice(
+      1,
+      0,
+      'npm run tasks -- runbook-exec --card queue-backlog',
+    );
+  }
+
+  return {
+    signature,
+    card,
+    reason: anomaly.reason,
+    possibleCauses: dedupeStrings(possibleCauses),
+    nextCommands: dedupeStrings(nextCommands),
+    logPaths: dedupeStrings(logPaths),
+  };
 }
 
 async function createLinearIssue(candidate, settings) {
@@ -3737,7 +5819,8 @@ async function createLinearIssue(candidate, settings) {
     throw new Error('Unable to resolve Linear team id. Set LINEAR_TEAM_ID or LINEAR_TEAM_KEY.');
   }
 
-  const title = `[ops][cron] ${candidate.job.name || candidate.job.id} - ${candidate.reason}`;
+  const signature = candidate.runbook && candidate.runbook.signature ? candidate.runbook.signature : '';
+  const title = `[ops][cron] ${candidate.job.name || candidate.job.id} - ${candidate.reason}${signature ? ` (${signature})` : ''}`;
   const input = {
     teamId,
     title,
@@ -3870,16 +5953,52 @@ async function githubApiRequest(token, endpoint) {
   return body;
 }
 
-async function todoistApiRequest(apiToken, pathSuffix) {
+async function requestGithubPullReviewers(token, repo, prNumber, reviewers) {
+  const response = await fetch(`https://api.github.com/repos/${repo}/pulls/${prNumber}/requested_reviewers`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${token}`,
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'openclaw-mission-control',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      reviewers,
+    }),
+  });
+
+  const raw = await response.text();
+  let body = null;
+  try {
+    body = raw ? JSON.parse(raw) : null;
+  } catch {
+    body = null;
+  }
+  if (!response.ok) {
+    const detail = body && body.message ? body.message : trimMessage(raw || `HTTP ${response.status}`, 240);
+    throw new Error(`GitHub request reviewers failed (${response.status}): ${detail}`);
+  }
+  return {
+    ok: true,
+    requestedReviewers: reviewers,
+    status: response.status,
+  };
+}
+
+async function todoistApiRequest(apiToken, pathSuffix, method = 'GET', payload = undefined) {
   const suffix = String(pathSuffix || '').startsWith('/') ? String(pathSuffix) : `/${String(pathSuffix || '')}`;
   const url = `https://api.todoist.com/api/v1${suffix}`;
+  const normalizedMethod = String(method || 'GET').toUpperCase();
+  const headers = {
+    Authorization: `Bearer ${apiToken}`,
+    'Content-Type': 'application/json',
+    'User-Agent': 'openclaw-mission-control',
+  };
   const response = await fetch(url, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${apiToken}`,
-      'Content-Type': 'application/json',
-      'User-Agent': 'openclaw-mission-control',
-    },
+    method: normalizedMethod,
+    headers,
+    body: payload === undefined || normalizedMethod === 'GET' ? undefined : JSON.stringify(payload),
   });
   const raw = await response.text();
   let body = null;
@@ -3893,6 +6012,14 @@ async function todoistApiRequest(apiToken, pathSuffix) {
     throw new Error(`Todoist API ${response.status}: ${detail}`);
   }
   return body;
+}
+
+async function closeTodoistTask(apiToken, taskId) {
+  const id = String(taskId || '').trim();
+  if (!id) {
+    throw new Error('todoist task id is required for close');
+  }
+  await todoistApiRequest(apiToken, `/tasks/${id}/close`, 'POST', {});
 }
 
 async function fetchTodoistTasks(apiToken, limit) {
@@ -4452,6 +6579,251 @@ function extractJson(text) {
   }
 
   throw new Error(`Failed to parse JSON from output:\n${trimmed.slice(0, 400)}`);
+}
+
+function normalizeTriggerJobId(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) {
+    return '';
+  }
+  const alias = {
+    github: 'github-sync',
+    gh: 'github-sync',
+    todoist: 'todoist-sync',
+    calendar: 'calendar-sync',
+    gcal: 'calendar-sync',
+    reminder: 'remind',
+    brief: 'briefing',
+    'briefing-daily': 'briefing',
+    state: 'status-sync',
+    status: 'status-sync',
+    queue: 'queue-drain',
+    sla: 'sla-check',
+  };
+  return alias[text] || text;
+}
+
+function buildTriggerChildArgs(jobId, settings, flags) {
+  const args = [];
+  switch (jobId) {
+    case 'github-sync':
+      args.push('github-sync', '--json');
+      break;
+    case 'todoist-sync':
+      args.push('todoist-sync', '--json');
+      break;
+    case 'calendar-sync':
+      args.push('calendar-sync', '--json');
+      if (flags['to-linear'] || flags.toLinear) {
+        args.push('--to-linear');
+      }
+      break;
+    case 'watchdog':
+      args.push('watchdog', '--json');
+      if (flags['auto-linear'] || settings.linear.enabled !== false) {
+        args.push('--auto-linear');
+      }
+      break;
+    case 'report':
+      args.push('report', '--json');
+      if (flags.send) {
+        args.push('--send');
+      }
+      break;
+    case 'briefing': {
+      const mode = String(flags.mode || flags._[1] || 'daily').trim();
+      args.push('briefing', mode, '--json');
+      if (flags.send) {
+        args.push('--send');
+      }
+      if (flags['auto-escalate'] || flags.escalate) {
+        args.push('--auto-escalate');
+      }
+      break;
+    }
+    case 'remind': {
+      const mode = String(flags.mode || flags._[1] || 'all').trim();
+      args.push('remind', mode, '--json');
+      if (flags.send) {
+        args.push('--send');
+      }
+      break;
+    }
+    case 'status-sync':
+      args.push('status-sync', '--json');
+      break;
+    case 'queue-drain':
+      args.push('queue-drain', '--json');
+      break;
+    case 'sla-check':
+      args.push('sla-check', '--json');
+      break;
+    default:
+      throw new Error(`unsupported trigger job: ${jobId}`);
+  }
+  return args;
+}
+
+function parseGitChangedFiles(statusOutput) {
+  const lines = String(statusOutput || '')
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter(Boolean);
+  const files = [];
+  for (const line of lines) {
+    if (line.length < 4) {
+      continue;
+    }
+    const pathPart = line.slice(3).trim();
+    if (!pathPart) {
+      continue;
+    }
+    const renamed = pathPart.includes('->')
+      ? pathPart
+          .split('->')
+          .map((item) => item.trim())
+          .filter(Boolean)
+      : [pathPart];
+    for (const item of renamed) {
+      const normalized = item.replace(/^"+|"+$/g, '');
+      if (normalized) {
+        files.push(normalized);
+      }
+    }
+  }
+  return dedupeStrings(files);
+}
+
+function evaluateAutoPrRisk(changedFiles, allowedPrefixes) {
+  if (!Array.isArray(changedFiles) || changedFiles.length === 0) {
+    return { ok: false, blockedFiles: ['(no files)'] };
+  }
+  const prefixes =
+    Array.isArray(allowedPrefixes) && allowedPrefixes.length > 0
+      ? allowedPrefixes
+      : ['docs/', '.github/', 'README.md', 'config/'];
+  const blockedFiles = changedFiles.filter((file) => {
+    const normalized = String(file || '').trim();
+    if (!normalized) {
+      return true;
+    }
+    return !prefixes.some((prefix) => normalized === prefix || normalized.startsWith(prefix));
+  });
+  return {
+    ok: blockedFiles.length === 0,
+    blockedFiles,
+  };
+}
+
+function buildAutoPrTitle(issueIdentifier, changedFiles) {
+  const scope = changedFiles.some((file) => String(file).startsWith('docs/')) ? 'docs' : 'automation';
+  return `${issueIdentifier ? `${issueIdentifier} ` : ''}chore(${scope}): auto update`;
+}
+
+function buildAutoPrBody(input) {
+  const issueIdentifier = String(input.issueIdentifier || '').trim();
+  const changedFiles = Array.isArray(input.changedFiles) ? input.changedFiles : [];
+  const baseBranch = String(input.baseBranch || 'main');
+  const testCommand = String(input.testCommand || '').trim();
+  const lines = [];
+  lines.push('## Auto PR Summary');
+  if (issueIdentifier) {
+    lines.push(`- linked issue: ${issueIdentifier}`);
+  }
+  lines.push(`- base branch: ${baseBranch}`);
+  lines.push(`- changed files: ${changedFiles.length}`);
+  if (testCommand) {
+    lines.push(`- test command: \`${testCommand}\``);
+  }
+  lines.push('');
+  lines.push('## Files');
+  for (const file of changedFiles.slice(0, 100)) {
+    lines.push(`- ${file}`);
+  }
+  lines.push('');
+  lines.push('## Checklist');
+  lines.push('- [x] low-risk path allowlist gate passed');
+  lines.push('- [x] local checks executed');
+  lines.push('- [ ] reviewer validation');
+  return lines.join('\n');
+}
+
+function runShellCommand(command, cwd) {
+  const result = spawnSync(command, {
+    cwd,
+    encoding: 'utf8',
+    env: process.env,
+    shell: true,
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    const detail = [result.stdout, result.stderr].filter(Boolean).join('\n').trim();
+    throw new Error(`shell command failed (${command}) with code ${result.status}${detail ? `: ${detail}` : ''}`);
+  }
+  return {
+    stdout: String(result.stdout || '').trim(),
+    stderr: String(result.stderr || '').trim(),
+  };
+}
+
+async function createGithubPullRequest(token, repo, input) {
+  const response = await fetch(`https://api.github.com/repos/${repo}/pulls`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${token}`,
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'openclaw-mission-control',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      title: input.title,
+      body: input.body,
+      head: input.head,
+      base: input.base,
+      draft: Boolean(input.draft),
+    }),
+  });
+
+  const raw = await response.text();
+  let body = null;
+  try {
+    body = raw ? JSON.parse(raw) : null;
+  } catch {
+    body = null;
+  }
+  if (!response.ok) {
+    const detail =
+      body && body.message ? String(body.message) : trimMessage(raw || `HTTP ${response.status}`, 240);
+    throw new Error(`GitHub create PR failed (${response.status}): ${detail}`);
+  }
+  return {
+    id: body && body.id ? body.id : '',
+    number: body && body.number ? body.number : 0,
+    url: body && body.html_url ? body.html_url : '',
+    title: body && body.title ? body.title : input.title,
+  };
+}
+
+function renderEvalReplayPlan(replay, replayPath, settings) {
+  const lines = [];
+  lines.push('# Eval Replay / Distillation Plan');
+  lines.push('');
+  lines.push(`- generated: ${formatTime(replay.generatedAtMs, settings.timezone)}`);
+  lines.push(`- replay artifact: ${replayPath}`);
+  lines.push(`- sessions: ${replay.metrics.sessions}`);
+  lines.push(`- cron runs: ${replay.metrics.cronRuns}`);
+  lines.push(`- failures: ${replay.metrics.failures}`);
+  lines.push('');
+  lines.push('## Suggested Next Steps');
+  lines.push('1. Slice failed runs by signature (timeout/network/tooling/model).');
+  lines.push('2. Build replay harness to compare baseline vs patched behavior.');
+  lines.push('3. Extract stable prompt/tool decisions into distill dataset.');
+  lines.push('4. Gate rollout on replay pass-rate and regression checks.');
+  return lines.join('\n');
 }
 
 function consumeConfirmation(confirmArg) {

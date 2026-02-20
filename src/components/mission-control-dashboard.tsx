@@ -61,6 +61,18 @@ type ToolsPayload = SourcePayload & { tools: ToolCard[]; actions: ToolAction[] }
 type TodoMutationPayload = SourcePayload & { todo?: TodoItem };
 type ApprovalMutationPayload = SourcePayload & { approval?: ApprovalItem };
 type ToolMutationPayload = SourcePayload & { action?: ToolAction };
+type ControlJobsPayload = SourcePayload & { jobs: string[] };
+type ControlRunPayload = SourcePayload & {
+  jobId?: string;
+  payload?: unknown;
+};
+
+type ControlJobCard = {
+  id: string;
+  label: string;
+  description: string;
+  payload?: Record<string, unknown>;
+};
 
 export default function MissionControlDashboard() {
   const [todos, setTodos] = useState<TodoItem[]>([]);
@@ -96,6 +108,10 @@ export default function MissionControlDashboard() {
   const [busyTodoIds, setBusyTodoIds] = useState<string[]>([]);
   const [busyApprovalId, setBusyApprovalId] = useState<string | null>(null);
   const [busyToolId, setBusyToolId] = useState<ToolId | null>(null);
+  const [controlJobs, setControlJobs] = useState<string[]>([]);
+  const [controlSource, setControlSource] = useState<string>('unknown');
+  const [controlConfirmCode, setControlConfirmCode] = useState('');
+  const [busyControlJobId, setBusyControlJobId] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [refreshInterval, setRefreshInterval] = useState<number>(15000);
@@ -114,6 +130,57 @@ export default function MissionControlDashboard() {
     [tools],
   );
 
+  const controlJobCards = useMemo<ControlJobCard[]>(
+    () => [
+      {
+        id: 'github-sync',
+        label: 'Run GitHub Sync',
+        description: 'Sync PR signals to Linear state.',
+      },
+      {
+        id: 'todoist-sync',
+        label: 'Run Todoist Sync',
+        description: 'Pull Todoist tasks into Linear triage.',
+      },
+      {
+        id: 'calendar-sync',
+        label: 'Run Calendar Sync',
+        description: 'Capture calendar events into mission flow.',
+      },
+      {
+        id: 'watchdog',
+        label: 'Run Watchdog',
+        description: 'Detect failures/timeouts and open incidents.',
+        payload: {
+          autoLinear: true,
+        },
+      },
+      {
+        id: 'report',
+        label: 'Run Health Report',
+        description: 'Generate current runtime health summary.',
+      },
+      {
+        id: 'briefing',
+        label: 'Run Daily Briefing',
+        description: 'Generate/send daily mission briefing template.',
+        payload: {
+          mode: 'daily',
+          send: true,
+        },
+      },
+      {
+        id: 'remind',
+        label: 'Run Reminder',
+        description: 'Send due/cycle reminder snapshot.',
+        payload: {
+          mode: 'all',
+        },
+      },
+    ],
+    [],
+  );
+
   const refreshData = useCallback(async (initialLoad = false): Promise<void> => {
     if (initialLoad) {
       setIsLoading(true);
@@ -122,7 +189,7 @@ export default function MissionControlDashboard() {
     }
 
     try {
-      const [todosPayload, runtimePayload, subagentsPayload, approvalsPayload, toolsPayload] =
+      const [todosPayload, runtimePayload, subagentsPayload, approvalsPayload, toolsPayload, controlPayload] =
         await Promise.all([
           fetchJson<TodosPayload>('/api/todos'),
           fetchJson<{
@@ -141,6 +208,7 @@ export default function MissionControlDashboard() {
           }>('/api/subagents'),
           fetchJson<ApprovalsPayload>('/api/approvals'),
           fetchJson<ToolsPayload>('/api/tools'),
+          fetchJson<ControlJobsPayload>('/api/control/jobs'),
         ]);
 
       setTodos(todosPayload.todos ?? []);
@@ -172,6 +240,8 @@ export default function MissionControlDashboard() {
       setToolActions(toolsPayload.actions ?? []);
       setToolsSource(toolsPayload.source ?? 'unknown');
       setToolsError(toolsPayload.ok ? null : toolsPayload.error ?? null);
+      setControlJobs(controlPayload.jobs ?? []);
+      setControlSource(controlPayload.source ?? 'unknown');
       setErrorMessage(null);
     } catch (error) {
       setErrorMessage(normalizeError(error));
@@ -325,6 +395,37 @@ export default function MissionControlDashboard() {
       setErrorMessage(normalizeError(error));
     } finally {
       setBusyToolId(null);
+    }
+  }
+
+  async function handleRunControlJob(job: ControlJobCard): Promise<void> {
+    const code = controlConfirmCode.trim();
+    if (!code) {
+      setErrorMessage('Enter a CONFIRM code before running control jobs.');
+      return;
+    }
+
+    setBusyControlJobId(job.id);
+    try {
+      const payload = await fetchJson<ControlRunPayload>('/api/control/jobs', {
+        method: 'POST',
+        body: JSON.stringify({
+          jobId: job.id,
+          confirm: code,
+          ...(job.payload ?? {}),
+        }),
+      });
+      if (!payload.ok) {
+        throw new Error(payload.error ?? 'failed to run control job');
+      }
+      setNotice(`Control job executed: ${job.id}`);
+      setErrorMessage(null);
+      setControlConfirmCode('');
+      void refreshData(false);
+    } catch (error) {
+      setErrorMessage(normalizeError(error));
+    } finally {
+      setBusyControlJobId(null);
     }
   }
 
@@ -760,6 +861,54 @@ export default function MissionControlDashboard() {
           {approvals.length === 0 ? (
             <p className="rounded-lg border border-dashed border-slate-300 px-3 py-4 text-center text-sm text-slate-500">
               Approval queue is empty.
+            </p>
+          ) : null}
+        </section>
+
+        <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm xl:col-span-2">
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-lg font-semibold text-slate-900">Automation Control Jobs</h2>
+            <span className="text-xs font-medium text-slate-500">Source: {controlSource}</span>
+          </div>
+          <p className="text-sm text-slate-600">
+            One-click trigger for sync/report/watchdog workflows. All actions require one-time
+            confirmation code.
+          </p>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <input
+              value={controlConfirmCode}
+              onChange={(event) => setControlConfirmCode(event.target.value)}
+              placeholder='CONFIRM <CODE>'
+              className="w-full max-w-sm rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-900 outline-none ring-cyan-300 transition focus:border-cyan-300 focus:ring-2"
+            />
+            <span className="text-xs text-slate-500">
+              Generate via <code className="font-mono">npm run tasks -- confirm</code>
+            </span>
+          </div>
+          <div className="mt-4 grid gap-3 md:grid-cols-3">
+            {controlJobCards
+              .filter((job) => controlJobs.includes(job.id))
+              .map((job) => (
+                <article
+                  key={job.id}
+                  className="rounded-lg border border-slate-200 bg-slate-50 p-4"
+                >
+                  <h3 className="text-sm font-semibold text-slate-800">{job.label}</h3>
+                  <p className="mt-2 text-sm text-slate-600">{job.description}</p>
+                  <button
+                    type="button"
+                    onClick={() => void handleRunControlJob(job)}
+                    disabled={busyControlJobId === job.id}
+                    className="mt-4 rounded-md bg-slate-900 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {busyControlJobId === job.id ? 'Running...' : 'Run now'}
+                  </button>
+                </article>
+              ))}
+          </div>
+          {controlJobs.length === 0 ? (
+            <p className="mt-3 rounded-lg border border-dashed border-slate-300 px-3 py-4 text-center text-sm text-slate-500">
+              No control jobs available.
             </p>
           ) : null}
         </section>

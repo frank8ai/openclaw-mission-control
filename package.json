@@ -14,17 +14,22 @@
     "tasks:report": "node ./scripts/tasks.js report",
     "tasks:watchdog": "node ./scripts/tasks.js watchdog",
     "tasks:now": "node ./scripts/tasks.js now",
+    "tasks:briefing": "node ./scripts/tasks.js briefing daily",
     "tasks:remind": "node ./scripts/tasks.js remind all",
     "tasks:triage": "node ./scripts/tasks.js triage",
     "tasks:ingest": "node ./scripts/tasks.js ingest-server",
     "tasks:github-hooks": "node ./scripts/tasks.js github-hooks",
     "tasks:github-sync": "node ./scripts/tasks.js github-sync",
     "tasks:todoist-sync": "node ./scripts/tasks.js todoist-sync",
+    "tasks:todoist-backsync": "node ./scripts/tasks.js todoist-backsync",
     "tasks:calendar-sync": "node ./scripts/tasks.js calendar-sync",
     "tasks:status-sync": "node ./scripts/tasks.js status-sync",
     "tasks:queue-drain": "node ./scripts/tasks.js queue-drain",
     "tasks:sla-check": "node ./scripts/tasks.js sla-check",
-    "tasks:runbook-exec": "node ./scripts/tasks.js runbook-exec"
+    "tasks:runbook-exec": "node ./scripts/tasks.js runbook-exec",
+    "tasks:trigger": "node ./scripts/tasks.js trigger",
+    "tasks:autopr": "node ./scripts/tasks.js autopr",
+    "tasks:eval-replay": "node ./scripts/tasks.js eval-replay"
   },
   "dependencies": {
     "next": "16.1.6",
