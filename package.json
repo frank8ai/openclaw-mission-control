@@ -23,7 +23,8 @@
     "tasks:calendar-sync": "node ./scripts/tasks.js calendar-sync",
     "tasks:status-sync": "node ./scripts/tasks.js status-sync",
     "tasks:queue-drain": "node ./scripts/tasks.js queue-drain",
-    "tasks:sla-check": "node ./scripts/tasks.js sla-check"
+    "tasks:sla-check": "node ./scripts/tasks.js sla-check",
+    "tasks:runbook-exec": "node ./scripts/tasks.js runbook-exec"
   },
   "dependencies": {
     "next": "16.1.6",

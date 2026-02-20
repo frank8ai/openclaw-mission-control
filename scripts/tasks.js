@@ -27,6 +27,7 @@ const INGEST_QUEUE_PATH = path.join(DATA_DIR, 'ingest-queue.json');
 const INGEST_DLQ_PATH = path.join(DATA_DIR, 'ingest-dlq.json');
 const AUDIT_LOG_PATH = path.join(DATA_DIR, 'audit.jsonl');
 const SLA_STATE_PATH = path.join(DATA_DIR, 'sla-check.json');
+const RUNBOOK_EXEC_PATH = path.join(DATA_DIR, 'runbook-exec.json');
 
 hydrateEnvFromDotEnv();
 
@@ -123,9 +124,64 @@ const DEFAULTS = {
     createOpsIssue: true,
     pollMinutes: 30,
   },
+  runbook: {
+    enabled: true,
+    allowExecute: false,
+    defaultDryRun: true,
+    allowedActions: ['status-sync', 'queue-drain', 'cron-run'],
+    maxActionsPerRun: 5,
+  },
 };
 
-const HELP_TEXT = `OpenClaw Control Center CLI\n\nUsage:\n  npm run tasks -- <command> [options]\n  node scripts/tasks.js <command> [options]\n\nRead commands:\n  now                          Quick 30-second answer: what is happening + what next\n  jobs                         List cron jobs and status\n  agents                       List subagents (label/status/start/elapsed)\n  sessions                     List active sessions summary\n  report [--json] [--send]     Build health report (Top 5 anomalies + manual actions)\n  watchdog [--auto-linear]     Detect incidents and optionally auto-create Linear issues\n  remind [due|cycle|all]       Send reminders from Linear (due soon/current cycle)\n  status-sync [--json]         Auto state machine + comment trail for linked runtime issues\n  queue-drain [--json]         Retry ingest queue and move failed payloads to DLQ\n  sla-check [--json]           Stale/blocked SLA checks with owner mention + escalation issue\n\nIntegrations:\n  triage --title ...           Create a Triage issue quickly (supports --source/--source-id/--labels)\n  ingest-server                Start webhook server for external intake + GitHub PR sync\n  github-hooks [--repo PATH]   Install git hooks to enforce/add Linear ID in branch/commit\n  github-sync                  Poll GitHub PRs and sync Linear states (In Review/Done)\n  todoist-sync                 Sync Todoist tasks into Linear Triage\n  calendar-sync                Sync Google Calendar events snapshot (browser logged-in tab)\n\nWrite commands (require one-time confirmation):\n  confirm                      Generate one-time confirmation code\n  run <jobId> --confirm CODE   Run cron job now\n  enable <jobId> --confirm CODE\n  disable <jobId> --confirm CODE\n  kill <subagentId> --confirm CODE\n\nScheduling:\n  schedule [--apply] [--channel CH] [--target TGT]\n    Prepare (or install) crontab block:\n    - 09:00 + 18:00 report\n    - every 5 minutes watchdog\n    - status machine + queue drain + sla-check\n    - reminders (due soon + cycle planning)\n\nExamples:\n  npm run tasks -- triage --title \"Fix Discord manual model switch\" --source discord --source-id discord:msg:123\n  npm run tasks -- status-sync\n  npm run tasks -- queue-drain\n  npm run tasks -- sla-check\n`;
+const HELP_TEXT = `OpenClaw Control Center CLI
+
+Usage:
+  npm run tasks -- <command> [options]
+  node scripts/tasks.js <command> [options]
+
+Read commands:
+  now                          Quick 30-second answer: what is happening + what next
+  jobs                         List cron jobs and status
+  agents                       List subagents (label/status/start/elapsed)
+  sessions                     List active sessions summary
+  report [--json] [--send]     Build health report (Top 5 anomalies + manual actions)
+  watchdog [--auto-linear]     Detect incidents and optionally auto-create Linear issues
+  remind [due|cycle|all]       Send reminders from Linear (due soon/current cycle)
+  status-sync [--json]         Auto state machine + comment trail for linked runtime issues
+  queue-drain [--json]         Retry ingest queue and move failed payloads to DLQ
+  sla-check [--json]           Stale/blocked SLA checks with owner mention + escalation issue
+
+Integrations:
+  triage --title ...           Create a Triage issue quickly (supports --source/--source-id/--labels)
+  ingest-server                Start webhook server for external intake + GitHub PR sync
+  github-hooks [--repo PATH]   Install git hooks to enforce/add Linear ID in branch/commit
+  github-sync                  Poll GitHub PRs and sync Linear states (In Review/Done)
+  todoist-sync                 Sync Todoist tasks into Linear Triage
+  calendar-sync                Sync Google Calendar events snapshot (browser logged-in tab)
+
+Write commands (require one-time confirmation):
+  confirm                      Generate one-time confirmation code
+  run <jobId> --confirm CODE   Run cron job now
+  enable <jobId> --confirm CODE
+  disable <jobId> --confirm CODE
+  kill <subagentId> --confirm CODE
+  runbook-exec --card CARD [--issue CLAW-123] [--cron-id ID] --confirm CODE [--execute]
+
+Scheduling:
+  schedule [--apply] [--channel CH] [--target TGT]
+    Prepare (or install) crontab block:
+    - 09:00 + 18:00 report
+    - every 5 minutes watchdog
+    - status machine + queue drain + sla-check
+    - reminders (due soon + cycle planning)
+
+Examples:
+  npm run tasks -- triage --title "Fix Discord manual model switch" --source discord --source-id discord:msg:123
+  npm run tasks -- status-sync
+  npm run tasks -- queue-drain
+  npm run tasks -- sla-check
+  npm run tasks -- runbook-exec --card cron-recover --issue CLAW-123 --confirm "CONFIRM ABC123" --execute
+`;
 
 async function main() {
   const { command, flags } = parseArgv(process.argv.slice(2));
@@ -176,6 +232,10 @@ async function main() {
       case 'sla-check':
       case 'sla':
         await cmdSlaCheck(settings, flags);
+        return;
+      case 'runbook-exec':
+      case 'runbook':
+        await cmdRunbookExec(settings, flags);
         return;
       case 'ingest-server':
       case 'webhook':
@@ -1381,6 +1441,326 @@ async function cmdSlaCheck(settings, flags) {
     );
   }
   process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+async function cmdRunbookExec(settings, flags) {
+  if (settings.runbook && settings.runbook.enabled === false) {
+    throw new Error('runbook execution is disabled in config.');
+  }
+
+  const card = normalizeRunbookCard(flags.card || flags._[0] || '');
+  if (!card) {
+    throw new Error('runbook-exec requires --card (model-failover|cron-recover|queue-backlog|issue-refresh).');
+  }
+
+  const issueIdentifier = normalizeLinearIssueId(
+    flags.issue || flags.identifier || flags.id || flags['issue-id'] || '',
+  );
+  const plan = buildRunbookExecutionPlan(card, issueIdentifier, flags, settings);
+  const maxActions = Math.max(1, Number(settings.runbook.maxActionsPerRun || 5));
+  if (plan.actions.length > maxActions) {
+    throw new Error(`runbook plan has ${plan.actions.length} actions, exceeds maxActionsPerRun=${maxActions}.`);
+  }
+
+  const allowedActions = new Set(
+    (Array.isArray(settings.runbook.allowedActions) ? settings.runbook.allowedActions : [])
+      .map((item) => String(item || '').trim().toLowerCase())
+      .filter(Boolean),
+  );
+  if (allowedActions.size === 0) {
+    throw new Error('runbook.allowedActions is empty; no action can be executed safely.');
+  }
+  for (const action of plan.actions) {
+    if (!allowedActions.has(action.type)) {
+      throw new Error(`runbook action "${action.type}" is not allowed by runbook.allowedActions.`);
+    }
+  }
+
+  const defaultDryRun = settings.runbook.defaultDryRun !== false;
+  const explicitExecute = Boolean(flags.execute || flags.apply);
+  const explicitDryRun = Boolean(flags['dry-run'] || flags.dryRun);
+  const dryRun = explicitExecute ? false : explicitDryRun ? true : defaultDryRun;
+  const continueOnError = Boolean(flags['continue-on-error']);
+
+  if (!dryRun) {
+    if (settings.runbook.allowExecute === false) {
+      throw new Error(
+        'runbook execution is disabled by default. Set runbook.allowExecute=true in config/control-center.json first.',
+      );
+    }
+    consumeConfirmation(flags.confirm);
+  }
+
+  const startedAtMs = Date.now();
+  const results = [];
+  appendAuditEvent('runbook-exec-plan', {
+    card,
+    issueIdentifier: plan.issueIdentifier || '',
+    dryRun,
+    actions: plan.actions.map((item) => ({
+      type: item.type,
+      description: item.description,
+      command: [item.bin].concat(item.args || []).join(' '),
+    })),
+  });
+
+  for (const action of plan.actions) {
+    const commandText = [action.bin].concat(action.args || []).map(shellQuote).join(' ');
+    if (dryRun) {
+      results.push({
+        type: action.type,
+        status: 'planned',
+        description: action.description,
+        command: commandText,
+      });
+      continue;
+    }
+
+    const actionStartedMs = Date.now();
+    try {
+      const output = runCommand(action.bin, action.args || []);
+      const item = {
+        type: action.type,
+        status: 'ok',
+        description: action.description,
+        command: commandText,
+        durationMs: Date.now() - actionStartedMs,
+        stdout: trimMessage(output.stdout || '', 240),
+        stderr: trimMessage(output.stderr || '', 240),
+      };
+      results.push(item);
+      appendAuditEvent('runbook-exec-action', {
+        card,
+        issueIdentifier: plan.issueIdentifier || '',
+        type: action.type,
+        command: commandText,
+        durationMs: item.durationMs,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const item = {
+        type: action.type,
+        status: 'error',
+        description: action.description,
+        command: commandText,
+        durationMs: Date.now() - actionStartedMs,
+        error: message,
+      };
+      results.push(item);
+      appendAuditEvent('runbook-exec-action-error', {
+        card,
+        issueIdentifier: plan.issueIdentifier || '',
+        type: action.type,
+        command: commandText,
+        durationMs: item.durationMs,
+        error: message,
+      });
+      if (!continueOnError) {
+        break;
+      }
+    }
+  }
+
+  const failed = results.filter((item) => item.status === 'error');
+  const summary = {
+    ok: failed.length === 0,
+    card,
+    issueIdentifier: plan.issueIdentifier || '',
+    dryRun,
+    continueOnError,
+    startedAtMs,
+    finishedAtMs: Date.now(),
+    durationMs: Date.now() - startedAtMs,
+    actionsPlanned: plan.actions.length,
+    actionsAttempted: results.length,
+    actionsFailed: failed.length,
+    notes: plan.notes,
+    results,
+  };
+
+  const runbookState = readJsonFile(RUNBOOK_EXEC_PATH, { version: 1, updatedAtMs: 0, runs: [] });
+  const runHistory = Array.isArray(runbookState.runs) ? runbookState.runs : [];
+  runHistory.unshift({
+    atMs: summary.finishedAtMs,
+    card: summary.card,
+    issueIdentifier: summary.issueIdentifier,
+    dryRun: summary.dryRun,
+    ok: summary.ok,
+    actionsPlanned: summary.actionsPlanned,
+    actionsAttempted: summary.actionsAttempted,
+    actionsFailed: summary.actionsFailed,
+  });
+  runbookState.version = 1;
+  runbookState.updatedAtMs = summary.finishedAtMs;
+  runbookState.runs = runHistory.slice(0, 100);
+  writeJsonFile(RUNBOOK_EXEC_PATH, runbookState);
+
+  appendAuditEvent('runbook-exec-summary', {
+    card: summary.card,
+    issueIdentifier: summary.issueIdentifier,
+    dryRun: summary.dryRun,
+    ok: summary.ok,
+    actionsPlanned: summary.actionsPlanned,
+    actionsAttempted: summary.actionsAttempted,
+    actionsFailed: summary.actionsFailed,
+    durationMs: summary.durationMs,
+  });
+
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+  } else {
+    const lines = [];
+    lines.push('Runbook execution result:');
+    lines.push(`- card: ${summary.card}`);
+    lines.push(`- issue: ${summary.issueIdentifier || '-'}`);
+    lines.push(`- mode: ${summary.dryRun ? 'dry-run' : 'execute'}`);
+    lines.push(`- actions: ${summary.actionsAttempted}/${summary.actionsPlanned} attempted`);
+    lines.push(`- failed: ${summary.actionsFailed}`);
+    if (summary.notes.length > 0) {
+      lines.push('- notes:');
+      for (const note of summary.notes) {
+        lines.push(`  - ${note}`);
+      }
+    }
+    for (const item of summary.results) {
+      lines.push(`- [${item.status}] ${item.type}: ${item.description}`);
+      lines.push(`  - cmd: ${item.command}`);
+      if (item.error) {
+        lines.push(`  - error: ${singleLine(trimMessage(item.error, 240))}`);
+      }
+    }
+    process.stdout.write(`${lines.join('\n')}\n`);
+  }
+
+  if (!summary.ok) {
+    throw new Error(`runbook-exec completed with ${summary.actionsFailed} failed action(s).`);
+  }
+}
+
+function normalizeRunbookCard(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) {
+    return '';
+  }
+  const alias = {
+    model: 'model-failover',
+    'model-switch': 'model-failover',
+    'failover-model': 'model-failover',
+    cron: 'cron-recover',
+    'cron-retry': 'cron-recover',
+    queue: 'queue-backlog',
+    refresh: 'issue-refresh',
+    status: 'issue-refresh',
+  };
+  return alias[text] || text;
+}
+
+function buildRunbookExecutionPlan(card, issueIdentifier, flags, settings) {
+  const scriptPath = path.join(ROOT_DIR, 'scripts', 'tasks.js');
+  const notes = [];
+  let issueContext = null;
+  if (issueIdentifier) {
+    const contexts = collectLinkedIssueSignals(settings, flags);
+    issueContext = contexts.find((item) => item.identifier === issueIdentifier) || null;
+    if (!issueContext) {
+      notes.push(`No active runtime signal found for ${issueIdentifier}; using static runbook actions.`);
+    }
+  }
+
+  switch (card) {
+    case 'model-failover':
+      notes.push('Verify model route and fallback chain before restarting runtime components.');
+      return {
+        card,
+        issueIdentifier,
+        notes,
+        actions: [
+          {
+            type: 'status-sync',
+            description: 'Refresh issue state and evidence comments from runtime signals.',
+            bin: process.execPath,
+            args: [scriptPath, 'status-sync', '--json'],
+          },
+          {
+            type: 'queue-drain',
+            description: 'Drain intake retry queue to clear stale delivery backlog.',
+            bin: process.execPath,
+            args: [scriptPath, 'queue-drain', '--json'],
+          },
+        ],
+      };
+    case 'cron-recover': {
+      const cronId = String(
+        flags['cron-id'] ||
+          flags.cronId ||
+          flags.job ||
+          (issueContext && issueContext.cronWarnings[0] ? issueContext.cronWarnings[0].cronId : '') ||
+          '',
+      ).trim();
+      if (!cronId) {
+        throw new Error('cron-recover requires --cron-id, or an --issue linked to a cron warning.');
+      }
+      notes.push(`Run cron ${cronId} once, then refresh status machine evidence.`);
+      return {
+        card,
+        issueIdentifier,
+        notes,
+        actions: [
+          {
+            type: 'cron-run',
+            description: `Run cron ${cronId} once for quick recovery validation.`,
+            bin: 'openclaw',
+            args: ['cron', 'run', cronId],
+          },
+          {
+            type: 'status-sync',
+            description: 'Refresh issue state and evidence comments after cron rerun.',
+            bin: process.execPath,
+            args: [scriptPath, 'status-sync', '--json'],
+          },
+        ],
+      };
+    }
+    case 'queue-backlog':
+      notes.push('Use queue-drain first; if DLQ keeps growing, inspect upstream webhook/auth.');
+      return {
+        card,
+        issueIdentifier,
+        notes,
+        actions: [
+          {
+            type: 'queue-drain',
+            description: 'Retry queued payloads and move exhausted retries to DLQ.',
+            bin: process.execPath,
+            args: [scriptPath, 'queue-drain', '--json'],
+          },
+          {
+            type: 'status-sync',
+            description: 'Refresh issue states after queue stabilization.',
+            bin: process.execPath,
+            args: [scriptPath, 'status-sync', '--json'],
+          },
+        ],
+      };
+    case 'issue-refresh':
+      return {
+        card,
+        issueIdentifier,
+        notes,
+        actions: [
+          {
+            type: 'status-sync',
+            description: 'Refresh issue state and evidence comments from latest runtime signals.',
+            bin: process.execPath,
+            args: [scriptPath, 'status-sync', '--json'],
+          },
+        ],
+      };
+    default:
+      throw new Error(
+        `unsupported runbook card "${card}". Supported: model-failover, cron-recover, queue-backlog, issue-refresh.`,
+      );
+  }
 }
 
 async function cmdIngestServer(settings, flags) {

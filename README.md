@@ -37,6 +37,7 @@ Tracking page for ongoing OpenClaw development projects:
 - `tasks status-sync`: auto status machine (`Triage -> In Progress -> In Review -> Done/Blocked`) for linked runtime issues
 - `tasks queue-drain`: retry ingest queue and move exhausted items to DLQ
 - `tasks sla-check`: stale issue SLA check (Blocked/In Progress) with owner mention + escalation issue
+- `tasks runbook-exec`: run SOP runbook cards in dry-run or guarded execute mode
 - `tasks run|enable|disable|kill`: control actions with one-time confirmation token
 - `tasks schedule`: generate/install crontab for:
   - Daily report at `09:00` and `18:00`
@@ -163,6 +164,12 @@ npm run tasks -- queue-drain
 
 # Stale SLA checks + escalation
 npm run tasks -- sla-check
+
+# Runbook v2 (default dry-run)
+npm run tasks -- runbook-exec --card cron-recover --issue CLAW-123
+
+# Runbook v2 execute mode (requires confirm token + runbook.allowExecute=true)
+npm run tasks -- runbook-exec --card cron-recover --issue CLAW-123 --confirm "CONFIRM <CODE>" --execute
 ```
 
 ## API response contract
@@ -205,9 +212,11 @@ npm run tasks -- disable <jobId> --confirm "CONFIRM <CODE>"
 npm run tasks -- enable <jobId> --confirm "CONFIRM <CODE>"
 npm run tasks -- run <jobId> --confirm "CONFIRM <CODE>"
 npm run tasks -- kill <subagentId> --confirm "CONFIRM <CODE>"
+npm run tasks -- runbook-exec --card queue-backlog --issue CLAW-123 --confirm "CONFIRM <CODE>" --execute
 ```
 
 `kill` is blocked unless the subagent ID is in whitelist.
+`runbook-exec --execute` is blocked unless `runbook.allowExecute=true`.
 
 ## Scheduling
 
@@ -388,6 +397,22 @@ Audit trail:
 
 - `data/control-center/audit.jsonl`
 
+### Runbook semi-auto (v2)
+
+`runbook-exec` provides guarded recovery cards with strict allowlist:
+
+- `model-failover`
+- `cron-recover`
+- `queue-backlog`
+- `issue-refresh`
+
+Safety defaults:
+
+- default mode is dry-run
+- execute mode requires one-time `CONFIRM` token
+- execute mode requires `runbook.allowExecute=true`
+- each action is validated against `runbook.allowedActions`
+
 ### Google Calendar sync
 
 Capture events from current logged-in Google Calendar tab (browser profile `openclaw`):
@@ -425,6 +450,7 @@ Fields:
 - `statusMachine.*`
 - `intakeQueue.*`
 - `sla.*`
+- `runbook.*`
 
 ## Storage files
 
@@ -432,6 +458,13 @@ Runtime files created by CLI/dashboard:
 
 - `data/control-center/confirmations.json`
 - `data/control-center/incidents.json`
+- `data/control-center/status-sync.json`
+- `data/control-center/triage-source-index.json`
+- `data/control-center/ingest-queue.json`
+- `data/control-center/ingest-dlq.json`
+- `data/control-center/sla-check.json`
+- `data/control-center/runbook-exec.json`
+- `data/control-center/audit.jsonl`
 - `data/control-center/report-cron.log`
 - `data/control-center/watchdog-cron.log`
 - Dashboard files under `data/mission-control/`:

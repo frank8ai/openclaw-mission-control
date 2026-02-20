@@ -12,3 +12,7 @@ This index lists project-level SOPs for OpenClaw Mission Control automation.
   - Purpose: detect stale Blocked/In Progress issues and auto-mention/escalate.
 - `SOP_MC_Runbook_AutoFix_v1.md`
   - Purpose: codify known-fault remediation suggestions and semi-automatic repair.
+- `SOP_MC_Runbook_AutoFix_v2.md`
+  - Purpose: guarded semi-automatic runbook execution with confirmation token, allowlist, and audit.
+- `SOP_MC_Audit_Permissions_v1.md`
+  - Purpose: enforce read-by-default with explicit confirmation and auditable write actions.

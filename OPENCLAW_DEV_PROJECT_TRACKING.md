@@ -53,14 +53,16 @@ Primary focus:
   - `data/control-center/sla-check.json`
 
 6. 自动修复 Runbook
-- Status: `Done (v1 suggestion mode)`
+- Status: `Done (v2 guarded semi-auto)`
 - Evidence:
   - `docs/sop/SOP_MC_Runbook_AutoFix_v1.md`
-  - `scripts/tasks.js` (`status-sync` suggested runbook hints)
+  - `docs/sop/SOP_MC_Runbook_AutoFix_v2.md`
+  - `scripts/tasks.js` (`runbook-exec`)
 
 7. 审计与权限（write actions）
 - Status: `Done (v1)`
 - Evidence:
+  - `docs/sop/SOP_MC_Audit_Permissions_v1.md`
   - `scripts/tasks.js` audit appends
   - `data/control-center/audit.jsonl`
 
@@ -168,8 +170,24 @@ Use this template for each update:
   - P0 and P1-v1 automation loop is runnable by cron.
   - Runbook now in suggestion mode (safe, non-destructive).
 - Blockers:
-  - v2 runbook semi-auto execution not implemented yet.
+  - none.
 - Next action:
-  - implement runbook mapping + guarded semi-auto command execution.
+  - maintain via cron and validate issue coverage quality weekly.
 - Links:
   - `docs/sop/SOP_INDEX.md`
+
+### 2026-02-20 22:20
+- What changed:
+  - Added guarded runbook execution command `runbook-exec` (default dry-run, execute gated by confirm token + config gate + allowlist).
+  - Added runbook execution state file and audit events.
+  - Added missing SOP docs for `runbook v2` and `audit + permissions`.
+- Current state:
+  - P0/P1-v1 loop complete.
+  - Runbook v2 semi-auto path complete with safety defaults.
+- Blockers:
+  - none.
+- Next action:
+  - add `/ops` queue/DLQ and SLA widgets (optional v2 UI polish).
+- Links:
+  - `docs/sop/SOP_MC_Runbook_AutoFix_v2.md`
+  - `docs/sop/SOP_MC_Audit_Permissions_v1.md`

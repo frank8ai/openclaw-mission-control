@@ -92,5 +92,16 @@
     "commentCooldownHours": 24,
     "createOpsIssue": true,
     "pollMinutes": 30
+  },
+  "runbook": {
+    "enabled": true,
+    "allowExecute": false,
+    "defaultDryRun": true,
+    "allowedActions": [
+      "status-sync",
+      "queue-drain",
+      "cron-run"
+    ],
+    "maxActionsPerRun": 5
   }
 }
