@@ -74,3 +74,38 @@ Use this template for each update:
 - Next action:
 - Links:
 ```
+
+## SOP Execution Log
+
+### 2026-02-20 21:18
+- SOP Route Card:
+  - task: 将 OpenClaw 正在运行的 session/subagent 与 Linear issue 绑定，并在 Mission Control 按 issue 视角展示。
+  - owner: codex
+  - classification: asset-compound
+  - priority: P0
+  - risk: medium (状态可视化改造，读取本地状态+Linear API，不改生产写操作)
+  - chosen_sop: `SOP/SOP_Router_v1.md` + `SOP/SOP_Preflight_Counterexample_Gate_v1.md` + `SOP/SOP_Task_Tagging_High_Leverage_v1.md`
+  - asset_output:
+    - type: `code` + `doc`
+    - path: `src/lib/openclaw-runtime.ts`, `src/components/mission-control-dashboard.tsx`, `src/app/ops/page.tsx`, `README.md`, `OPENCLAW_DEV_PROJECT_TRACKING.md`
+  - stop_condition: 如出现 issue 误识别（false positive）或 runtime 接口延迟明显升高，先回退自动识别并仅保留手动绑定。
+
+- Preflight Counterexample Gate:
+  - minimal_success: 在 `/` 和 `/ops` 页面看到 `Linked Issues`，并显示 linked/unlinked 计数；未绑定任务清晰标注。
+  - counterexamples:
+    - C1 execution: 运行态来源差异导致没有可绑定字段。
+      - mitigation: 以 `taskId/sessionKey/sessionId/subagentId/cronId` 多键绑定，任一命中即可。
+    - C2 quality: 自动识别把模型名（如 `gpt-5`）误判为 issue。
+      - mitigation: 只允许指定 team key（默认 `CLAW`）格式进入自动识别，并支持手动覆盖。
+    - C3 risk: Linear API 不可用时导致页面异常。
+      - mitigation: 线性查询失败降级为本地任务展示，不阻断 runtime 快照。
+  - decision: PASS
+  - preflight: PASS + 风险可控且有降级策略
+
+- Task Tagging:
+  - tags: Asset, Growth, Risk
+  - DoD: 你可在 30 秒内看见“有哪些 issue 在跑、哪些任务没绑定、每个 issue 的运行/告警数量”。
+
+- Verification:
+  - `npm run lint` 通过
+  - `GET /api/runtime/tasks` 返回 `issues` + 新 summary 字段（`linkedIssues/linkedTasks/unlinkedActive`）

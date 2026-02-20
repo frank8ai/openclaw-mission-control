@@ -54,6 +54,7 @@ export type CronEvent = {
 
 export type RuntimeTaskType = 'session' | 'subagent' | 'cron';
 export type RuntimeTaskStatus = 'running' | 'warning' | 'idle';
+export type RuntimeIssueSource = 'detected' | 'binding';
 
 export type RuntimeTaskItem = {
   id: string;
@@ -63,6 +64,28 @@ export type RuntimeTaskItem = {
   detail: string;
   ageMs?: number;
   updatedAt?: string;
+  issueIdentifier?: string;
+  issueTitle?: string;
+  issueState?: string;
+  issueUrl?: string;
+  issueAssignee?: string;
+  issueSource?: RuntimeIssueSource;
+};
+
+export type RuntimeIssueItem = {
+  identifier: string;
+  title: string;
+  state: string;
+  url?: string;
+  assignee?: string;
+  source: RuntimeIssueSource | 'mixed';
+  taskCount: number;
+  runningCount: number;
+  warningCount: number;
+  latestUpdateAt?: string;
+  tasks: Array<
+    Pick<RuntimeTaskItem, 'id' | 'type' | 'status' | 'title' | 'updatedAt'>
+  >;
 };
 
 export type RuntimeTaskSummary = {
@@ -71,4 +94,7 @@ export type RuntimeTaskSummary = {
   sessions: number;
   subagents: number;
   cronIssues: number;
+  linkedIssues: number;
+  linkedTasks: number;
+  unlinkedActive: number;
 };

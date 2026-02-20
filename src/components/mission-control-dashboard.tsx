@@ -5,6 +5,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import type {
   ApprovalItem,
   ApprovalStatus,
+  RuntimeIssueItem,
   RuntimeTaskItem,
   RuntimeTaskStatus,
   RuntimeTaskSummary,
@@ -64,12 +65,16 @@ type ToolMutationPayload = SourcePayload & { action?: ToolAction };
 export default function MissionControlDashboard() {
   const [todos, setTodos] = useState<TodoItem[]>([]);
   const [runtimeTasks, setRuntimeTasks] = useState<RuntimeTaskItem[]>([]);
+  const [runtimeIssues, setRuntimeIssues] = useState<RuntimeIssueItem[]>([]);
   const [runtimeSummary, setRuntimeSummary] = useState<RuntimeTaskSummary>({
     active: 0,
     warnings: 0,
     sessions: 0,
     subagents: 0,
     cronIssues: 0,
+    linkedIssues: 0,
+    linkedTasks: 0,
+    unlinkedActive: 0,
   });
   const [runtimeSource, setRuntimeSource] = useState<string>('unknown');
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
@@ -123,6 +128,7 @@ export default function MissionControlDashboard() {
           fetchJson<{
             ok: boolean;
             tasks: RuntimeTaskItem[];
+            issues: RuntimeIssueItem[];
             summary: RuntimeTaskSummary;
             source: string;
             error?: string;
@@ -141,6 +147,7 @@ export default function MissionControlDashboard() {
       setTodoSource(todosPayload.source ?? 'unknown');
       setTodoError(todosPayload.ok ? null : todosPayload.error ?? null);
       setRuntimeTasks(runtimePayload.tasks ?? []);
+      setRuntimeIssues(runtimePayload.issues ?? []);
       setRuntimeSummary(
         runtimePayload.summary ?? {
           active: 0,
@@ -148,6 +155,9 @@ export default function MissionControlDashboard() {
           sessions: 0,
           subagents: 0,
           cronIssues: 0,
+          linkedIssues: 0,
+          linkedTasks: 0,
+          unlinkedActive: 0,
         },
       );
       setRuntimeSource(runtimePayload.source ?? 'unknown');
@@ -389,6 +399,9 @@ export default function MissionControlDashboard() {
             Runtime: {runtimeSummary.active} active / {runtimeSummary.warnings} warnings
           </span>
           <span className="rounded-full bg-white px-3 py-1 text-slate-700">
+            Linked issues: {runtimeSummary.linkedIssues} ({runtimeSummary.linkedTasks} tasks)
+          </span>
+          <span className="rounded-full bg-white px-3 py-1 text-slate-700">
             Subagents: {subagents.length} tracked ({subagentSource})
           </span>
           <span className="rounded-full bg-white px-3 py-1 text-slate-700">
@@ -431,12 +444,67 @@ export default function MissionControlDashboard() {
             <span className="rounded-full bg-slate-100 px-3 py-1 text-slate-700">
               Cron issues: {runtimeSummary.cronIssues}
             </span>
+            <span className="rounded-full bg-slate-100 px-3 py-1 text-slate-700">
+              Unlinked active: {runtimeSummary.unlinkedActive}
+            </span>
           </div>
           {runtimeError ? (
             <p className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
               Runtime task fallback: {runtimeError}
             </p>
           ) : null}
+          {runtimeIssues.length > 0 ? (
+            <div className="mb-4 rounded-lg border border-slate-200 bg-white p-3">
+              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
+                Linked Issues
+              </p>
+              <ul className="mt-2 space-y-2">
+                {runtimeIssues.map((issue) => (
+                  <li
+                    key={issue.identifier}
+                    className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        {issue.url ? (
+                          <a
+                            href={issue.url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-sm font-semibold text-cyan-700 underline-offset-2 hover:underline"
+                          >
+                            {issue.identifier}
+                          </a>
+                        ) : (
+                          <span className="text-sm font-semibold text-slate-900">
+                            {issue.identifier}
+                          </span>
+                        )}
+                        <span className="rounded-full bg-white px-2 py-1 text-[11px] font-medium text-slate-600">
+                          {issue.state}
+                        </span>
+                        <span className="rounded-full bg-white px-2 py-1 text-[11px] font-medium text-slate-600">
+                          {issue.source}
+                        </span>
+                      </div>
+                      <span className="text-[11px] text-slate-500">
+                        {issue.runningCount} running / {issue.warningCount} warning
+                      </span>
+                    </div>
+                    <p className="mt-1 text-sm text-slate-700">{issue.title}</p>
+                    <p className="mt-1 text-xs text-slate-500">
+                      {issue.assignee ? `Owner ${issue.assignee} · ` : ''}
+                      {issue.taskCount} runtime tasks linked
+                    </p>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : (
+            <p className="mb-3 rounded-lg border border-dashed border-slate-300 px-3 py-2 text-xs text-slate-500">
+              No runtime tasks linked to Linear issues yet.
+            </p>
+          )}
           {runtimeTasks.length === 0 ? (
             <p className="rounded-lg border border-dashed border-slate-300 px-3 py-4 text-center text-sm text-slate-500">
               No active OpenClaw tasks right now.
@@ -465,6 +533,28 @@ export default function MissionControlDashboard() {
                   </div>
                   <p className="mt-2 text-sm font-medium text-slate-800">{task.title}</p>
                   <p className="mt-1 text-sm text-slate-600">{task.detail}</p>
+                  {task.issueIdentifier ? (
+                    <p className="mt-1 text-xs text-cyan-700">
+                      Issue{' '}
+                      {task.issueUrl ? (
+                        <a
+                          href={task.issueUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="underline-offset-2 hover:underline"
+                        >
+                          {task.issueIdentifier}
+                        </a>
+                      ) : (
+                        task.issueIdentifier
+                      )}
+                      {task.issueTitle ? ` · ${task.issueTitle}` : ''}
+                      {task.issueState ? ` · ${task.issueState}` : ''}
+                      {task.issueAssignee ? ` · owner ${task.issueAssignee}` : ''}
+                    </p>
+                  ) : (
+                    <p className="mt-1 text-xs text-amber-700">Issue: unlinked</p>
+                  )}
                   {task.updatedAt ? (
                     <p className="mt-1 text-xs text-slate-500">
                       Updated {formatTimestamp(task.updatedAt)}

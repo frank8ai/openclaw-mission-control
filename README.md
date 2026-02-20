@@ -12,6 +12,7 @@ Tracking page for ongoing OpenClaw development projects:
 
 - Todo list with local JSON persistence (`data/mission-control/todos.json`)
 - Subagent tracker UI (tries local OpenClaw API, falls back to stub data)
+- Runtime issue linkage view (group active tasks by Linear issue when available)
 - Content approval queue (`tweet` / `thumbnail` / `script`)
 - Tool cards:
   - Generate briefing stub
@@ -64,6 +65,42 @@ If you want only Linear sync/verify:
 npm run linear:sync
 npm run linear:verify
 ```
+
+## Runtime Issue Linking (P0)
+
+Mission Control links active runtime tasks to Linear in two ways:
+
+1. Auto-detect issue IDs from task text (e.g. `CLAW-123`)  
+   - default allowed team key: `CLAW`
+   - optional override: `CONTROL_CENTER_ISSUE_TEAM_KEYS="CLAW,OPS"`
+2. Manual binding file (recommended for Discord sessions without issue ID in text):  
+   `data/control-center/runtime-issue-links.json`
+
+Example manual binding:
+
+```json
+{
+  "byTaskId": {
+    "session:main:agent:main:discord:channel:1468117725040742527": "CLAW-123"
+  },
+  "bySessionId": {
+    "0e75fa5e-7182-4d13-8f1d-639655d081a5": "CLAW-123"
+  },
+  "bySessionKey": {
+    "agent:codex:discord:channel:1473998332031533157": "CLAW-124"
+  },
+  "bySubagentId": {
+    "subagent-1": "CLAW-125"
+  },
+  "byCronId": {
+    "e9598af8-438a-4b04-a532-817343723772": "CLAW-126"
+  }
+}
+```
+
+Reference template: `config/runtime-issue-links.example.json`
+
+After writing the file, refresh `/` or `/ops`. Linked issue cards and summary counters are updated automatically.
 
 ## CLI usage
 

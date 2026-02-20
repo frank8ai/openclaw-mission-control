@@ -1,0 +1,17 @@
+{
+  "byTaskId": {
+    "session:main:agent:main:discord:channel:1468117725040742527": "CLAW-123"
+  },
+  "bySessionId": {
+    "0e75fa5e-7182-4d13-8f1d-639655d081a5": "CLAW-123"
+  },
+  "bySessionKey": {
+    "agent:codex:discord:channel:1473998332031533157": "CLAW-124"
+  },
+  "bySubagentId": {
+    "subagent-1": "CLAW-125"
+  },
+  "byCronId": {
+    "e9598af8-438a-4b04-a532-817343723772": "CLAW-126"
+  }
+}

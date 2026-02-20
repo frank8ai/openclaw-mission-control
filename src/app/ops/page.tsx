@@ -1,5 +1,5 @@
 import { listApprovals, listTodos, listToolActions } from '@/lib/mission-control-store';
-import type { RuntimeTaskSummary } from '@/lib/mission-control-types';
+import type { RuntimeIssueItem, RuntimeTaskSummary } from '@/lib/mission-control-types';
 import { getOpenClawRuntimeSnapshot } from '@/lib/openclaw-runtime';
 import { listSubagentsWithFallback } from '@/lib/subagents-provider';
 
@@ -21,6 +21,9 @@ const EMPTY_RUNTIME_SUMMARY: RuntimeTaskSummary = {
   sessions: 0,
   subagents: 0,
   cronIssues: 0,
+  linkedIssues: 0,
+  linkedTasks: 0,
+  unlinkedActive: 0,
 };
 
 const dateFormatter = new Intl.DateTimeFormat('en-US', {
@@ -48,6 +51,7 @@ export default async function OpsPage() {
       : null;
   const runtimeSummary = runtimeSnapshot?.summary ?? EMPTY_RUNTIME_SUMMARY;
   const runtimeTasks = (runtimeSnapshot?.tasks ?? []).slice(0, 15);
+  const runtimeIssues: RuntimeIssueItem[] = (runtimeSnapshot?.issues ?? []).slice(0, 10);
 
   const subagentsPayload =
     subagentsResult.status === 'fulfilled' ? subagentsResult.value : null;
@@ -93,6 +97,12 @@ export default async function OpsPage() {
       value: String(runtimeSummary.warnings),
       detail: `${runtimeSummary.cronIssues} cron issues`,
       tone: runtimeSummary.warnings > 0 ? 'warn' : 'ok',
+    },
+    {
+      label: 'Linked Issues',
+      value: String(runtimeSummary.linkedIssues),
+      detail: `${runtimeSummary.linkedTasks} tasks linked`,
+      tone: runtimeSummary.linkedIssues > 0 ? 'ok' : 'neutral',
     },
     {
       label: 'Subagents API',
@@ -179,6 +189,44 @@ export default async function OpsPage() {
       </section>
 
       <section className="mt-5 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+        <h2 className="text-lg font-semibold text-slate-900">Linked Issues</h2>
+        {runtimeIssues.length === 0 ? (
+          <p className="mt-3 text-sm text-slate-500">No linked runtime issues.</p>
+        ) : (
+          <ul className="mt-3 space-y-3">
+            {runtimeIssues.map((issue) => (
+              <li
+                key={issue.identifier}
+                className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-sm font-medium text-slate-800">
+                    {issue.url ? (
+                      <a
+                        href={issue.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-cyan-700 underline-offset-2 hover:underline"
+                      >
+                        {issue.identifier}
+                      </a>
+                    ) : (
+                      issue.identifier
+                    )}
+                    {' '}· {issue.state}
+                  </p>
+                  <p className="text-xs text-slate-500">
+                    {issue.runningCount} running / {issue.warningCount} warning
+                  </p>
+                </div>
+                <p className="mt-1 text-xs text-slate-600">{issue.title}</p>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="mt-5 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
         <h2 className="text-lg font-semibold text-slate-900">Runtime Tasks</h2>
         {runtimeTasks.length === 0 ? (
           <p className="mt-3 text-sm text-slate-500">No runtime tasks available.</p>
@@ -204,6 +252,10 @@ export default async function OpsPage() {
                   </span>
                 </div>
                 <p className="mt-1 text-xs text-slate-600">{task.detail}</p>
+                <p className="mt-1 text-xs text-slate-600">
+                  Issue: {task.issueIdentifier ?? 'unlinked'}
+                  {task.issueState ? ` · ${task.issueState}` : ''}
+                </p>
                 <p className="mt-1 text-xs text-slate-500">
                   {task.updatedAt ? `Updated ${formatTimestamp(task.updatedAt)}` : 'Updated -'}
                 </p>
