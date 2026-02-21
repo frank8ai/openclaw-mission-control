@@ -29,6 +29,8 @@ const INGEST_DLQ_PATH = path.join(DATA_DIR, 'ingest-dlq.json');
 const AUDIT_LOG_PATH = path.join(DATA_DIR, 'audit.jsonl');
 const SLA_STATE_PATH = path.join(DATA_DIR, 'sla-check.json');
 const RUNBOOK_EXEC_PATH = path.join(DATA_DIR, 'runbook-exec.json');
+const DISCORD_INTAKE_STATE_PATH = path.join(DATA_DIR, 'discord-intake-state.json');
+const LINEAR_AUTOPILOT_PATH = path.join(DATA_DIR, 'linear-autopilot.json');
 
 hydrateEnvFromDotEnv();
 
@@ -56,6 +58,7 @@ const DEFAULTS = {
       'github-sync',
       'todoist-sync',
       'calendar-sync',
+      'discord-intake-sync',
       'watchdog',
       'report',
       'briefing',
@@ -63,6 +66,7 @@ const DEFAULTS = {
       'status-sync',
       'queue-drain',
       'sla-check',
+      'linear-autopilot',
     ],
   },
   linear: {
@@ -131,6 +135,21 @@ const DEFAULTS = {
     syncToLinear: false,
     label: 'calendar',
     defaultState: 'Triage',
+  },
+  discordIntake: {
+    enabled: true,
+    channelId: process.env.CONTROL_CENTER_DISCORD_INTAKE_CHANNEL || '',
+    ownerUserIds: process.env.CONTROL_CENTER_OWNER_USER_IDS
+      ? process.env.CONTROL_CENTER_OWNER_USER_IDS.split(',').map((item) => item.trim()).filter(Boolean)
+      : ['1146425418937811145'],
+    includeBotMessages: false,
+    limit: 30,
+    pollMinutes: 2,
+    maxCreatePerRun: 5,
+    minTextChars: 6,
+    labels: ['auto-intake', 'main-directive'],
+    defaultState: 'Triage',
+    defaultPriority: 3,
   },
   obsidian: {
     vaultPath: process.env.OBSIDIAN_VAULT_PATH || path.join(ROOT_DIR, '..', 'Obsidian'),
@@ -227,6 +246,18 @@ const DEFAULTS = {
     allowedActions: ['status-sync', 'queue-drain', 'cron-run'],
     maxActionsPerRun: 5,
   },
+  execution: {
+    enabled: true,
+    pollMinutes: 15,
+    agentId: 'main',
+    timeoutSeconds: 900,
+    includeStates: ['In Progress', 'Triage', 'Blocked'],
+    includeLabels: ['auto-intake', 'main-directive'],
+    maxPromptChars: 1400,
+    autoComment: true,
+    autoTransition: true,
+    defaultTransitionFromTriage: 'In Progress',
+  },
 };
 
 const HELP_TEXT = `OpenClaw Control Center CLI
@@ -258,6 +289,8 @@ Integrations:
   todoist-sync                 Sync Todoist tasks into Linear Triage
   todoist-backsync             Mark Todoist tasks complete when linked Linear issues are Done
   calendar-sync                Sync Google Calendar events snapshot (browser logged-in tab)
+  discord-intake-sync          Auto ingest main Discord directives into Linear Triage
+  linear-autopilot             Pick one runnable Linear issue and execute one next step via main agent
 
 Write commands (require one-time confirmation):
   confirm                      Generate one-time confirmation code
@@ -274,7 +307,7 @@ Scheduling:
     Prepare (or install) crontab block:
     - 09:00 + 18:00 report
     - every 5 minutes watchdog
-    - status machine + queue drain + sla-check
+    - status machine + queue drain + sla-check + linear-autopilot
     - reminders + daily/weekly briefing
 
 Examples:
@@ -283,7 +316,9 @@ Examples:
   npm run tasks -- status-sync
   npm run tasks -- queue-drain
   npm run tasks -- sla-check
+  npm run tasks -- linear-autopilot --json
   npm run tasks -- briefing daily --send
+  npm run tasks -- discord-intake-sync --channel 1468117725040742527
   npm run tasks -- trigger github-sync --confirm "CONFIRM ABC123"
   npm run tasks -- autopr --issue CLAW-123 --confirm "CONFIRM ABC123"
   npm run tasks -- runbook-exec --card cron-recover --issue CLAW-123 --confirm "CONFIRM ABC123" --execute
@@ -376,10 +411,20 @@ async function main() {
       case 'todoist-done-sync':
         await cmdTodoistBacksync(settings, flags);
         return;
+      case 'discord-intake-sync':
+      case 'discord-intake':
+      case 'intake-sync':
+        await cmdDiscordIntakeSync(settings, flags);
+        return;
       case 'calendar-sync':
       case 'gcal-sync':
       case 'calendar':
         await cmdCalendarSync(settings, flags);
+        return;
+      case 'linear-autopilot':
+      case 'execution-loop':
+      case 'autopilot':
+        await cmdLinearAutopilot(settings, flags);
         return;
       case 'confirm':
         await cmdConfirm(settings, flags);
@@ -1041,7 +1086,7 @@ async function cmdTrigger(settings, flags) {
   const jobId = normalizeTriggerJobId(flags._[0] || flags.job || '');
   if (!jobId) {
     throw new Error(
-      'trigger requires a job id. Allowed: github-sync,todoist-sync,calendar-sync,watchdog,report,briefing,remind,status-sync,queue-drain,sla-check',
+      'trigger requires a job id. Allowed: github-sync,todoist-sync,calendar-sync,discord-intake-sync,watchdog,report,briefing,remind,status-sync,queue-drain,sla-check,linear-autopilot',
     );
   }
 
@@ -1446,13 +1491,18 @@ async function cmdSchedule(settings, flags) {
   const githubSyncLog = path.join(DATA_DIR, 'github-sync-cron.log');
   const todoistSyncLog = path.join(DATA_DIR, 'todoist-sync-cron.log');
   const calendarSyncLog = path.join(DATA_DIR, 'calendar-sync-cron.log');
+  const discordIntakeLog = path.join(DATA_DIR, 'discord-intake-cron.log');
   const statusSyncLog = path.join(DATA_DIR, 'status-sync-cron.log');
   const queueDrainLog = path.join(DATA_DIR, 'queue-drain-cron.log');
   const slaCheckLog = path.join(DATA_DIR, 'sla-check-cron.log');
+  const linearAutopilotLog = path.join(DATA_DIR, 'linear-autopilot-cron.log');
   const watchdogInterval = Number(flags['watchdog-interval'] || 5);
   const githubPollMinutes = Number(flags['github-poll-minutes'] || settings.github.pollIntervalMinutes || 15);
   const todoistPollMinutes = Number(flags['todoist-poll-minutes'] || 30);
   const calendarPollMinutes = Number(flags['calendar-poll-minutes'] || 60);
+  const discordIntakeMinutes = Number(
+    flags['discord-intake-minutes'] || settings.discordIntake.pollMinutes || 2,
+  );
   const statusSyncMinutes = Number(
     flags['status-sync-minutes'] || settings.statusMachine.pollMinutes || 10,
   );
@@ -1460,14 +1510,21 @@ async function cmdSchedule(settings, flags) {
     flags['queue-drain-minutes'] || settings.intakeQueue.pollMinutes || 2,
   );
   const slaPollMinutes = Number(flags['sla-poll-minutes'] || settings.sla.pollMinutes || 30);
+  const executionPollMinutes = Number(
+    flags['execution-poll-minutes'] || settings.execution.pollMinutes || 15,
+  );
   const githubExpr = cronEveryMinutesExpr(githubPollMinutes);
   const todoistExpr = cronEveryMinutesExpr(todoistPollMinutes);
   const calendarExpr = cronEveryMinutesExpr(calendarPollMinutes);
+  const discordIntakeExpr =
+    settings.discordIntake.enabled === false ? '' : cronEveryMinutesExpr(discordIntakeMinutes);
   const statusSyncExpr =
     settings.statusMachine.enabled === false ? '' : cronEveryMinutesExpr(statusSyncMinutes);
   const queueDrainExpr =
     settings.intakeQueue.enabled === false ? '' : cronEveryMinutesExpr(queueDrainMinutes);
   const slaExpr = settings.sla.enabled === false ? '' : cronEveryMinutesExpr(slaPollMinutes);
+  const linearAutopilotExpr =
+    settings.execution.enabled === false ? '' : cronEveryMinutesExpr(executionPollMinutes);
 
   ensureDir(DATA_DIR);
 
@@ -1481,9 +1538,15 @@ async function cmdSchedule(settings, flags) {
   const todoistBatchSize = Math.max(1, Number(settings.todoist.syncBatchSize || 10));
   const todoistSyncParts = [nodeBin, scriptPath, 'todoist-sync', '--limit', String(todoistBatchSize)];
   const calendarSyncParts = [nodeBin, scriptPath, 'calendar-sync'];
+  const discordIntakeParts = [nodeBin, scriptPath, 'discord-intake-sync'];
+  const discordIntakeChannel = resolveDiscordIntakeChannelId(settings, flags);
+  if (discordIntakeChannel) {
+    discordIntakeParts.push('--channel', discordIntakeChannel);
+  }
   const statusSyncParts = [nodeBin, scriptPath, 'status-sync'];
   const queueDrainParts = [nodeBin, scriptPath, 'queue-drain'];
   const slaCheckParts = [nodeBin, scriptPath, 'sla-check'];
+  const linearAutopilotParts = [nodeBin, scriptPath, 'linear-autopilot'];
   const remindDueParts = [nodeBin, scriptPath, 'remind', 'due'];
   const remindCycleParts = [nodeBin, scriptPath, 'remind', 'cycle'];
   const briefingDailyParts = [nodeBin, scriptPath, 'briefing', 'daily'];
@@ -1504,8 +1567,14 @@ async function cmdSchedule(settings, flags) {
   const blockLines = [
     '# OPENCLAW_CONTROL_CENTER_BEGIN',
     `CRON_TZ=${timezone}`,
+    'PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin',
     `0 9,18 * * * cd ${shellQuote(ROOT_DIR)} && ${joinShell(reportParts)} >> ${shellQuote(reportLog)} 2>&1`,
     `*/${watchdogInterval} * * * * cd ${shellQuote(ROOT_DIR)} && ${joinShell(watchdogParts)} >> ${shellQuote(watchdogLog)} 2>&1`,
+    ...(discordIntakeExpr
+      ? [
+          `${discordIntakeExpr} cd ${shellQuote(ROOT_DIR)} && ${joinShell(discordIntakeParts)} >> ${shellQuote(discordIntakeLog)} 2>&1`,
+        ]
+      : []),
     ...(githubExpr
       ? [
           `${githubExpr} cd ${shellQuote(ROOT_DIR)} && ${joinShell(githubSyncParts)} >> ${shellQuote(githubSyncLog)} 2>&1`,
@@ -1534,6 +1603,11 @@ async function cmdSchedule(settings, flags) {
     ...(slaExpr
       ? [
           `${slaExpr} cd ${shellQuote(ROOT_DIR)} && ${joinShell(slaCheckParts)} >> ${shellQuote(slaCheckLog)} 2>&1`,
+        ]
+      : []),
+    ...(linearAutopilotExpr
+      ? [
+          `${linearAutopilotExpr} cd ${shellQuote(ROOT_DIR)} && ${joinShell(linearAutopilotParts)} >> ${shellQuote(linearAutopilotLog)} 2>&1`,
         ]
       : []),
     ...(withReminders
@@ -2936,6 +3010,475 @@ async function cmdGithubSync(settings, flags) {
   process.stdout.write(`${lines.join('\n')}\n`);
 }
 
+async function cmdDiscordIntakeSync(settings, flags) {
+  if (settings.discordIntake && settings.discordIntake.enabled === false && !flags.force) {
+    const disabled = { ok: true, skipped: true, reason: 'disabled' };
+    if (flags.json) {
+      process.stdout.write(`${JSON.stringify(disabled, null, 2)}\n`);
+    } else {
+      process.stdout.write('Discord intake is disabled in config.\n');
+    }
+    return;
+  }
+
+  const channelId = resolveDiscordIntakeChannelId(settings, flags);
+  if (!channelId) {
+    throw new Error('discord-intake-sync requires a channel id. Set discordIntake.channelId or --channel.');
+  }
+
+  const includeBotMessages =
+    flags['include-bots'] !== undefined
+      ? isTruthyLike(flags['include-bots'])
+      : Boolean(settings.discordIntake && settings.discordIntake.includeBotMessages);
+  const ownerUserIds = normalizeOwnerIds(
+    flags['owner-ids'] || flags.owner || (settings.discordIntake && settings.discordIntake.ownerUserIds) || [],
+  );
+  const limit = Math.max(
+    5,
+    Math.min(100, Number(flags.limit || (settings.discordIntake && settings.discordIntake.limit) || 30)),
+  );
+  const maxCreatePerRun = Math.max(
+    1,
+    Math.min(
+      50,
+      Number(flags['max-create'] || (settings.discordIntake && settings.discordIntake.maxCreatePerRun) || 5),
+    ),
+  );
+  const minTextChars = Math.max(
+    3,
+    Number(flags['min-chars'] || (settings.discordIntake && settings.discordIntake.minTextChars) || 6),
+  );
+  const defaultState = String(
+    flags.state || (settings.discordIntake && settings.discordIntake.defaultState) || 'Triage',
+  ).trim();
+  const defaultPriority = Number(
+    flags.priority || (settings.discordIntake && settings.discordIntake.defaultPriority) || 3,
+  );
+  const baseLabels = normalizeLabelNames(
+    flags.labels || (settings.discordIntake && settings.discordIntake.labels) || ['auto-intake', 'main-directive'],
+  );
+  const backfill = isTruthyLike(flags.backfill);
+  const aroundId = String(flags.around || '').trim();
+  const beforeId = String(flags.before || '').trim();
+  const afterId = String(flags.after || '').trim();
+
+  const hasStateFile = fs.existsSync(DISCORD_INTAKE_STATE_PATH);
+  const state = readJsonFile(DISCORD_INTAKE_STATE_PATH, {
+    version: 1,
+    channelId: '',
+    lastSeenTsMs: 0,
+    items: {},
+  });
+  if (!state.items || typeof state.items !== 'object') {
+    state.items = {};
+  }
+  const oldLastSeenTsMs = Number(state.lastSeenTsMs || 0);
+
+  const messages = await readDiscordMessagesViaOpenClaw(channelId, limit, {
+    around: aroundId,
+    before: beforeId,
+    after: afterId,
+  });
+  const ordered = (Array.isArray(messages) ? messages : [])
+    .slice()
+    .sort((a, b) => extractMessageTimestampMs(a) - extractMessageTimestampMs(b));
+
+  const latestTsMs = ordered.reduce((acc, msg) => Math.max(acc, extractMessageTimestampMs(msg)), oldLastSeenTsMs);
+  if (!hasStateFile && !backfill) {
+    state.version = 1;
+    state.channelId = channelId;
+    state.lastSeenTsMs = latestTsMs;
+    state.updatedAtMs = Date.now();
+    writeJsonFile(DISCORD_INTAKE_STATE_PATH, state);
+    const bootstrapped = {
+      ok: true,
+      bootstrapped: true,
+      channelId,
+      lastSeenTsMs: latestTsMs,
+      inspected: ordered.length,
+      created: [],
+      deduped: [],
+      skipped: [],
+      note: 'state initialized; next run will ingest new directives only',
+    };
+    if (flags.json) {
+      process.stdout.write(`${JSON.stringify(bootstrapped, null, 2)}\n`);
+    } else {
+      process.stdout.write(
+        `Discord intake bootstrapped on channel ${channelId} with ${ordered.length} recent messages. Next run will process new directives.\n`,
+      );
+    }
+    return;
+  }
+
+  const created = [];
+  const deduped = [];
+  const skipped = [];
+  let processed = 0;
+  let createdCount = 0;
+  let highWatermarkTsMs = oldLastSeenTsMs;
+
+  for (const message of ordered) {
+    const messageId = String(message && message.id ? message.id : '').trim();
+    const author = message && message.author && typeof message.author === 'object' ? message.author : {};
+    const authorId = String(author.id || message.author_id || '').trim();
+    const isBot = Boolean(author.bot);
+    const guildId = String(message.guild_id || message.guildId || '@me').trim() || '@me';
+    const tsMs = extractMessageTimestampMs(message);
+    highWatermarkTsMs = Math.max(highWatermarkTsMs, tsMs);
+    if (!messageId) {
+      continue;
+    }
+
+    const sourceId = normalizeSourceId(`discord:${guildId}:${channelId}:${messageId}`);
+    if (state.items[sourceId]) {
+      skipped.push({ messageId, reason: 'already-processed' });
+      continue;
+    }
+    if (!backfill && tsMs <= oldLastSeenTsMs) {
+      state.items[sourceId] = tsMs || Date.now();
+      skipped.push({ messageId, reason: 'older-than-watermark' });
+      continue;
+    }
+    if (!includeBotMessages && isBot) {
+      state.items[sourceId] = tsMs || Date.now();
+      skipped.push({ messageId, reason: 'bot-message' });
+      continue;
+    }
+    if (ownerUserIds.length > 0 && (!authorId || !ownerUserIds.includes(authorId))) {
+      state.items[sourceId] = tsMs || Date.now();
+      skipped.push({ messageId, reason: 'not-owner' });
+      continue;
+    }
+
+    const content = String(message.content || '').trim();
+    if (!content || content.length < minTextChars) {
+      state.items[sourceId] = tsMs || Date.now();
+      skipped.push({ messageId, reason: 'text-too-short' });
+      continue;
+    }
+    if (!looksLikeTaskDirective(content)) {
+      state.items[sourceId] = tsMs || Date.now();
+      skipped.push({ messageId, reason: 'not-task-directive' });
+      continue;
+    }
+
+    if (createdCount >= maxCreatePerRun) {
+      skipped.push({ messageId, reason: 'max-create-reached' });
+      continue;
+    }
+
+    const input = buildDiscordTriageInput({
+      ...message,
+      messageId,
+      channelId,
+      guildId,
+      sourceId,
+      title: `[main] ${singleLine(content).slice(0, 120)}`,
+      state: defaultState,
+      priority: defaultPriority,
+      labels: baseLabels,
+    });
+    input.source = 'discord';
+    input.sourceId = sourceId;
+    input.state = defaultState;
+    input.priority = Number.isFinite(defaultPriority) ? defaultPriority : 3;
+    input.labels = dedupeStrings([
+      ...normalizeLabelNames(input.labels || []),
+      ...baseLabels,
+      'discord',
+    ]);
+
+    const issue = await createTriageIssueFromInput(input, settings);
+    state.items[sourceId] = tsMs || Date.now();
+    processed += 1;
+
+    if (issue && issue.deduped) {
+      deduped.push({
+        messageId,
+        identifier: issue.identifier || '',
+        dedupeKey: issue.dedupeKey || '',
+      });
+      continue;
+    }
+
+    createdCount += 1;
+    created.push({
+      messageId,
+      identifier: issue.identifier || '',
+      url: issue.url || '',
+      title: issue.title || input.title,
+    });
+    appendAuditEvent('discord-intake-created', {
+      channelId,
+      messageId,
+      sourceId,
+      identifier: issue.identifier || '',
+      url: issue.url || '',
+    });
+  }
+
+  const maxStateEntries = 4000;
+  const entries = Object.entries(state.items || {});
+  if (entries.length > maxStateEntries) {
+    entries.sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0));
+    state.items = {};
+    for (const [key, value] of entries.slice(0, maxStateEntries)) {
+      state.items[key] = value;
+    }
+  }
+
+  state.version = 1;
+  state.channelId = channelId;
+  state.lastSeenTsMs = Math.max(highWatermarkTsMs, oldLastSeenTsMs);
+  state.updatedAtMs = Date.now();
+  writeJsonFile(DISCORD_INTAKE_STATE_PATH, state);
+
+  const result = {
+    ok: true,
+    channelId,
+    inspected: ordered.length,
+    processed,
+    created,
+    deduped,
+    skipped,
+    lastSeenTsMs: state.lastSeenTsMs,
+  };
+
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+
+  const lines = [];
+  lines.push('Discord intake sync result:');
+  lines.push(`- channel: ${channelId}`);
+  lines.push(`- inspected: ${ordered.length}`);
+  lines.push(`- processed directives: ${processed}`);
+  lines.push(`- created Linear issues: ${created.length}`);
+  lines.push(`- deduped: ${deduped.length}`);
+  lines.push(`- skipped: ${skipped.length}`);
+  for (const item of created.slice(0, 8)) {
+    lines.push(`- ${item.messageId} -> ${item.identifier}`);
+  }
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+async function cmdLinearAutopilot(settings, flags) {
+  if (settings.execution && settings.execution.enabled === false && !flags.force) {
+    const disabled = { ok: true, skipped: true, reason: 'disabled' };
+    if (flags.json) {
+      process.stdout.write(`${JSON.stringify(disabled, null, 2)}\n`);
+    } else {
+      process.stdout.write('Linear autopilot is disabled in config.\n');
+    }
+    return;
+  }
+
+  const apiKey = String(settings.linear.apiKey || '').trim();
+  if (!apiKey) {
+    throw new Error('LINEAR_API_KEY is required for linear-autopilot.');
+  }
+
+  const teamId = settings.linear.teamId || (await resolveLinearTeamId(apiKey, settings.linear.teamKey));
+  if (!teamId) {
+    throw new Error('Unable to resolve Linear team id for linear-autopilot.');
+  }
+
+  const includeStates = normalizeStateNames(
+    flags.states || (settings.execution && settings.execution.includeStates) || ['In Progress', 'Triage', 'Blocked'],
+  );
+  const includeLabels = normalizeLabelNames(
+    flags.labels || (settings.execution && settings.execution.includeLabels) || ['auto-intake', 'main-directive'],
+  );
+  const includeAll = Boolean(flags.all || flags['include-all']);
+  const maxPromptChars = Math.max(
+    300,
+    Number(flags['max-prompt-chars'] || (settings.execution && settings.execution.maxPromptChars) || 1400),
+  );
+
+  const openIssues = await fetchOpenLinearIssuesForSla(apiKey, teamId);
+  let candidate = pickLinearAutopilotCandidate(openIssues, {
+    includeStates,
+    includeLabels,
+    includeAll,
+  });
+  const usedLabelFallback = !candidate && !includeAll && includeLabels.length > 0;
+  if (usedLabelFallback) {
+    candidate = pickLinearAutopilotCandidate(openIssues, {
+      includeStates,
+      includeLabels: [],
+      includeAll: true,
+    });
+  }
+
+  if (!candidate) {
+    const empty = {
+      ok: true,
+      skipped: true,
+      reason: 'no-runnable-issue',
+      scanned: openIssues.length,
+      includeStates,
+      includeLabels,
+      includeAll,
+      usedLabelFallback: false,
+    };
+    if (flags.json) {
+      process.stdout.write(`${JSON.stringify(empty, null, 2)}\n`);
+    } else {
+      process.stdout.write(
+        `Linear autopilot found no runnable issue (scanned=${openIssues.length}, labels=${includeLabels.join(',') || '*'}).\n`,
+      );
+    }
+    return;
+  }
+
+  const agentId = String(flags.agent || (settings.execution && settings.execution.agentId) || 'main').trim();
+  const timeoutSeconds = Math.max(
+    60,
+    Number(flags['timeout-seconds'] || (settings.execution && settings.execution.timeoutSeconds) || 900),
+  );
+  const prompt = buildLinearAutopilotPrompt(candidate, maxPromptChars);
+
+  let agentPayload = null;
+  let agentText = '';
+  let agentError = '';
+  let runId = '';
+  try {
+    const output = runCommand('openclaw', [
+      'agent',
+      '--agent',
+      agentId,
+      '--message',
+      prompt,
+      '--timeout',
+      String(timeoutSeconds),
+      '--json',
+    ]);
+    agentPayload = extractJson(output.stdout || '');
+    runId = String(agentPayload && agentPayload.runId ? agentPayload.runId : '').trim();
+    agentText = extractAgentText(agentPayload);
+  } catch (error) {
+    agentError = error instanceof Error ? error.message : String(error);
+  }
+
+  const parsed = parseLinearAutopilotResponse(agentText);
+  const nextState = resolveLinearAutopilotNextState(candidate, parsed, settings);
+  let transition = null;
+  if (
+    !agentError &&
+    nextState &&
+    settings.execution &&
+    settings.execution.autoTransition !== false
+  ) {
+    transition = await transitionIssueByIdentifier(candidate.identifier, nextState, settings);
+  }
+
+  let commented = false;
+  let commentError = '';
+  if (settings.execution && settings.execution.autoComment === false) {
+    commented = false;
+  } else {
+    const comment = renderLinearAutopilotComment({
+      candidate,
+      parsed,
+      agentText,
+      agentError,
+      runId,
+      transition,
+      settings,
+    });
+    try {
+      await createLinearIssueComment(apiKey, candidate.id, comment);
+      commented = true;
+    } catch (error) {
+      commentError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  const result = {
+    ok: !agentError,
+    issue: {
+      id: candidate.id,
+      identifier: candidate.identifier,
+      title: candidate.title,
+      url: candidate.url || '',
+      state: candidate.state && candidate.state.name ? candidate.state.name : '',
+    },
+    runId,
+    agentId,
+    timeoutSeconds,
+    status: parsed.status || (agentError ? 'error' : 'in_progress'),
+    summary: parsed.summary || singleLine(trimMessage(agentText || '', 400)),
+    nextAction: parsed.nextAction || '',
+    artifacts: parsed.artifacts,
+    nextState,
+    transition,
+    usedLabelFallback,
+    commented,
+    commentError,
+    error: agentError,
+  };
+
+  const history = readJsonFile(LINEAR_AUTOPILOT_PATH, { version: 1, updatedAtMs: 0, runs: [] });
+  const runs = Array.isArray(history.runs) ? history.runs : [];
+  runs.unshift({
+    atMs: Date.now(),
+    issueIdentifier: result.issue.identifier,
+    runId: result.runId,
+    status: result.status,
+    ok: result.ok,
+    commented: result.commented,
+    nextState: result.nextState || '',
+    transitionStatus: result.transition && result.transition.status ? result.transition.status : '',
+    error: result.error || result.commentError || '',
+  });
+  history.version = 1;
+  history.updatedAtMs = Date.now();
+  history.runs = runs.slice(0, 200);
+  writeJsonFile(LINEAR_AUTOPILOT_PATH, history);
+
+  appendAuditEvent('linear-autopilot-run', {
+    issueIdentifier: result.issue.identifier,
+    status: result.status,
+    ok: result.ok,
+    runId: result.runId,
+    nextState: result.nextState || '',
+    transitionStatus: result.transition && result.transition.status ? result.transition.status : '',
+    commented: result.commented,
+    error: result.error || result.commentError || '',
+  });
+
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  } else {
+    const lines = [];
+    lines.push('Linear autopilot result:');
+    lines.push(`- issue: ${result.issue.identifier} ${result.issue.title}`);
+    lines.push(`- status: ${result.status}`);
+    lines.push(`- transition: ${result.transition ? result.transition.status : '-'}`);
+    lines.push(`- label fallback: ${result.usedLabelFallback ? 'yes' : 'no'}`);
+    lines.push(`- commented: ${result.commented ? 'yes' : 'no'}`);
+    if (result.summary) {
+      lines.push(`- summary: ${singleLine(result.summary)}`);
+    }
+    if (result.nextAction) {
+      lines.push(`- next action: ${singleLine(result.nextAction)}`);
+    }
+    if (result.error) {
+      lines.push(`- error: ${singleLine(result.error)}`);
+    }
+    if (result.commentError) {
+      lines.push(`- comment error: ${singleLine(result.commentError)}`);
+    }
+    process.stdout.write(`${lines.join('\n')}\n`);
+  }
+
+  if (agentError) {
+    throw new Error(`linear-autopilot agent run failed: ${agentError}`);
+  }
+}
+
 async function cmdTodoistSync(settings, flags) {
   const enabled = settings.todoist.enabled !== false;
   if (!enabled) {
@@ -3170,17 +3713,34 @@ async function cmdCalendarSync(settings, flags) {
 
   const profile = String(flags.profile || settings.calendar.browserProfile || 'openclaw').trim();
   const tabHint = String(flags.hint || settings.calendar.tabHint || 'calendar.google.com').trim();
-  const tabs = listBrowserTabs(profile);
-  const tab = tabs.find((item) => String(item.url || '').includes(tabHint));
+  let tabs = listBrowserTabs(profile);
+  let tab =
+    tabs.find((item) => String(item.url || '').includes(tabHint) && String(item.type || '').toLowerCase() === 'page') ||
+    tabs.find((item) => String(item.url || '').includes(tabHint));
   if (!tab) {
     throw new Error(`Google Calendar tab not found in profile=${profile}.`);
   }
 
-  const result = openclawBrowserEvaluate(
-    profile,
-    tab.targetId,
-    "() => Array.from(document.querySelectorAll('[data-eventid]')).map((el) => ({id: el.getAttribute('data-eventid') || '', text: (el.textContent||'').replace(/\\s+/g,' ').trim(), className: el.className || ''})).filter((x) => x.id && x.text).slice(0, 500)",
-  );
+  let result = null;
+  const evalFnCode =
+    "() => Array.from(document.querySelectorAll('[data-eventid]')).map((el) => ({id: el.getAttribute('data-eventid') || '', text: (el.textContent||'').replace(/\\s+/g,' ').trim(), className: el.className || ''})).filter((x) => x.id && x.text).slice(0, 500)";
+  try {
+    result = openclawBrowserEvaluate(profile, tab.targetId, evalFnCode);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/tab not found/i.test(message)) {
+      throw error;
+    }
+    // Browser target ids can rotate; refresh tab list once and retry.
+    tabs = listBrowserTabs(profile);
+    tab =
+      tabs.find((item) => String(item.url || '').includes(tabHint) && String(item.type || '').toLowerCase() === 'page') ||
+      tabs.find((item) => String(item.url || '').includes(tabHint));
+    if (!tab) {
+      throw new Error(`Google Calendar tab not found in profile=${profile}.`);
+    }
+    result = openclawBrowserEvaluate(profile, tab.targetId, evalFnCode);
+  }
   const rows = Array.isArray(result) ? result : [];
   const seen = new Set();
   const events = [];
@@ -4408,6 +4968,9 @@ function collectLinkedIssueSignals(settings, flags) {
   }
 
   const cronWarnings = loadCronJobs(settings).filter((job) => {
+    if (!job.enabled) {
+      return false;
+    }
     const state = job.state || {};
     const lastStatus = String(state.lastStatus || '').toLowerCase();
     const consecutiveErrors = Number(state.consecutiveErrors || 0);
@@ -4738,10 +5301,14 @@ async function fetchOpenLinearIssuesForSla(apiKey, teamId) {
           id
           identifier
           title
+          description
           url
+          dueDate
           priority
           updatedAt
           state { id name type }
+          labels { nodes { id name } }
+          cycle { id name number endsAt startsAt }
           assignee { id name displayName }
         }
       }
@@ -5010,6 +5577,386 @@ function buildRunbookHints(context, settings) {
   return dedupeStrings(hints);
 }
 
+function isTruthyLike(value) {
+  if (value === undefined || value === null) {
+    return false;
+  }
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  const text = String(value).trim().toLowerCase();
+  if (!text) {
+    return false;
+  }
+  return !['0', 'false', 'no', 'off', 'n'].includes(text);
+}
+
+function normalizeOwnerIds(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || '').trim()).filter(Boolean);
+  }
+  return String(value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function normalizeStateNames(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || '').trim()).filter(Boolean);
+  }
+  return String(value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function pickLinearAutopilotCandidate(issues, options = {}) {
+  const includeStates = new Set(
+    normalizeStateNames(options.includeStates || []).map((item) => item.toLowerCase()),
+  );
+  const includeLabels = new Set(
+    normalizeLabelNames(options.includeLabels || []).map((item) => item.toLowerCase()),
+  );
+  const includeAll = Boolean(options.includeAll);
+
+  const filtered = (Array.isArray(issues) ? issues : []).filter((issue) => {
+    const stateName = String((issue && issue.state && issue.state.name) || '').trim();
+    const stateLower = stateName.toLowerCase();
+    if (includeStates.size > 0 && !includeStates.has(stateLower)) {
+      return false;
+    }
+    if (includeAll || includeLabels.size === 0) {
+      return true;
+    }
+    const labels = ((((issue || {}).labels || {}).nodes || []) || [])
+      .map((item) => String(item && item.name ? item.name : '').trim().toLowerCase())
+      .filter(Boolean);
+    return labels.some((name) => includeLabels.has(name));
+  });
+
+  const scored = filtered
+    .map((issue) => {
+      const stateName = String((issue && issue.state && issue.state.name) || '').trim();
+      const priority = Number(issue && issue.priority);
+      const updatedAtMs = Date.parse(String((issue && issue.updatedAt) || ''));
+      return {
+        issue,
+        stateRank: autopilotStateRank(stateName),
+        priorityRank: Number.isFinite(priority) && priority > 0 ? priority : 9,
+        updatedAtMs: Number.isFinite(updatedAtMs) ? updatedAtMs : 0,
+      };
+    })
+    .sort((a, b) => {
+      if (a.stateRank !== b.stateRank) {
+        return a.stateRank - b.stateRank;
+      }
+      if (a.priorityRank !== b.priorityRank) {
+        return a.priorityRank - b.priorityRank;
+      }
+      if (a.updatedAtMs !== b.updatedAtMs) {
+        return a.updatedAtMs - b.updatedAtMs;
+      }
+      return String((a.issue && a.issue.identifier) || '').localeCompare(
+        String((b.issue && b.issue.identifier) || ''),
+      );
+    });
+
+  return scored.length > 0 ? scored[0].issue : null;
+}
+
+function autopilotStateRank(stateName) {
+  const text = String(stateName || '').trim().toLowerCase();
+  if (!text) {
+    return 9;
+  }
+  if (text === 'in progress' || text === 'doing' || text.includes('in progress')) {
+    return 0;
+  }
+  if (text === 'triage') {
+    return 1;
+  }
+  if (text === 'backlog' || text === 'todo' || text === 'planned') {
+    return 2;
+  }
+  if (text === 'blocked' || text.includes('block')) {
+    return 3;
+  }
+  return 4;
+}
+
+function extractLinearIssueRawInput(description, maxChars) {
+  const text = String(description || '').trim();
+  if (!text) {
+    return '';
+  }
+  const rawMatch = text.match(/##\s*Raw input[\s\S]*?```text\s*([\s\S]*?)```/i);
+  const raw = rawMatch && rawMatch[1] ? rawMatch[1].trim() : text;
+  return trimMessage(raw, Math.max(200, Number(maxChars || 1200)));
+}
+
+function buildLinearAutopilotPrompt(issue, maxPromptChars) {
+  const stateName = String((issue && issue.state && issue.state.name) || '').trim();
+  const priority = Number.isFinite(Number(issue && issue.priority)) ? Number(issue.priority) : 0;
+  const labels = (((issue && issue.labels) || {}).nodes || [])
+    .map((item) => String(item && item.name ? item.name : '').trim())
+    .filter(Boolean);
+  const dueDate = String(issue && issue.dueDate ? issue.dueDate : '').trim();
+  const cycle = issue && issue.cycle && issue.cycle.name ? String(issue.cycle.name) : '';
+  const rawInput = extractLinearIssueRawInput(issue && issue.description ? issue.description : '', maxPromptChars);
+
+  const lines = [];
+  lines.push('You are OpenClaw execution autopilot.');
+  lines.push('Do exactly ONE concrete next step for this issue in local workspace.');
+  lines.push('If blocked, report exact blocker and next unblock action.');
+  lines.push('');
+  lines.push(`Issue: ${issue.identifier} ${singleLine(issue.title || '')}`);
+  lines.push(`URL: ${issue.url || '-'}`);
+  lines.push(`State: ${stateName || '-'}`);
+  lines.push(`Priority: ${priority || '-'}`);
+  if (dueDate) {
+    lines.push(`Due: ${dueDate}`);
+  }
+  if (cycle) {
+    lines.push(`Cycle: ${cycle}`);
+  }
+  if (labels.length > 0) {
+    lines.push(`Labels: ${labels.join(', ')}`);
+  }
+  lines.push('');
+  lines.push('Issue context (trimmed):');
+  lines.push('```text');
+  lines.push(rawInput || '(no description)');
+  lines.push('```');
+  lines.push('');
+  lines.push('Return strict JSON only (no markdown):');
+  lines.push(
+    '{"status":"done|in_progress|blocked","summary":"what changed","next_action":"single next action","artifacts":["path or url"],"next_state":"In Progress|In Review|Blocked|Done|Triage"}',
+  );
+  return lines.join('\n');
+}
+
+function extractAgentText(agentPayload) {
+  const payloads = (((agentPayload || {}).result || {}).payloads || []);
+  if (!Array.isArray(payloads) || payloads.length === 0) {
+    return '';
+  }
+  for (const item of payloads) {
+    const text = String(item && item.text ? item.text : '').trim();
+    if (text) {
+      return text;
+    }
+  }
+  return '';
+}
+
+function parseLinearAutopilotResponse(text) {
+  const raw = String(text || '').trim();
+  if (!raw) {
+    return {
+      status: '',
+      summary: '',
+      nextAction: '',
+      nextState: '',
+      artifacts: [],
+    };
+  }
+
+  let parsed = null;
+  try {
+    parsed = extractJson(raw);
+  } catch {
+    parsed = null;
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {
+      status: '',
+      summary: singleLine(trimMessage(raw, 600)),
+      nextAction: '',
+      nextState: '',
+      artifacts: [],
+    };
+  }
+
+  const artifactsRaw = Array.isArray(parsed.artifacts)
+    ? parsed.artifacts
+    : parsed.artifactPath
+      ? [parsed.artifactPath]
+      : [];
+  const artifacts = artifactsRaw
+    .map((item) => String(item || '').trim())
+    .filter(Boolean)
+    .slice(0, 8);
+
+  return {
+    status: normalizeAutopilotStatus(parsed.status || parsed.result || ''),
+    summary: String(parsed.summary || parsed.message || '').trim(),
+    nextAction: String(parsed.next_action || parsed.nextAction || '').trim(),
+    nextState: normalizeAutopilotStateName(parsed.next_state || parsed.nextState || ''),
+    artifacts,
+  };
+}
+
+function normalizeAutopilotStatus(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) {
+    return '';
+  }
+  if (text === 'done' || text === 'completed' || text === 'complete') {
+    return 'done';
+  }
+  if (text === 'blocked' || text === 'error' || text === 'failed') {
+    return 'blocked';
+  }
+  return 'in_progress';
+}
+
+function normalizeAutopilotStateName(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) {
+    return '';
+  }
+  if (text === 'done' || text === 'completed' || text === 'complete') {
+    return 'Done';
+  }
+  if (text === 'in review' || text === 'review') {
+    return 'In Review';
+  }
+  if (text === 'blocked' || text.includes('block')) {
+    return 'Blocked';
+  }
+  if (text === 'triage') {
+    return 'Triage';
+  }
+  if (text === 'in progress' || text === 'in_progress' || text === 'doing') {
+    return 'In Progress';
+  }
+  return '';
+}
+
+function resolveLinearAutopilotNextState(candidate, parsed, settings) {
+  if (parsed && parsed.nextState) {
+    return parsed.nextState;
+  }
+  const stateName = String((candidate && candidate.state && candidate.state.name) || '').trim().toLowerCase();
+  if (stateName === 'triage') {
+    return String(
+      (settings.execution && settings.execution.defaultTransitionFromTriage) || 'In Progress',
+    ).trim();
+  }
+  return '';
+}
+
+function renderLinearAutopilotComment(input) {
+  const candidate = input && input.candidate ? input.candidate : {};
+  const parsed = input && input.parsed ? input.parsed : {};
+  const transition = input && input.transition ? input.transition : null;
+  const runId = String(input && input.runId ? input.runId : '').trim();
+  const agentText = String(input && input.agentText ? input.agentText : '').trim();
+  const agentError = String(input && input.agentError ? input.agentError : '').trim();
+  const settings = input && input.settings ? input.settings : { timezone: 'UTC' };
+
+  const lines = [];
+  lines.push('### Mission Control Linear Autopilot');
+  lines.push(`- issue: ${candidate.identifier || '-'}`);
+  lines.push(`- status: ${parsed.status || (agentError ? 'error' : 'in_progress')}`);
+  if (parsed.nextState) {
+    lines.push(`- requested next state: ${parsed.nextState}`);
+  }
+  if (transition && transition.status) {
+    lines.push(
+      `- transition: ${transition.previousState || '-'} -> ${transition.state || transition.targetStateName || '-'} (${transition.status})`,
+    );
+  }
+  if (runId) {
+    lines.push(`- agent run id: ${runId}`);
+  }
+  if (agentError) {
+    lines.push(`- execution error: ${singleLine(trimMessage(agentError, 300))}`);
+  }
+
+  if (parsed.summary) {
+    lines.push('');
+    lines.push('#### Summary');
+    lines.push(`- ${singleLine(parsed.summary)}`);
+  } else if (agentText) {
+    lines.push('');
+    lines.push('#### Summary');
+    lines.push(`- ${singleLine(trimMessage(agentText, 800))}`);
+  }
+
+  if (parsed.nextAction) {
+    lines.push('');
+    lines.push('#### Next Action');
+    lines.push(`- ${singleLine(parsed.nextAction)}`);
+  }
+
+  if (Array.isArray(parsed.artifacts) && parsed.artifacts.length > 0) {
+    lines.push('');
+    lines.push('#### Artifacts');
+    for (const item of parsed.artifacts.slice(0, 8)) {
+      lines.push(`- ${item}`);
+    }
+  }
+
+  lines.push('');
+  lines.push(`_generated ${formatTime(Date.now(), settings.timezone)} by mission-control linear-autopilot_`);
+  return trimMessage(lines.join('\n'), 3400);
+}
+
+function resolveDiscordIntakeChannelId(settings, flags) {
+  const fromFlag = String(flags.channel || flags.target || '').trim();
+  if (fromFlag) {
+    return fromFlag.startsWith('channel:') ? fromFlag.split(':').pop() : fromFlag;
+  }
+
+  const fromConfig = String(settings.discordIntake && settings.discordIntake.channelId ? settings.discordIntake.channelId : '').trim();
+  if (fromConfig) {
+    return fromConfig.startsWith('channel:') ? fromConfig.split(':').pop() : fromConfig;
+  }
+
+  const reportTarget = String(settings.report && settings.report.target ? settings.report.target : '').trim();
+  if (reportTarget.startsWith('channel:')) {
+    return reportTarget.slice('channel:'.length).trim();
+  }
+
+  const reminderTarget = String(settings.reminders && settings.reminders.target ? settings.reminders.target : '').trim();
+  if (reminderTarget.startsWith('channel:')) {
+    return reminderTarget.slice('channel:'.length).trim();
+  }
+
+  return '';
+}
+
+function looksLikeTaskDirective(text) {
+  const normalized = singleLine(String(text || '').trim());
+  if (!normalized) {
+    return false;
+  }
+  if (normalized.length < 4) {
+    return false;
+  }
+
+  const pureAck = /^(好|好的|ok|okay|收到|明白|👍|👌|yes|no|嗯|行|可以|谢谢|thanks|great|nice|lol|哈哈|？|\?)+$/i;
+  if (pureAck.test(normalized)) {
+    return false;
+  }
+
+  const actionPattern =
+    /(帮我|请|麻烦|需要|安排|处理|修复|实现|配置|部署|排查|检查|优化|自动化|创建|推进|执行|继续|完成|落地|同步|对接|搭建|setup|set up|implement|fix|build|deploy|configure|investigate|automate|create)/i;
+  if (!actionPattern.test(normalized)) {
+    return false;
+  }
+
+  const noisePattern = /(仅供参考|随便聊聊|测试一下|test message only|不用处理|无需处理|ignore)/i;
+  if (noisePattern.test(normalized)) {
+    return false;
+  }
+
+  return true;
+}
+
 function buildDiscordTriageInput(body) {
   const payload = body && typeof body === 'object' ? body : {};
   const messageId = String(payload.messageId || payload.id || '').trim();
@@ -5050,6 +5997,82 @@ function buildDiscordTriageInput(body) {
     dueDate: String(payload.dueDate || '').trim(),
     priority: Number(payload.priority || 3),
   };
+}
+
+function readDiscordMessagesViaOpenClaw(channelId, limit, options = {}) {
+  const target = String(channelId || '').trim();
+  if (!target) {
+    throw new Error('readDiscordMessagesViaOpenClaw requires channel id.');
+  }
+  const boundedLimit = Math.max(1, Math.min(100, Number(limit || 30)));
+  const aroundId = String(options.around || '').trim();
+  const beforeId = String(options.before || '').trim();
+  const afterId = String(options.after || '').trim();
+  const tmpPath = path.join(
+    os.tmpdir(),
+    `openclaw-discord-read-${Date.now()}-${Math.random().toString(16).slice(2)}.json`,
+  );
+  const result = spawnSync(
+    'openclaw',
+    [
+      'message',
+      'read',
+      '--channel',
+      'discord',
+      '--target',
+      target,
+      '--limit',
+      String(boundedLimit),
+      ...(aroundId ? ['--around', aroundId] : []),
+      ...(beforeId ? ['--before', beforeId] : []),
+      ...(afterId ? ['--after', afterId] : []),
+      '--json',
+    ],
+    {
+      cwd: ROOT_DIR,
+      encoding: 'utf8',
+      env: process.env,
+      maxBuffer: 10 * 1024 * 1024,
+      stdio: ['ignore', fs.openSync(tmpPath, 'w'), 'pipe'],
+    },
+  );
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    throw new Error(`openclaw message read failed: ${String(result.stderr || '').trim()}`);
+  }
+
+  let parsed = null;
+  try {
+    parsed = extractJson(fs.readFileSync(tmpPath, 'utf8'));
+  } finally {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // ignore
+    }
+  }
+  const payload =
+    parsed && typeof parsed === 'object'
+      ? parsed.payload && typeof parsed.payload === 'object'
+        ? parsed.payload
+        : parsed
+      : {};
+  return Array.isArray(payload.messages) ? payload.messages : [];
+}
+
+function extractMessageTimestampMs(message) {
+  if (!message || typeof message !== 'object') {
+    return 0;
+  }
+  const direct = Number(message.timestampMs || message.createdAtMs || 0);
+  if (Number.isFinite(direct) && direct > 0) {
+    return direct;
+  }
+  const rawTs = String(message.timestamp || message.created_at || message.createdAt || '').trim();
+  const parsed = Date.parse(rawTs);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function ensureDirSync(dirPath) {
@@ -5577,6 +6600,9 @@ function buildReport(snapshot, settings) {
       totalCronJobs: snapshot.cronJobs.length,
       enabledCronJobs: snapshot.cronJobs.filter((job) => job.enabled).length,
       cronErrorJobs: snapshot.cronJobs.filter((job) => {
+        if (!job.enabled) {
+          return false;
+        }
         const status = String((job.state && job.state.lastStatus) || '').toLowerCase();
         return status === 'error' || status === 'failed';
       }).length,
@@ -5596,6 +6622,9 @@ function analyzeCron(jobs, nowMs, settings) {
   const anomalies = [];
 
   for (const job of jobs) {
+    if (!job.enabled) {
+      continue;
+    }
     const state = job.state || {};
     const name = job.name || job.id;
     const consecutiveErrors = Number(state.consecutiveErrors || 0);
@@ -6660,6 +7689,15 @@ function extractJson(text) {
     if (char !== '{' && char !== '[') {
       continue;
     }
+    const end = findJsonEndIndex(trimmed, i);
+    if (end > i) {
+      const bounded = trimmed.slice(i, end + 1);
+      try {
+        return JSON.parse(bounded);
+      } catch {
+        // continue
+      }
+    }
     const candidate = trimmed.slice(i);
     try {
       return JSON.parse(candidate);
@@ -6669,6 +7707,44 @@ function extractJson(text) {
   }
 
   throw new Error(`Failed to parse JSON from output:\n${trimmed.slice(0, 400)}`);
+}
+
+function findJsonEndIndex(text, startIndex) {
+  const start = text[startIndex];
+  if (start !== '{' && start !== '[') {
+    return -1;
+  }
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = startIndex; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{' || ch === '[') {
+      depth += 1;
+      continue;
+    }
+    if (ch === '}' || ch === ']') {
+      depth -= 1;
+      if (depth === 0) {
+        return i;
+      }
+    }
+  }
+  return -1;
 }
 
 function normalizeTriggerJobId(value) {
@@ -6682,6 +7758,11 @@ function normalizeTriggerJobId(value) {
     todoist: 'todoist-sync',
     calendar: 'calendar-sync',
     gcal: 'calendar-sync',
+    intake: 'discord-intake-sync',
+    'discord-intake': 'discord-intake-sync',
+    autopilot: 'linear-autopilot',
+    execution: 'linear-autopilot',
+    'execution-loop': 'linear-autopilot',
     reminder: 'remind',
     brief: 'briefing',
     'briefing-daily': 'briefing',
@@ -6706,6 +7787,15 @@ function buildTriggerChildArgs(jobId, settings, flags) {
       args.push('calendar-sync', '--json');
       if (flags['to-linear'] || flags.toLinear) {
         args.push('--to-linear');
+      }
+      break;
+    case 'discord-intake-sync':
+      args.push('discord-intake-sync', '--json');
+      if (flags.channel) {
+        args.push('--channel', String(flags.channel));
+      }
+      if (flags.limit) {
+        args.push('--limit', String(flags.limit));
       }
       break;
     case 'watchdog':
@@ -6747,6 +7837,15 @@ function buildTriggerChildArgs(jobId, settings, flags) {
       break;
     case 'sla-check':
       args.push('sla-check', '--json');
+      break;
+    case 'linear-autopilot':
+      args.push('linear-autopilot', '--json');
+      if (flags.all) {
+        args.push('--all');
+      }
+      if (flags.labels) {
+        args.push('--labels', String(flags.labels));
+      }
       break;
     default:
       throw new Error(`unsupported trigger job: ${jobId}`);

@@ -39,6 +39,7 @@ Tracking page for ongoing OpenClaw development projects:
 - `tasks status-sync`: auto status machine (`Triage -> In Progress -> In Review -> Done/Blocked`) for linked runtime issues
 - `tasks queue-drain`: retry ingest queue and move exhausted items to DLQ
 - `tasks sla-check`: stale issue SLA check (Blocked/In Progress) with owner mention + escalation issue
+- `tasks linear-autopilot`: pull one runnable Linear issue and let main agent execute exactly one next step, then auto comment/state update
 - `tasks eval-replay`: export replay artifact for eval/distillation workflow
 - `tasks runbook-exec`: run SOP runbook cards in dry-run or guarded execute mode
 - `tasks trigger`: one-click run for sync/report/watchdog jobs with confirmation token
@@ -47,6 +48,7 @@ Tracking page for ongoing OpenClaw development projects:
 - `tasks schedule`: generate/install crontab for:
   - Daily report at `09:00` and `18:00`
   - Watchdog every `5` minutes
+  - Linear autopilot every `15` minutes
   - Due-soon reminder daily + cycle reminder weekly
   - Daily + weekly briefing
 
@@ -179,6 +181,12 @@ npm run tasks -- queue-drain
 
 # Stale SLA checks + escalation
 npm run tasks -- sla-check
+
+# Execute one Linear issue step via main agent (auto comment/state)
+npm run tasks -- linear-autopilot
+
+# Backfill around a specific Discord message id (one-time import of historical directives)
+npm run tasks -- discord-intake-sync --around <MESSAGE_ID> --backfill --limit 60
 
 # Trigger one-click control job (requires confirm token)
 npm run tasks -- trigger github-sync --confirm "CONFIRM <CODE>"

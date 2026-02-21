@@ -28,7 +28,8 @@
       "remind",
       "status-sync",
       "queue-drain",
-      "sla-check"
+      "sla-check",
+      "linear-autopilot"
     ]
   },
   "linear": {
@@ -223,5 +224,24 @@
       "cron-run"
     ],
     "maxActionsPerRun": 5
+  },
+  "execution": {
+    "enabled": true,
+    "pollMinutes": 15,
+    "agentId": "main",
+    "timeoutSeconds": 900,
+    "includeStates": [
+      "In Progress",
+      "Triage",
+      "Blocked"
+    ],
+    "includeLabels": [
+      "auto-intake",
+      "main-directive"
+    ],
+    "maxPromptChars": 1400,
+    "autoComment": true,
+    "autoTransition": true,
+    "defaultTransitionFromTriage": "In Progress"
   }
 }
