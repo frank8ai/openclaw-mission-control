@@ -227,7 +227,7 @@
   },
   "execution": {
     "enabled": true,
-    "pollMinutes": 15,
+    "pollMinutes": 5,
     "agentId": "main",
     "timeoutSeconds": 900,
     "includeStates": [
@@ -242,6 +242,9 @@
     "maxPromptChars": 1400,
     "autoComment": true,
     "autoTransition": true,
-    "defaultTransitionFromTriage": "In Progress"
+    "defaultTransitionFromTriage": "In Progress",
+    "issueCooldownMinutes": 30,
+    "maxConsecutiveSameIssue": 2,
+    "preferNewTriage": true
   }
 }

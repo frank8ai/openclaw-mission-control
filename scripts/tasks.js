@@ -248,7 +248,7 @@ const DEFAULTS = {
   },
   execution: {
     enabled: true,
-    pollMinutes: 15,
+    pollMinutes: 5,
     agentId: 'main',
     timeoutSeconds: 900,
     includeStates: ['In Progress', 'Triage', 'Blocked'],
@@ -257,6 +257,9 @@ const DEFAULTS = {
     autoComment: true,
     autoTransition: true,
     defaultTransitionFromTriage: 'In Progress',
+    issueCooldownMinutes: 30,
+    maxConsecutiveSameIssue: 2,
+    preferNewTriage: true,
   },
 };
 
@@ -3296,20 +3299,52 @@ async function cmdLinearAutopilot(settings, flags) {
     300,
     Number(flags['max-prompt-chars'] || (settings.execution && settings.execution.maxPromptChars) || 1400),
   );
+  const issueCooldownMinutes = Math.max(
+    0,
+    Number(
+      flags['issue-cooldown-minutes'] ||
+        (settings.execution && settings.execution.issueCooldownMinutes) ||
+        30,
+    ),
+  );
+  const maxConsecutiveSameIssue = Math.max(
+    1,
+    Number(
+      flags['max-consecutive-same-issue'] ||
+        (settings.execution && settings.execution.maxConsecutiveSameIssue) ||
+        2,
+    ),
+  );
+  const preferNewTriage =
+    flags['prefer-new-triage'] !== undefined
+      ? isTruthyLike(flags['prefer-new-triage'])
+      : Boolean(settings.execution && settings.execution.preferNewTriage !== false);
+  const historyState = readJsonFile(LINEAR_AUTOPILOT_PATH, { version: 1, updatedAtMs: 0, runs: [] });
+  const historyRuns = Array.isArray(historyState.runs) ? historyState.runs : [];
 
   const openIssues = await fetchOpenLinearIssuesForSla(apiKey, teamId);
-  let candidate = pickLinearAutopilotCandidate(openIssues, {
+  let selection = pickLinearAutopilotCandidate(openIssues, {
     includeStates,
     includeLabels,
     includeAll,
+    historyRuns,
+    issueCooldownMinutes,
+    maxConsecutiveSameIssue,
+    preferNewTriage,
   });
+  let candidate = selection.issue;
   const usedLabelFallback = !candidate && !includeAll && includeLabels.length > 0;
   if (usedLabelFallback) {
-    candidate = pickLinearAutopilotCandidate(openIssues, {
+    selection = pickLinearAutopilotCandidate(openIssues, {
       includeStates,
       includeLabels: [],
       includeAll: true,
+      historyRuns,
+      issueCooldownMinutes,
+      maxConsecutiveSameIssue,
+      preferNewTriage,
     });
+    candidate = selection.issue;
   }
 
   if (!candidate) {
@@ -3321,7 +3356,8 @@ async function cmdLinearAutopilot(settings, flags) {
       includeStates,
       includeLabels,
       includeAll,
-      usedLabelFallback: false,
+      usedLabelFallback,
+      selectionStrategy: selection && selection.strategy ? selection.strategy : '',
     };
     if (flags.json) {
       process.stdout.write(`${JSON.stringify(empty, null, 2)}\n`);
@@ -3415,13 +3451,13 @@ async function cmdLinearAutopilot(settings, flags) {
     nextState,
     transition,
     usedLabelFallback,
+    selectionStrategy: selection && selection.strategy ? selection.strategy : '',
     commented,
     commentError,
     error: agentError,
   };
 
-  const history = readJsonFile(LINEAR_AUTOPILOT_PATH, { version: 1, updatedAtMs: 0, runs: [] });
-  const runs = Array.isArray(history.runs) ? history.runs : [];
+  const runs = Array.isArray(historyState.runs) ? historyState.runs : [];
   runs.unshift({
     atMs: Date.now(),
     issueIdentifier: result.issue.identifier,
@@ -3433,10 +3469,10 @@ async function cmdLinearAutopilot(settings, flags) {
     transitionStatus: result.transition && result.transition.status ? result.transition.status : '',
     error: result.error || result.commentError || '',
   });
-  history.version = 1;
-  history.updatedAtMs = Date.now();
-  history.runs = runs.slice(0, 200);
-  writeJsonFile(LINEAR_AUTOPILOT_PATH, history);
+  historyState.version = 1;
+  historyState.updatedAtMs = Date.now();
+  historyState.runs = runs.slice(0, 200);
+  writeJsonFile(LINEAR_AUTOPILOT_PATH, historyState);
 
   appendAuditEvent('linear-autopilot-run', {
     issueIdentifier: result.issue.identifier,
@@ -3457,6 +3493,7 @@ async function cmdLinearAutopilot(settings, flags) {
     lines.push(`- issue: ${result.issue.identifier} ${result.issue.title}`);
     lines.push(`- status: ${result.status}`);
     lines.push(`- transition: ${result.transition ? result.transition.status : '-'}`);
+    lines.push(`- strategy: ${result.selectionStrategy || '-'}`);
     lines.push(`- label fallback: ${result.usedLabelFallback ? 'yes' : 'no'}`);
     lines.push(`- commented: ${result.commented ? 'yes' : 'no'}`);
     if (result.summary) {
@@ -5619,6 +5656,12 @@ function pickLinearAutopilotCandidate(issues, options = {}) {
     normalizeLabelNames(options.includeLabels || []).map((item) => item.toLowerCase()),
   );
   const includeAll = Boolean(options.includeAll);
+  const nowMs = Date.now();
+  const historyIndex = buildAutopilotHistoryIndex(options.historyRuns || []);
+  const issueCooldownMinutes = Math.max(0, Number(options.issueCooldownMinutes || 0));
+  const cooldownMs = issueCooldownMinutes * 60 * 1000;
+  const maxConsecutiveSameIssue = Math.max(1, Number(options.maxConsecutiveSameIssue || 2));
+  const preferNewTriage = Boolean(options.preferNewTriage);
 
   const filtered = (Array.isArray(issues) ? issues : []).filter((issue) => {
     const stateName = String((issue && issue.state && issue.state.name) || '').trim();
@@ -5635,18 +5678,56 @@ function pickLinearAutopilotCandidate(issues, options = {}) {
     return labels.some((name) => includeLabels.has(name));
   });
 
-  const scored = filtered
-    .map((issue) => {
-      const stateName = String((issue && issue.state && issue.state.name) || '').trim();
-      const priority = Number(issue && issue.priority);
-      const updatedAtMs = Date.parse(String((issue && issue.updatedAt) || ''));
-      return {
-        issue,
-        stateRank: autopilotStateRank(stateName),
-        priorityRank: Number.isFinite(priority) && priority > 0 ? priority : 9,
-        updatedAtMs: Number.isFinite(updatedAtMs) ? updatedAtMs : 0,
-      };
-    })
+  if (filtered.length === 0) {
+    return { issue: null, strategy: 'none' };
+  }
+
+  const scored = filtered.map((issue) => {
+    const identifier = normalizeLinearIssueId(String((issue && issue.identifier) || ''));
+    const stateName = String((issue && issue.state && issue.state.name) || '').trim();
+    const stateLower = stateName.toLowerCase();
+    const priority = Number(issue && issue.priority);
+    const updatedAtMsRaw = Date.parse(String((issue && issue.updatedAt) || ''));
+    const updatedAtMs = Number.isFinite(updatedAtMsRaw) ? updatedAtMsRaw : 0;
+    const history = historyIndex.get(identifier) || { lastAtMs: 0, consecutive: 0 };
+    const inCooldown =
+      cooldownMs > 0 && history.lastAtMs > 0 ? nowMs - history.lastAtMs < cooldownMs : false;
+    const blockedByConsecutive = history.consecutive >= maxConsecutiveSameIssue;
+
+    return {
+      issue,
+      identifier,
+      stateName,
+      stateLower,
+      stateRank: autopilotStateRank(stateName),
+      priorityRank: Number.isFinite(priority) && priority > 0 ? priority : 9,
+      updatedAtMs,
+      inCooldown,
+      blockedByConsecutive,
+      lastAtMs: Number(history.lastAtMs || 0),
+      consecutive: Number(history.consecutive || 0),
+    };
+  });
+
+  const triageReady = preferNewTriage
+    ? scored
+        .filter((item) => item.stateLower === 'triage' && !item.inCooldown && !item.blockedByConsecutive)
+        .sort((a, b) => {
+          if (a.priorityRank !== b.priorityRank) {
+            return a.priorityRank - b.priorityRank;
+          }
+          if (a.updatedAtMs !== b.updatedAtMs) {
+            return b.updatedAtMs - a.updatedAtMs;
+          }
+          return String(a.identifier || '').localeCompare(String(b.identifier || ''));
+        })
+    : [];
+  if (triageReady.length > 0) {
+    return { issue: triageReady[0].issue, strategy: 'triage-priority' };
+  }
+
+  const readyPool = scored
+    .filter((item) => !item.inCooldown && !item.blockedByConsecutive)
     .sort((a, b) => {
       if (a.stateRank !== b.stateRank) {
         return a.stateRank - b.stateRank;
@@ -5657,12 +5738,85 @@ function pickLinearAutopilotCandidate(issues, options = {}) {
       if (a.updatedAtMs !== b.updatedAtMs) {
         return a.updatedAtMs - b.updatedAtMs;
       }
-      return String((a.issue && a.issue.identifier) || '').localeCompare(
-        String((b.issue && b.issue.identifier) || ''),
-      );
+      return String(a.identifier || '').localeCompare(String(b.identifier || ''));
     });
+  if (readyPool.length > 0) {
+    return { issue: readyPool[0].issue, strategy: 'ready-pool' };
+  }
 
-  return scored.length > 0 ? scored[0].issue : null;
+  const softPool = scored
+    .filter((item) => !item.blockedByConsecutive)
+    .sort((a, b) => {
+      if (a.inCooldown !== b.inCooldown) {
+        return Number(a.inCooldown) - Number(b.inCooldown);
+      }
+      if (a.stateRank !== b.stateRank) {
+        return a.stateRank - b.stateRank;
+      }
+      if (a.priorityRank !== b.priorityRank) {
+        return a.priorityRank - b.priorityRank;
+      }
+      if (a.updatedAtMs !== b.updatedAtMs) {
+        return a.updatedAtMs - b.updatedAtMs;
+      }
+      return String(a.identifier || '').localeCompare(String(b.identifier || ''));
+    });
+  if (softPool.length > 0) {
+    return { issue: softPool[0].issue, strategy: 'cooldown-fallback' };
+  }
+
+  const fallback = scored.sort((a, b) => {
+    if (a.stateRank !== b.stateRank) {
+      return a.stateRank - b.stateRank;
+    }
+    if (a.priorityRank !== b.priorityRank) {
+      return a.priorityRank - b.priorityRank;
+    }
+    if (a.updatedAtMs !== b.updatedAtMs) {
+      return a.updatedAtMs - b.updatedAtMs;
+    }
+    return String(a.identifier || '').localeCompare(String(b.identifier || ''));
+  });
+  return { issue: fallback.length > 0 ? fallback[0].issue : null, strategy: 'any-fallback' };
+}
+
+function buildAutopilotHistoryIndex(runs) {
+  const list = Array.isArray(runs) ? runs : [];
+  const map = new Map();
+  const latestByIssue = new Map();
+  for (const item of list) {
+    const identifier = normalizeLinearIssueId(item && item.issueIdentifier ? item.issueIdentifier : '');
+    if (!identifier) {
+      continue;
+    }
+    const atMs = Number(item && item.atMs ? item.atMs : 0);
+    const prev = latestByIssue.get(identifier);
+    if (!prev || atMs > prev) {
+      latestByIssue.set(identifier, atMs);
+    }
+  }
+
+  let lastIdentifier = '';
+  let sequence = 0;
+  for (const item of list) {
+    const identifier = normalizeLinearIssueId(item && item.issueIdentifier ? item.issueIdentifier : '');
+    if (!identifier) {
+      continue;
+    }
+    if (identifier === lastIdentifier) {
+      sequence += 1;
+    } else {
+      sequence = 1;
+      lastIdentifier = identifier;
+    }
+    if (!map.has(identifier)) {
+      map.set(identifier, {
+        lastAtMs: Number(latestByIssue.get(identifier) || 0),
+        consecutive: sequence,
+      });
+    }
+  }
+  return map;
 }
 
 function autopilotStateRank(stateName) {

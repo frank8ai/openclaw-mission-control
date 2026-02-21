@@ -48,7 +48,7 @@ Tracking page for ongoing OpenClaw development projects:
 - `tasks schedule`: generate/install crontab for:
   - Daily report at `09:00` and `18:00`
   - Watchdog every `5` minutes
-  - Linear autopilot every `15` minutes
+  - Linear autopilot every `5` minutes (with issue cooldown/rotation)
   - Due-soon reminder daily + cycle reminder weekly
   - Daily + weekly briefing
 
