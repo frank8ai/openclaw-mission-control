@@ -236,6 +236,17 @@
     "maxSessions": 200,
     "maxRunsPerJob": 20
   },
+  "distillExport": {
+    "enabled": true,
+    "maxSessions": 200,
+    "maxSamples": 2000,
+    "maxAuditEvents": 2000,
+    "minUserChars": 6,
+    "minAssistantChars": 20,
+    "includeAudit": true,
+    "includeToolTrace": true,
+    "includeCodexCli": true
+  },
   "runbook": {
     "enabled": true,
     "allowExecute": false,

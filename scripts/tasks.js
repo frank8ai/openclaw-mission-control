@@ -272,6 +272,17 @@ const DEFAULTS = {
     maxSessions: 200,
     maxRunsPerJob: 20,
   },
+  distillExport: {
+    enabled: true,
+    maxSessions: 200,
+    maxSamples: 2000,
+    maxAuditEvents: 2000,
+    minUserChars: 6,
+    minAssistantChars: 20,
+    includeAudit: true,
+    includeToolTrace: true,
+    includeCodexCli: true,
+  },
   runbook: {
     enabled: true,
     allowExecute: false,
@@ -353,6 +364,7 @@ Read commands:
   state-machine-rules [--json] Show/apply/rollback config-driven status-machine rule versions
   audit-rollback --audit-id ID Roll back auditable local writes by audit id
   eval-replay [--json]         Build replay artifact for evaluation/distillation workflow
+  distill-export [--json]      Export local training dataset from replay + OpenClaw/Codex session logs + audit
 
 Integrations:
   triage --title ...           Create a Triage issue quickly (supports --source/--source-id/--labels)
@@ -395,6 +407,7 @@ Examples:
   npm run tasks -- linear-autopilot --issue CLAW-128 --agent auto --json
   npm run tasks -- linear-engine --max-steps 3 --agent auto --json
   npm run tasks -- linear-engine --issue CLAW-128 --max-steps 5 --json
+  npm run tasks -- distill-export --agent codex --json
   npm run tasks -- briefing daily --send
   npm run tasks -- discord-intake-sync --channel 1468117725040742527
   npm run tasks -- trigger github-sync --confirm "CONFIRM ABC123"
@@ -502,6 +515,11 @@ async function main() {
       case 'replay-eval':
       case 'distill-replay':
         await cmdEvalReplay(settings, flags);
+        return;
+      case 'distill-export':
+      case 'dataset-export':
+      case 'distill-dataset':
+        await cmdDistillExport(settings, flags);
         return;
       case 'runbook-exec':
       case 'runbook':
@@ -1755,6 +1773,753 @@ async function cmdEvalReplay(settings, flags) {
   lines.push(`- cron runs: ${replay.metrics.cronRuns}`);
   lines.push(`- failures: ${replay.metrics.failures}`);
   process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+async function cmdDistillExport(settings, flags) {
+  if (settings.distillExport && settings.distillExport.enabled === false) {
+    throw new Error('distillExport is disabled in config.');
+  }
+
+  const issueFilter = normalizeLinearIssueId(flags.issue || flags.identifier || '');
+  const replayPathInput = String(flags.replay || flags['replay-path'] || '').trim();
+  const replayPath = replayPathInput || findLatestEvalReplayPath();
+  if (!replayPath || !fs.existsSync(replayPath)) {
+    throw new Error('replay artifact not found. Run: npm run tasks -- eval-replay --emit-plan');
+  }
+
+  const replay = readJsonFile(replayPath, null);
+  if (!replay || typeof replay !== 'object' || !Array.isArray(replay.records)) {
+    throw new Error(`invalid replay artifact JSON: ${replayPath}`);
+  }
+
+  const maxSessions = Math.max(
+    1,
+    Number(flags['max-sessions'] || settings.distillExport.maxSessions || settings.evalReplay.maxSessions || 200),
+  );
+  const maxSamples = Math.max(
+    1,
+    Number(flags['max-samples'] || settings.distillExport.maxSamples || 2000),
+  );
+  const maxAuditEvents = Math.max(
+    0,
+    Number(flags['max-audit-events'] || settings.distillExport.maxAuditEvents || 2000),
+  );
+  const minUserChars = Math.max(
+    1,
+    Number(flags['min-user-chars'] || settings.distillExport.minUserChars || 6),
+  );
+  const minAssistantChars = Math.max(
+    1,
+    Number(flags['min-assistant-chars'] || settings.distillExport.minAssistantChars || 20),
+  );
+  const includeAudit =
+    flags['include-audit'] === undefined
+      ? settings.distillExport.includeAudit !== false
+      : isTruthyLike(flags['include-audit']);
+  const includeToolTrace =
+    flags['include-tool-trace'] === undefined
+      ? settings.distillExport.includeToolTrace !== false
+      : isTruthyLike(flags['include-tool-trace']);
+  const includeCodexCli =
+    flags['include-codex-cli'] === undefined
+      ? settings.distillExport.includeCodexCli !== false
+      : isTruthyLike(flags['include-codex-cli']);
+  const agentAllow = new Set(normalizeAgentIds(flags.agent || flags.agents || ''));
+
+  const replaySessionRecords = replay.records
+    .filter((item) => item && item.type === 'session')
+    .filter((item) => !issueFilter || String(item.issueIdentifier || '') === issueFilter)
+    .filter((item) => {
+      if (agentAllow.size === 0) {
+        return true;
+      }
+      return agentAllow.has(String(item.agentId || '').trim().toLowerCase());
+    });
+  const sessionRecords = replaySessionRecords.slice(0, maxSessions);
+  const seenSessionKeys = new Set(
+    sessionRecords
+      .map((item) => `${String(item.agentId || '').trim()}:${String(item.sessionId || '').trim()}`)
+      .filter((item) => !item.startsWith(':')),
+  );
+  const bindings = readJsonFile(ISSUE_LINKS_PATH, {});
+  const liveSessions = loadSessions(settings)
+    .filter((item) => item && item.sessionId && item.agentId)
+    .filter((item) => {
+      if (agentAllow.size === 0) {
+        return true;
+      }
+      return agentAllow.has(String(item.agentId || '').trim().toLowerCase());
+    })
+    .sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0));
+  for (const live of liveSessions) {
+    if (sessionRecords.length >= maxSessions) {
+      break;
+    }
+    const mergedKey = `${String(live.agentId || '').trim()}:${String(live.sessionId || '').trim()}`;
+    if (!mergedKey || seenSessionKeys.has(mergedKey)) {
+      continue;
+    }
+    const issueIdentifier = resolveIssueFromBindings(bindings, {
+      taskId: `session:${live.agentId}:${live.key || ''}`,
+      sessionId: live.sessionId || '',
+      sessionKey: live.key || '',
+    });
+    if (issueFilter && issueIdentifier !== issueFilter) {
+      continue;
+    }
+    sessionRecords.push({
+      type: 'session',
+      issueIdentifier,
+      agentId: live.agentId || '',
+      sessionId: live.sessionId || '',
+      sessionKey: live.key || '',
+      model: live.model || '',
+      ageMs: Number(live.ageMs || 0),
+      updatedAtMs: Number(live.updatedAt || 0),
+      totalTokens: live.totalTokens != null ? Number(live.totalTokens) : null,
+      contextTokens: live.contextTokens != null ? Number(live.contextTokens) : null,
+      abortedLastRun: Boolean(live.abortedLastRun),
+    });
+    seenSessionKeys.add(mergedKey);
+  }
+  const selectedIssueIds = new Set(
+    sessionRecords
+      .map((item) => normalizeLinearIssueId(item && item.issueIdentifier ? item.issueIdentifier : ''))
+      .filter(Boolean),
+  );
+
+  const rows = [];
+  const byAgent = {};
+  let sessionsMissingFile = 0;
+  let sessionsProcessed = 0;
+  let codexCliRows = 0;
+  let codexCliFilesProcessed = 0;
+
+  for (const record of sessionRecords) {
+    if (rows.length >= maxSamples) {
+      break;
+    }
+    const built = buildDistillSessionSamples(record, settings, {
+      minUserChars,
+      minAssistantChars,
+      includeToolTrace,
+      maxSamples: maxSamples - rows.length,
+    });
+    if (!built.foundFile) {
+      sessionsMissingFile += 1;
+      continue;
+    }
+    sessionsProcessed += 1;
+    rows.push(...built.samples);
+    const agentId = String(record.agentId || '').trim() || 'unknown';
+    byAgent[agentId] = (byAgent[agentId] || 0) + built.samples.length;
+  }
+
+  const shouldIncludeCodexCli =
+    includeCodexCli &&
+    rows.length < maxSamples &&
+    (agentAllow.size === 0 || agentAllow.has('codex') || agentAllow.has('codex-cli'));
+  if (shouldIncludeCodexCli) {
+    const codexBuilt = buildCodexCliSamples({
+      issueFilter,
+      maxSamples: maxSamples - rows.length,
+      minUserChars,
+      minAssistantChars,
+      includeToolTrace,
+    });
+    rows.push(...codexBuilt.samples);
+    codexCliRows = codexBuilt.samples.length;
+    codexCliFilesProcessed = codexBuilt.filesProcessed;
+    if (codexCliRows > 0) {
+      byAgent['codex-cli'] = (byAgent['codex-cli'] || 0) + codexCliRows;
+      for (const row of codexBuilt.samples) {
+        const issue = normalizeLinearIssueId(row && row.issueIdentifier ? row.issueIdentifier : '');
+        if (issue) {
+          selectedIssueIds.add(issue);
+        }
+      }
+    }
+  }
+
+  let auditSamples = 0;
+  if (includeAudit && maxAuditEvents > 0 && rows.length < maxSamples) {
+    const auditEvents = loadJsonlObjects(AUDIT_LOG_PATH, maxAuditEvents);
+    for (const event of auditEvents) {
+      if (rows.length >= maxSamples) {
+        break;
+      }
+      const eventIssue = extractIssueIdentifierFromAuditEvent(event, issueFilter);
+      if (issueFilter && eventIssue !== issueFilter) {
+        continue;
+      }
+      if (!issueFilter && agentAllow.size > 0) {
+        if (!eventIssue || !selectedIssueIds.has(eventIssue)) {
+          continue;
+        }
+      }
+      const detailText = sanitizeTrainingText(
+        trimMessage(singleLine(stringifyForDataset(event && event.detail ? event.detail : {})), 900),
+      );
+      if (!detailText) {
+        continue;
+      }
+      rows.push({
+        schemaVersion: 1,
+        type: 'ops_event',
+        source: 'audit-jsonl',
+        issueIdentifier: eventIssue,
+        eventType: String((event && event.eventType) || 'unknown').trim(),
+        timestamp: String((event && event.ts) || ''),
+        input: `event_type=${String((event && event.eventType) || 'unknown').trim()}`,
+        output: detailText,
+      });
+      auditSamples += 1;
+    }
+  }
+
+  const distillDir = path.join(DATA_DIR, 'distill');
+  ensureDir(distillDir);
+  const nowMs = Date.now();
+  const stamp = new Date(nowMs).toISOString().replace(/[^0-9]/g, '').slice(0, 14);
+  const issueSuffix = issueFilter ? `-${issueFilter.toLowerCase()}` : '';
+  const datasetPath = path.join(distillDir, `dataset-${stamp}${issueSuffix}.jsonl`);
+  const manifestPath = path.join(distillDir, `dataset-${stamp}${issueSuffix}.manifest.json`);
+
+  const body = rows.map((item) => JSON.stringify(item)).join('\n');
+  fs.writeFileSync(datasetPath, body ? `${body}\n` : '', 'utf8');
+
+  const manifest = {
+    ok: true,
+    generatedAtMs: nowMs,
+    generatedAt: new Date(nowMs).toISOString(),
+    replayPath,
+    issueFilter,
+    settings: {
+      maxSessions,
+      maxSamples,
+      maxAuditEvents,
+      minUserChars,
+      minAssistantChars,
+      includeAudit,
+      includeToolTrace,
+      agentFilter: [...agentAllow],
+    },
+    metrics: {
+      rows: rows.length,
+      sessionRows: rows.filter((item) => item.type === 'sft_turn').length,
+      auditRows: rows.filter((item) => item.type === 'ops_event').length,
+      sessionsRequested: sessionRecords.length,
+      sessionsProcessed,
+      sessionsMissingFile,
+      codexCliRows,
+      codexCliFilesProcessed,
+      auditRowsAdded: auditSamples,
+      byAgent,
+    },
+    datasetPath,
+  };
+  writeJsonFile(manifestPath, manifest);
+
+  appendAuditEvent('distill-export-generated', {
+    issueFilter,
+    replayPath,
+    datasetPath,
+    manifestPath,
+    rows: manifest.metrics.rows,
+    sessionRows: manifest.metrics.sessionRows,
+    auditRows: manifest.metrics.auditRows,
+    sessionsProcessed: manifest.metrics.sessionsProcessed,
+    sessionsMissingFile: manifest.metrics.sessionsMissingFile,
+    codexCliRows: manifest.metrics.codexCliRows,
+    codexCliFilesProcessed: manifest.metrics.codexCliFilesProcessed,
+  });
+
+  const result = {
+    ok: true,
+    issueFilter,
+    replayPath,
+    datasetPath,
+    manifestPath,
+    metrics: manifest.metrics,
+  };
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+
+  const lines = [];
+  lines.push('Distill dataset exported:');
+  lines.push(`- replay: ${replayPath}`);
+  lines.push(`- dataset: ${datasetPath}`);
+  lines.push(`- manifest: ${manifestPath}`);
+  lines.push(`- rows: ${manifest.metrics.rows}`);
+  lines.push(`- session rows: ${manifest.metrics.sessionRows}`);
+  lines.push(`- audit rows: ${manifest.metrics.auditRows}`);
+  lines.push(`- sessions processed: ${manifest.metrics.sessionsProcessed}`);
+  lines.push(`- sessions missing file: ${manifest.metrics.sessionsMissingFile}`);
+  lines.push(`- codex cli rows: ${manifest.metrics.codexCliRows}`);
+  lines.push(`- codex cli files processed: ${manifest.metrics.codexCliFilesProcessed}`);
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+function findLatestEvalReplayPath() {
+  const replayDir = path.join(DATA_DIR, 'eval-replay');
+  const files = listDir(replayDir)
+    .filter((name) => /^replay-\d{14}\.json$/i.test(String(name || '')))
+    .sort();
+  if (files.length === 0) {
+    return '';
+  }
+  return path.join(replayDir, files[files.length - 1]);
+}
+
+function buildDistillSessionSamples(record, settings, options = {}) {
+  const agentId = String((record && record.agentId) || '').trim();
+  const sessionId = String((record && record.sessionId) || '').trim();
+  if (!agentId || !sessionId) {
+    return { foundFile: false, samples: [] };
+  }
+
+  const sessionPath = path.join(settings.openclawHome, 'agents', agentId, 'sessions', `${sessionId}.jsonl`);
+  if (!fs.existsSync(sessionPath)) {
+    return { foundFile: false, samples: [] };
+  }
+
+  const minUserChars = Math.max(1, Number(options.minUserChars || 6));
+  const minAssistantChars = Math.max(1, Number(options.minAssistantChars || 20));
+  const includeToolTrace = options.includeToolTrace !== false;
+  const maxSamples = Math.max(1, Number(options.maxSamples || 500));
+  const events = loadJsonlObjects(sessionPath, 0);
+  const samples = [];
+
+  let pendingUser = null;
+  let toolTrace = [];
+
+  for (const event of events) {
+    if (samples.length >= maxSamples) {
+      break;
+    }
+    if (!event || String(event.type || '') !== 'message' || !event.message || typeof event.message !== 'object') {
+      continue;
+    }
+    const role = String(event.message.role || '').trim().toLowerCase();
+    const text = sanitizeTrainingText(extractMessageText(event.message.content));
+    if (role === 'user') {
+      if (text.length < minUserChars) {
+        pendingUser = null;
+        toolTrace = [];
+        continue;
+      }
+      pendingUser = {
+        text,
+        timestamp: event.timestamp || '',
+      };
+      toolTrace = [];
+      continue;
+    }
+    if (role === 'assistant') {
+      const calls = includeToolTrace ? extractToolCallSummaries(event.message.content) : [];
+      if (calls.length > 0 && !text) {
+        toolTrace.push(...calls.map((item) => sanitizeTrainingText(item)).filter(Boolean).slice(0, 6));
+        toolTrace = toolTrace.slice(-20);
+        continue;
+      }
+      if (!pendingUser || text.length < minAssistantChars) {
+        continue;
+      }
+
+      const sample = {
+        schemaVersion: 1,
+        type: 'sft_turn',
+        source: 'session-jsonl',
+        issueIdentifier: String((record && record.issueIdentifier) || '').trim(),
+        agentId,
+        sessionId,
+        sessionKey: String((record && record.sessionKey) || '').trim(),
+        model: String((event.message && event.message.model) || (record && record.model) || '').trim(),
+        timestamp: String(event.timestamp || pendingUser.timestamp || ''),
+        input: pendingUser.text,
+        output: text,
+      };
+      const usage = extractMessageUsage(event.message);
+      if (usage) {
+        sample.usage = usage;
+      }
+      if (includeToolTrace && toolTrace.length > 0) {
+        sample.toolTrace = toolTrace.slice(0, 20);
+      }
+      samples.push(sample);
+      pendingUser = null;
+      toolTrace = [];
+      continue;
+    }
+    if (role === 'toolresult' && includeToolTrace && text) {
+      toolTrace.push(`tool_result: ${trimMessage(singleLine(text), 400)}`);
+      toolTrace = toolTrace.slice(-20);
+    }
+  }
+
+  return {
+    foundFile: true,
+    sessionPath,
+    samples,
+  };
+}
+
+function extractMessageUsage(message) {
+  if (!message || typeof message !== 'object' || !message.usage || typeof message.usage !== 'object') {
+    return null;
+  }
+  const usage = message.usage;
+  const mapped = {
+    input: usage.input != null ? Number(usage.input) : null,
+    output: usage.output != null ? Number(usage.output) : null,
+    cacheRead: usage.cacheRead != null ? Number(usage.cacheRead) : null,
+    cacheWrite: usage.cacheWrite != null ? Number(usage.cacheWrite) : null,
+    totalTokens: usage.totalTokens != null ? Number(usage.totalTokens) : null,
+  };
+  if (
+    mapped.input == null &&
+    mapped.output == null &&
+    mapped.cacheRead == null &&
+    mapped.cacheWrite == null &&
+    mapped.totalTokens == null
+  ) {
+    return null;
+  }
+  return mapped;
+}
+
+function loadJsonlObjects(filePath, limit = 0) {
+  if (!filePath || !fs.existsSync(filePath)) {
+    return [];
+  }
+  const lines = fs
+    .readFileSync(filePath, 'utf8')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const windowed = limit > 0 ? lines.slice(-Math.max(1, Number(limit))) : lines;
+  const items = [];
+  for (const line of windowed) {
+    try {
+      items.push(JSON.parse(line));
+    } catch {
+      // skip malformed line
+    }
+  }
+  return items;
+}
+
+function extractMessageText(content) {
+  if (typeof content === 'string') {
+    return content.trim();
+  }
+  if (!Array.isArray(content)) {
+    return '';
+  }
+  const parts = [];
+  for (const chunk of content) {
+    if (typeof chunk === 'string') {
+      const text = chunk.trim();
+      if (text) {
+        parts.push(text);
+      }
+      continue;
+    }
+    if (!chunk || typeof chunk !== 'object') {
+      continue;
+    }
+    if (typeof chunk.text === 'string' && ['text', 'input_text', 'output_text'].includes(String(chunk.type || ''))) {
+      const text = chunk.text.trim();
+      if (text) {
+        parts.push(text);
+      }
+      continue;
+    }
+    if (typeof chunk.content === 'string' && String(chunk.type || '') === 'text') {
+      const text = chunk.content.trim();
+      if (text) {
+        parts.push(text);
+      }
+    }
+  }
+  return parts.join('\n').trim();
+}
+
+function extractToolCallSummaries(content) {
+  if (!Array.isArray(content)) {
+    return [];
+  }
+  const traces = [];
+  for (const chunk of content) {
+    if (!chunk || typeof chunk !== 'object') {
+      continue;
+    }
+    if (String(chunk.type || '') !== 'toolCall') {
+      continue;
+    }
+    const name = String(chunk.name || 'tool').trim() || 'tool';
+    let args = '';
+    if (typeof chunk.arguments === 'string') {
+      args = chunk.arguments;
+    } else if (chunk.arguments && typeof chunk.arguments === 'object') {
+      args = stringifyForDataset(chunk.arguments);
+    } else if (typeof chunk.partialJson === 'string') {
+      args = chunk.partialJson;
+    }
+    const argSummary = args ? trimMessage(singleLine(args), 300) : '';
+    traces.push(argSummary ? `tool_call ${name}: ${argSummary}` : `tool_call ${name}`);
+  }
+  return traces;
+}
+
+function stringifyForDataset(value) {
+  if (value == null) {
+    return '';
+  }
+  if (typeof value === 'string') {
+    return value;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function extractIssueIdentifierFromAuditEvent(event, fallback = '') {
+  const preferred = normalizeLinearIssueId(
+    event && event.detail && (event.detail.issueIdentifier || event.detail.identifier || event.detail.issue || ''),
+  );
+  if (preferred) {
+    return preferred;
+  }
+  const blob = `${stringifyForDataset(event)} ${fallback || ''}`;
+  const match = blob.match(/\b([A-Z][A-Z0-9]+-\d+)\b/);
+  if (match) {
+    return normalizeLinearIssueId(match[1]);
+  }
+  return normalizeLinearIssueId(fallback);
+}
+
+function sanitizeTrainingText(text) {
+  let value = String(text || '');
+  if (!value) {
+    return '';
+  }
+  value = value.replace(/\r\n/g, '\n');
+  value = value.replace(/\blin_api_[A-Za-z0-9]+\b/g, 'lin_api_[REDACTED]');
+  value = value.replace(/\bsk-[A-Za-z0-9]{16,}\b/g, 'sk-[REDACTED]');
+  value = value.replace(/\bgh[pousr]_[A-Za-z0-9]{16,}\b/g, 'gh_[REDACTED]');
+  value = value.replace(/\b(?:xoxb|xoxp|xoxa|xoxr)-[A-Za-z0-9-]{16,}\b/g, 'xox-[REDACTED]');
+  value = value.replace(/\bBearer\s+[A-Za-z0-9._-]{8,}\b/gi, 'Bearer [REDACTED]');
+  value = value.replace(
+    /\b(api[_-]?key|token|secret|password)\b\s*[:=]\s*['"]?[A-Za-z0-9._-]{8,}['"]?/gi,
+    '$1=[REDACTED]',
+  );
+  return value.trim();
+}
+
+function buildCodexCliSamples(options = {}) {
+  const sessionsRoot = String(options.sessionsRoot || path.join(os.homedir(), '.codex', 'sessions')).trim();
+  if (!sessionsRoot || !fs.existsSync(sessionsRoot)) {
+    return {
+      samples: [],
+      filesProcessed: 0,
+      filesMatched: 0,
+      sessionsRoot,
+    };
+  }
+
+  const maxSamples = Math.max(1, Number(options.maxSamples || 500));
+  const files = listJsonlFilesRecursive(sessionsRoot).sort((a, b) => b.localeCompare(a));
+  const samples = [];
+  let filesProcessed = 0;
+
+  for (const filePath of files) {
+    if (samples.length >= maxSamples) {
+      break;
+    }
+    filesProcessed += 1;
+    const parsed = parseCodexCliSessionFile(filePath, {
+      issueFilter: options.issueFilter || '',
+      minUserChars: options.minUserChars || 6,
+      minAssistantChars: options.minAssistantChars || 20,
+      includeToolTrace: options.includeToolTrace !== false,
+      maxSamples: maxSamples - samples.length,
+    });
+    samples.push(...parsed.samples);
+  }
+
+  return {
+    samples,
+    filesProcessed,
+    filesMatched: files.length,
+    sessionsRoot,
+  };
+}
+
+function parseCodexCliSessionFile(filePath, options = {}) {
+  const entries = loadJsonlObjects(filePath, 0);
+  const issueFilter = normalizeLinearIssueId(options.issueFilter || '');
+  const minUserChars = Math.max(1, Number(options.minUserChars || 6));
+  const minAssistantChars = Math.max(1, Number(options.minAssistantChars || 20));
+  const includeToolTrace = options.includeToolTrace !== false;
+  const maxSamples = Math.max(1, Number(options.maxSamples || 200));
+  const samples = [];
+
+  let pendingUser = null;
+  let toolTrace = [];
+  let activeModel = '';
+
+  for (const entry of entries) {
+    if (samples.length >= maxSamples) {
+      break;
+    }
+
+    if (entry && String(entry.type || '') === 'turn_context' && entry.payload && typeof entry.payload === 'object') {
+      activeModel = String(entry.payload.model || activeModel || '').trim();
+      continue;
+    }
+
+    if (
+      entry &&
+      String(entry.type || '') === 'event_msg' &&
+      entry.payload &&
+      String(entry.payload.type || '') === 'user_message'
+    ) {
+      const userText = sanitizeTrainingText(String(entry.payload.message || '').trim());
+      if (userText.length < minUserChars) {
+        pendingUser = null;
+        toolTrace = [];
+        continue;
+      }
+      pendingUser = {
+        text: userText,
+        timestamp: String(entry.timestamp || ''),
+      };
+      toolTrace = [];
+      continue;
+    }
+
+    if (
+      entry &&
+      String(entry.type || '') === 'response_item' &&
+      entry.payload &&
+      String(entry.payload.type || '') === 'function_call' &&
+      pendingUser &&
+      includeToolTrace
+    ) {
+      const name = String(entry.payload.name || 'tool').trim() || 'tool';
+      const argsRaw =
+        typeof entry.payload.arguments === 'string'
+          ? entry.payload.arguments
+          : stringifyForDataset(entry.payload.arguments || {});
+      const args = sanitizeTrainingText(trimMessage(singleLine(argsRaw), 300));
+      toolTrace.push(args ? `tool_call ${name}: ${args}` : `tool_call ${name}`);
+      toolTrace = toolTrace.slice(-20);
+      continue;
+    }
+
+    if (
+      entry &&
+      String(entry.type || '') === 'response_item' &&
+      entry.payload &&
+      String(entry.payload.type || '') === 'function_call_output' &&
+      pendingUser &&
+      includeToolTrace
+    ) {
+      const out = sanitizeTrainingText(trimMessage(singleLine(String(entry.payload.output || '')), 350));
+      if (out) {
+        toolTrace.push(`tool_result: ${out}`);
+        toolTrace = toolTrace.slice(-20);
+      }
+      continue;
+    }
+
+    if (
+      entry &&
+      String(entry.type || '') === 'response_item' &&
+      entry.payload &&
+      String(entry.payload.type || '') === 'message' &&
+      String(entry.payload.role || '').toLowerCase() === 'assistant'
+    ) {
+      if (!pendingUser) {
+        continue;
+      }
+      const output = sanitizeTrainingText(extractMessageText(entry.payload.content));
+      if (output.length < minAssistantChars) {
+        continue;
+      }
+      const issueIdentifier = extractIssueIdentifierFromText(
+        `${pendingUser.text}\n${output}`,
+        issueFilter,
+      );
+      if (issueFilter && issueIdentifier !== issueFilter) {
+        pendingUser = null;
+        toolTrace = [];
+        continue;
+      }
+
+      const sample = {
+        schemaVersion: 1,
+        type: 'sft_turn',
+        source: 'codex-cli-session',
+        issueIdentifier,
+        agentId: 'codex-cli',
+        sessionId: path.basename(filePath, '.jsonl'),
+        sessionPath: filePath,
+        model: activeModel || 'gpt-5.3-codex',
+        timestamp: String(entry.timestamp || pendingUser.timestamp || ''),
+        input: pendingUser.text,
+        output,
+      };
+      if (includeToolTrace && toolTrace.length > 0) {
+        sample.toolTrace = toolTrace.slice(0, 20);
+      }
+      samples.push(sample);
+      pendingUser = null;
+      toolTrace = [];
+    }
+  }
+
+  return { samples };
+}
+
+function extractIssueIdentifierFromText(text, fallback = '') {
+  const direct = normalizeLinearIssueId(fallback);
+  const match = String(text || '').match(/\b([A-Z][A-Z0-9]+-\d+)\b/);
+  if (match) {
+    return normalizeLinearIssueId(match[1]);
+  }
+  return direct;
+}
+
+function listJsonlFilesRecursive(rootDir) {
+  if (!rootDir || !fs.existsSync(rootDir)) {
+    return [];
+  }
+  const result = [];
+  const queue = [rootDir];
+  while (queue.length > 0) {
+    const current = queue.pop();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const nextPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        queue.push(nextPath);
+      } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        result.push(nextPath);
+      }
+    }
+  }
+  return result;
 }
 
 async function cmdSchedule(settings, flags) {

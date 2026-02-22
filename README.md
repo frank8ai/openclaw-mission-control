@@ -5,6 +5,8 @@ Local-first Next.js dashboard + CLI control center for OpenClaw operations.
 Tracking page for ongoing OpenClaw development projects:
 
 - `OPENCLAW_DEV_PROJECT_TRACKING.md`
+- local model distillation guide:
+  - `docs/LOCAL_MODEL_DISTILLATION.md`
 - SOP index for mission-control automation:
   - `docs/sop/SOP_INDEX.md`
 - Audit entry guide:
@@ -54,6 +56,7 @@ Tracking page for ongoing OpenClaw development projects:
 - `tasks linear-autopilot`: pull one runnable Linear issue and let configured execution agent execute exactly one next step, then auto comment/state update (supports `--issue CLAW-123`, `--agent <id>`, `--agent auto`)
 - `tasks linear-engine`: run multi-step execution for a specific issue or auto-pick one runnable issue until `done/blocked/max-steps`
 - `tasks eval-replay`: export replay artifact for eval/distillation workflow
+- `tasks distill-export`: export local training-ready dataset (jsonl) from replay + OpenClaw sessions + Codex CLI sessions + audit logs
 - `tasks runbook-exec`: run SOP runbook cards in dry-run or guarded execute mode
 - `tasks trigger`: one-click run for sync/report/watchdog jobs with confirmation token
 - `tasks autopr`: guarded low-risk auto PR flow (dry-run default)
@@ -249,6 +252,9 @@ npm run tasks -- autopr --issue CLAW-123
 # Eval replay artifact for distillation
 npm run tasks -- eval-replay --emit-plan
 
+# Export local distillation dataset (includes codex session traces)
+npm run tasks -- distill-export --agent codex --json
+
 # Runbook v2 (default dry-run)
 npm run tasks -- runbook-exec --card cron-recover --issue CLAW-123
 
@@ -274,6 +280,7 @@ All control-plane evidence is stored in `data/control-center/`:
 - `audit.jsonl`: immutable audit trail with `auditId`
 - `rollback-journal.json`: rollback snapshots keyed by `auditId`
 - `approvals.json`: one-time approval tokens for high-risk writes
+- `distill/`: local distillation exports (`dataset-*.jsonl`, `*.manifest.json`)
 
 ## API response contract
 
