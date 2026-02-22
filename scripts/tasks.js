@@ -1758,6 +1758,20 @@ async function cmdEvalReplay(settings, flags) {
 }
 
 async function cmdSchedule(settings, flags) {
+  if (flags.help || flags.h) {
+    process.stdout.write(
+      [
+        'Usage:',
+        '  schedule [--apply] [--mode full|minimal] [--execution-loop autopilot|engine] [--engine-max-steps N] [--agent AGENT|auto] [--channel CH] [--target TGT]',
+        '',
+        'Behavior:',
+        '  - Without --apply: print proposed crontab block only.',
+        '  - With --apply: install the generated block into user crontab.',
+      ].join('\n') + '\n',
+    );
+    return;
+  }
+
   const timezone = String(flags.tz || settings.timezone || 'Asia/Shanghai').trim();
   const apply = Boolean(flags.apply);
   const mode = String(flags.mode || 'minimal').trim().toLowerCase();
