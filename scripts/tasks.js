@@ -153,6 +153,7 @@ const DEFAULTS = {
     pollMinutes: 2,
     maxCreatePerRun: 5,
     minTextChars: 6,
+    excludeProgressChecks: true,
     labels: ['auto-intake', 'main-directive'],
     defaultState: 'Triage',
     defaultPriority: 3,
@@ -3184,7 +3185,7 @@ async function cmdDiscordIntakeSync(settings, flags) {
       skipped.push({ messageId, reason: 'text-too-short' });
       continue;
     }
-    if (!looksLikeTaskDirective(content)) {
+    if (!looksLikeTaskDirective(content, settings.discordIntake || {})) {
       state.items[sourceId] = tsMs || Date.now();
       skipped.push({ messageId, reason: 'not-task-directive' });
       continue;
@@ -6976,7 +6977,7 @@ function resolveDiscordIntakeChannelId(settings, flags) {
   return '';
 }
 
-function looksLikeTaskDirective(text) {
+function looksLikeTaskDirective(text, options = {}) {
   const normalized = singleLine(String(text || '').trim());
   if (!normalized) {
     return false;
@@ -6990,9 +6991,23 @@ function looksLikeTaskDirective(text) {
     return false;
   }
 
+  const excludeProgressChecks = options && options.excludeProgressChecks !== false;
+  if (excludeProgressChecks) {
+    const progressOnlyPattern =
+      /(完成了吗|全部完成了吗|完成的如何|情况如何|现在在做哪块|还需要开发|你.*系统.*完成了吗|是否全部完成|任务完成多少|什么时候完成|现在卡在哪|进展如何|还有没有任务没有完成)/i;
+    if (progressOnlyPattern.test(normalized)) {
+      return false;
+    }
+  }
+
   const actionPattern =
     /(帮我|请|麻烦|需要|安排|处理|修复|实现|配置|部署|排查|检查|优化|自动化|创建|推进|执行|继续|完成|落地|同步|对接|搭建|setup|set up|implement|fix|build|deploy|configure|investigate|automate|create)/i;
   if (!actionPattern.test(normalized)) {
+    return false;
+  }
+
+  const genericMetaPattern = /^(请|帮我|麻烦|需要)?\s*(继续|完成|推进|处理)(一下|下)?\s*$/i;
+  if (genericMetaPattern.test(normalized)) {
     return false;
   }
 
