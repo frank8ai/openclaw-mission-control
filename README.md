@@ -30,6 +30,7 @@ Tracking page for ongoing OpenClaw development projects:
 - `tasks report`: runtime health report with Top 5 anomalies + human actions
 - `tasks briefing`: daily/weekly briefing template (report + cycle + SLA watch), optional send
 - `tasks watchdog`: incident loop for cron failures/timeout/silence, with optional Linear auto issue creation
+- `tasks workspace-guard`: detect and auto-repair `~/.openclaw/openclaw.json` main workspace drift (for example `/tmp/empty-workspace`)
 - `tasks triage`: external input to Linear Triage issue
 - `tasks remind`: due-soon + current-cycle reminders
 - `tasks ingest-server`: webhook intake (`/triage` + `/discord/message`) + GitHub PR state sync (`/github/pr`)
@@ -59,8 +60,8 @@ Tracking page for ongoing OpenClaw development projects:
 - `tasks run|enable|disable|kill`: control actions with one-time confirmation token
 - `tasks approve`: one-time approval token for high-risk write actions (`run/enable/disable/kill/trigger/autopr/runbook-exec`)
 - `tasks schedule`: generate/install crontab with mode switch:
-  - `minimal` (default): `discord-intake-sync` + `queue-drain` + execution loop (`linear-autopilot` by default, configurable to `linear-engine`)
-  - `full`: report/watchdog/github/todoist/calendar/status/sla + reminders/briefing + minimal loop
+  - `minimal` (default): `discord-intake-sync` + `queue-drain` + `workspace-guard` + execution loop (`linear-autopilot` by default, configurable to `linear-engine`)
+  - `full`: report/watchdog/github/todoist/calendar/status/sla + reminders/briefing + minimal loop (includes `workspace-guard`)
 
 ## Quick start
 
@@ -149,6 +150,9 @@ npm run tasks -- watchdog
 
 # Watchdog + auto-create Linear issues
 npm run tasks -- watchdog --auto-linear
+
+# Guard main workspace pointer in ~/.openclaw/openclaw.json
+npm run tasks -- workspace-guard --json
 
 # One-line intake -> Linear Triage
 npm run tasks -- triage --title "Fix Discord manual model switch" --source discord --labels needs-spec
@@ -638,6 +642,7 @@ Fields:
 - `report.channel` / `report.target`
 - `control.killWhitelist`
 - `watchdog.*`
+- `workspaceGuard.*`
 - `linear.*`
 - `ingest.*`
 - `reminders.*`

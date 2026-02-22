@@ -67,6 +67,15 @@ const DEFAULTS = {
     subagentLongRunMinutes: 120,
     contextHotThreshold: 0.85,
   },
+  workspaceGuard: {
+    enabled: true,
+    pollMinutes: 5,
+    expectedMainWorkspace:
+      process.env.CONTROL_CENTER_MAIN_WORKSPACE ||
+      path.join(process.env.OPENCLAW_STATE_DIR || path.join(os.homedir(), '.openclaw'), 'workspace'),
+    autoRepair: true,
+    backupOnRepair: true,
+  },
   control: {
     confirmTtlMinutes: 10,
     approvalTtlMinutes: 30,
@@ -78,6 +87,7 @@ const DEFAULTS = {
       'calendar-sync',
       'discord-intake-sync',
       'watchdog',
+      'workspace-guard',
       'report',
       'briefing',
       'remind',
@@ -328,6 +338,7 @@ Read commands:
   report [--json] [--send]     Build health report (Top 5 anomalies + manual actions)
   briefing [daily|weekly]      Build daily/weekly briefing template and optional send
   watchdog [--auto-linear]     Detect incidents and optionally auto-create Linear issues
+  workspace-guard [--json]     Detect/repair main agent workspace drift (e.g. /tmp/empty-workspace)
   remind [due|cycle|all]       Send reminders from Linear (due soon/current cycle)
   status-sync [--json]         Auto state machine + comment trail for linked runtime issues
   queue-drain [--json]         Retry ingest queue and move failed payloads to DLQ
@@ -370,8 +381,8 @@ Write commands (require one-time confirmation):
 Scheduling:
   schedule [--apply] [--mode full|minimal] [--execution-loop autopilot|engine] [--engine-max-steps N] [--agent AGENT|auto] [--channel CH] [--target TGT]
     Prepare (or install) crontab block:
-    - mode=full: report + watchdog + sync/governance + queue drain + execution loop + reminders/briefing
-    - mode=minimal: discord-intake-sync + queue-drain + execution loop (autopilot by default)
+    - mode=full: report + watchdog + workspace-guard + sync/governance + queue drain + execution loop + reminders/briefing
+    - mode=minimal: discord-intake-sync + queue-drain + workspace-guard + execution loop (autopilot by default)
 
 Examples:
   npm run tasks -- triage --title "Fix Discord manual model switch" --source discord --source-id discord:msg:123
@@ -425,6 +436,11 @@ async function main() {
         return;
       case 'watchdog':
         await cmdWatchdog(settings, flags);
+        return;
+      case 'workspace-guard':
+      case 'workspace-guard-check':
+      case 'guard':
+        await cmdWorkspaceGuard(settings, flags);
         return;
       case 'triage':
         await cmdTriage(settings, flags);
@@ -1106,6 +1122,124 @@ async function cmdWatchdog(settings, flags) {
   process.stdout.write(`${lines.join('\n')}\n`);
 }
 
+async function cmdWorkspaceGuard(settings, flags) {
+  const configPath = path.join(settings.openclawHome, 'openclaw.json');
+  if (!fs.existsSync(configPath)) {
+    throw new Error(`openclaw config not found: ${configPath}`);
+  }
+
+  const expectedWorkspace = path.resolve(
+    String(
+      flags['expected-workspace'] ||
+        flags.expectedWorkspace ||
+        (settings.workspaceGuard && settings.workspaceGuard.expectedMainWorkspace) ||
+        path.join(settings.openclawHome, 'workspace'),
+    ).trim(),
+  );
+  const autoRepair =
+    flags['auto-repair'] !== undefined
+      ? isTruthyLike(flags['auto-repair'])
+      : Boolean(settings.workspaceGuard && settings.workspaceGuard.autoRepair !== false);
+  const backupOnRepair =
+    flags['backup-on-repair'] !== undefined
+      ? isTruthyLike(flags['backup-on-repair'])
+      : Boolean(settings.workspaceGuard && settings.workspaceGuard.backupOnRepair !== false);
+  const dryRun = Boolean(flags['dry-run']);
+
+  let payload = {};
+  try {
+    payload = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch (error) {
+    throw new Error(`invalid JSON at ${configPath}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  if (!payload || typeof payload !== 'object') {
+    throw new Error(`invalid openclaw config structure at ${configPath}`);
+  }
+
+  const agents = payload.agents && typeof payload.agents === 'object' ? payload.agents : {};
+  const list = Array.isArray(agents.list) ? agents.list : [];
+  const mainIndex = list.findIndex((item) => item && (item.id === 'main' || item.default === true));
+  if (mainIndex < 0) {
+    throw new Error('workspace-guard: main agent entry not found in agents.list');
+  }
+
+  const mainAgent = list[mainIndex] && typeof list[mainIndex] === 'object' ? list[mainIndex] : {};
+  const currentWorkspaceRaw = String(mainAgent.workspace || '').trim();
+  const currentWorkspace = currentWorkspaceRaw ? path.resolve(currentWorkspaceRaw) : '';
+  const drift = !currentWorkspace || currentWorkspace !== expectedWorkspace;
+  const expectedExists = fs.existsSync(expectedWorkspace);
+
+  let repaired = false;
+  let changed = false;
+  let backupPath = '';
+
+  if (drift && autoRepair && !dryRun) {
+    if (!expectedExists) {
+      throw new Error(`workspace-guard expected workspace does not exist: ${expectedWorkspace}`);
+    }
+
+    if (backupOnRepair) {
+      const stamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
+      backupPath = `${configPath}.bak.${stamp}.workspace-guard`;
+      fs.copyFileSync(configPath, backupPath);
+    }
+
+    mainAgent.workspace = expectedWorkspace;
+    list[mainIndex] = mainAgent;
+    payload.agents = {
+      ...agents,
+      list,
+    };
+    fs.writeFileSync(configPath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+    repaired = true;
+    changed = true;
+  }
+
+  const auditDetail = {
+    configPath,
+    mainAgentId: String(mainAgent.id || 'main'),
+    expectedWorkspace,
+    expectedExists,
+    currentWorkspace: currentWorkspace || '',
+    drift,
+    autoRepair,
+    dryRun,
+    repaired,
+    changed,
+    backupPath,
+  };
+  const audit = appendAuditEvent(
+    drift ? (repaired ? 'workspace-guard-repair' : 'workspace-guard-drift') : 'workspace-guard-ok',
+    auditDetail,
+  );
+
+  const result = {
+    ok: true,
+    ...auditDetail,
+    auditId: audit.auditId,
+  };
+
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+
+  const lines = [];
+  lines.push('Workspace guard result:');
+  lines.push(`- config: ${configPath}`);
+  lines.push(`- main workspace: ${currentWorkspace || '(empty)'}`);
+  lines.push(`- expected workspace: ${expectedWorkspace}`);
+  lines.push(`- drift: ${drift ? 'yes' : 'no'}`);
+  lines.push(`- repaired: ${repaired ? 'yes' : 'no'}`);
+  lines.push(`- expected exists: ${expectedExists ? 'yes' : 'no'}`);
+  if (backupPath) {
+    lines.push(`- backup: ${backupPath}`);
+  }
+  lines.push(`- audit id: ${audit.auditId}`);
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
 async function cmdConfirm(settings) {
   const ttlMinutes = Number(settings.control.confirmTtlMinutes || 10);
   const confirmations = readJsonFile(CONFIRMATIONS_PATH, { version: 1, tokens: [] });
@@ -1233,7 +1367,7 @@ async function cmdTrigger(settings, flags) {
   const jobId = normalizeTriggerJobId(flags._[0] || flags.job || '');
   if (!jobId) {
     throw new Error(
-      'trigger requires a job id. Allowed: github-sync,todoist-sync,calendar-sync,discord-intake-sync,watchdog,report,briefing,remind,status-sync,queue-drain,sla-check,linear-autopilot,linear-engine',
+      'trigger requires a job id. Allowed: github-sync,todoist-sync,calendar-sync,discord-intake-sync,watchdog,workspace-guard,report,briefing,remind,status-sync,queue-drain,sla-check,linear-autopilot,linear-engine',
     );
   }
 
@@ -1672,6 +1806,7 @@ async function cmdSchedule(settings, flags) {
   const statusSyncLog = path.join(DATA_DIR, 'status-sync-cron.log');
   const queueDrainLog = path.join(DATA_DIR, 'queue-drain-cron.log');
   const slaCheckLog = path.join(DATA_DIR, 'sla-check-cron.log');
+  const workspaceGuardLog = path.join(DATA_DIR, 'workspace-guard-cron.log');
   const linearExecutionLog = path.join(DATA_DIR, `${executionLoop}-cron.log`);
   const watchdogInterval = Number(flags['watchdog-interval'] || 5);
   const githubPollMinutes = Number(flags['github-poll-minutes'] || settings.github.pollIntervalMinutes || 15);
@@ -1686,6 +1821,9 @@ async function cmdSchedule(settings, flags) {
   const queueDrainMinutes = Number(
     flags['queue-drain-minutes'] || settings.intakeQueue.pollMinutes || 2,
   );
+  const workspaceGuardMinutes = Number(
+    flags['workspace-guard-minutes'] || (settings.workspaceGuard && settings.workspaceGuard.pollMinutes) || 5,
+  );
   const slaPollMinutes = Number(flags['sla-poll-minutes'] || settings.sla.pollMinutes || 30);
   const executionPollMinutes = Number(
     flags['execution-poll-minutes'] || settings.execution.pollMinutes || 15,
@@ -1699,6 +1837,8 @@ async function cmdSchedule(settings, flags) {
     minimalMode || settings.statusMachine.enabled === false ? '' : cronEveryMinutesExpr(statusSyncMinutes);
   const queueDrainExpr =
     settings.intakeQueue.enabled === false ? '' : cronEveryMinutesExpr(queueDrainMinutes);
+  const workspaceGuardExpr =
+    settings.workspaceGuard && settings.workspaceGuard.enabled === false ? '' : cronEveryMinutesExpr(workspaceGuardMinutes);
   const slaExpr = minimalMode || settings.sla.enabled === false ? '' : cronEveryMinutesExpr(slaPollMinutes);
   const linearExecutionExpr =
     settings.execution.enabled === false ? '' : cronEveryMinutesExpr(executionPollMinutes);
@@ -1722,6 +1862,7 @@ async function cmdSchedule(settings, flags) {
   }
   const statusSyncParts = [nodeBin, scriptPath, 'status-sync'];
   const queueDrainParts = [nodeBin, scriptPath, 'queue-drain'];
+  const workspaceGuardParts = [nodeBin, scriptPath, 'workspace-guard'];
   const slaCheckParts = [nodeBin, scriptPath, 'sla-check'];
   const linearExecutionParts = [nodeBin, scriptPath, executionLoop];
   if (executionLoop === 'linear-engine') {
@@ -1822,6 +1963,11 @@ async function cmdSchedule(settings, flags) {
     ...(queueDrainExpr
       ? [
           `${queueDrainExpr} cd ${shellQuote(ROOT_DIR)} && ${joinShell(queueDrainParts)} >> ${shellQuote(queueDrainLog)} 2>&1`,
+        ]
+      : []),
+    ...(workspaceGuardExpr
+      ? [
+          `${workspaceGuardExpr} cd ${shellQuote(ROOT_DIR)} && ${joinShell(workspaceGuardParts)} >> ${shellQuote(workspaceGuardLog)} 2>&1`,
         ]
       : []),
     ...(slaExpr
@@ -9963,6 +10109,10 @@ function normalizeTriggerJobId(value) {
     gcal: 'calendar-sync',
     intake: 'discord-intake-sync',
     'discord-intake': 'discord-intake-sync',
+    guard: 'workspace-guard',
+    workspace: 'workspace-guard',
+    workspaceguard: 'workspace-guard',
+    'workspace-guard': 'workspace-guard',
     autopilot: 'linear-autopilot',
     execution: 'linear-autopilot',
     'execution-loop': 'linear-autopilot',
@@ -10028,6 +10178,18 @@ function buildTriggerChildArgs(jobId, settings, flags) {
       args.push('watchdog', '--json');
       if (flags['auto-linear'] || settings.linear.enabled !== false) {
         args.push('--auto-linear');
+      }
+      break;
+    case 'workspace-guard':
+      args.push('workspace-guard', '--json');
+      if (flags['expected-workspace']) {
+        args.push('--expected-workspace', String(flags['expected-workspace']));
+      }
+      if (flags['dry-run']) {
+        args.push('--dry-run');
+      }
+      if (flags['auto-repair'] !== undefined) {
+        args.push('--auto-repair', String(flags['auto-repair']));
       }
       break;
     case 'report':

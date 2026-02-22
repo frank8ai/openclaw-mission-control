@@ -13,6 +13,13 @@
     "subagentLongRunMinutes": 120,
     "contextHotThreshold": 0.85
   },
+  "workspaceGuard": {
+    "enabled": true,
+    "pollMinutes": 5,
+    "expectedMainWorkspace": "/Users/yizhi/.openclaw/workspace",
+    "autoRepair": true,
+    "backupOnRepair": true
+  },
   "control": {
     "confirmTtlMinutes": 10,
     "approvalTtlMinutes": 30,
@@ -33,6 +40,7 @@
       "todoist-sync",
       "calendar-sync",
       "watchdog",
+      "workspace-guard",
       "report",
       "briefing",
       "remind",

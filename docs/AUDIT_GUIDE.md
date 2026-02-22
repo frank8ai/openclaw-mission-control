@@ -48,6 +48,7 @@ High-value files:
 - Minimal loop (default):
   - `discord-intake-sync`
   - `queue-drain`
+  - `workspace-guard`
   - execution loop (`linear-autopilot` or `linear-engine`)
 - Full loop:
   - Includes report/watchdog/github/todoist/calendar/status/sla/reminders/briefing in addition to minimal loop.
@@ -74,6 +75,12 @@ Run one autopilot step against any runnable issue:
 
 ```bash
 npm run tasks -- linear-autopilot --json
+```
+
+Run workspace guard once (detect and auto-repair main workspace drift):
+
+```bash
+npm run tasks -- workspace-guard --json
 ```
 
 Force a specific issue:
