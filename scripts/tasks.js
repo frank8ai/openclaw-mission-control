@@ -344,6 +344,7 @@ Integrations:
   calendar-sync                Sync Google Calendar events snapshot (browser logged-in tab)
   discord-intake-sync          Auto ingest main Discord directives into Linear Triage
   linear-autopilot             Pick one runnable Linear issue and execute one next step via main agent
+  linear-engine                Multi-step execution engine for one issue (until done/blocked/max-steps)
 
 Write commands (require one-time confirmation):
   confirm                      Generate one-time confirmation code
@@ -370,6 +371,7 @@ Examples:
   npm run tasks -- sla-check
   npm run tasks -- linear-autopilot --json
   npm run tasks -- linear-autopilot --issue CLAW-128 --json
+  npm run tasks -- linear-engine --issue CLAW-128 --max-steps 5 --json
   npm run tasks -- briefing daily --send
   npm run tasks -- discord-intake-sync --channel 1468117725040742527
   npm run tasks -- trigger github-sync --confirm "CONFIRM ABC123"
@@ -511,6 +513,11 @@ async function main() {
       case 'execution-loop':
       case 'autopilot':
         await cmdLinearAutopilot(settings, flags);
+        return;
+      case 'linear-engine':
+      case 'execution-engine':
+      case 'autopilot-engine':
+        await cmdLinearEngine(settings, flags);
         return;
       case 'confirm':
         await cmdConfirm(settings, flags);
@@ -4023,6 +4030,166 @@ async function cmdLinearAutopilot(settings, flags) {
 
   if (agentError && strictFailure) {
     throw new Error(`linear-autopilot agent run failed: ${agentError}`);
+  }
+}
+
+async function cmdLinearEngine(settings, flags) {
+  const issueIdentifier = normalizeLinearIssueId(
+    flags.issue || flags['issue-id'] || flags.identifier || '',
+  );
+  if (!issueIdentifier) {
+    throw new Error('linear-engine requires --issue CLAW-123.');
+  }
+
+  const maxSteps = Math.max(1, Number(flags['max-steps'] || flags.steps || 5));
+  const stepSleepMs = Math.max(0, Number(flags['step-sleep-ms'] || 0));
+  const noProgressThreshold = Math.max(
+    2,
+    Number(flags['no-progress-threshold'] || 2),
+  );
+  const strictFailure = isTruthyLike(flags.strict);
+  const timeoutSeconds = Math.max(
+    60,
+    Number(flags['timeout-seconds'] || (settings.execution && settings.execution.timeoutSeconds) || 900),
+  );
+  const perStepTimeoutMs = Math.max(90_000, Math.ceil(timeoutSeconds * 1000 * 1.3));
+
+  const runs = [];
+  let stopReason = 'max-steps';
+  let previousFingerprint = '';
+  let consecutiveSameFingerprint = 0;
+
+  for (let step = 1; step <= maxSteps; step += 1) {
+    const childArgs = ['linear-autopilot', '--issue', issueIdentifier, '--json'];
+    if (isTruthyLike(flags.force)) {
+      childArgs.push('--force');
+    }
+    if (isTruthyLike(flags.trace)) {
+      childArgs.push('--trace');
+    }
+    if (flags.agent) {
+      childArgs.push('--agent', String(flags.agent));
+    }
+    if (flags['max-prompt-chars']) {
+      childArgs.push('--max-prompt-chars', String(flags['max-prompt-chars']));
+    }
+    if (flags['timeout-seconds']) {
+      childArgs.push('--timeout-seconds', String(flags['timeout-seconds']));
+    }
+    if (flags['agent-retries']) {
+      childArgs.push('--agent-retries', String(flags['agent-retries']));
+    }
+    if (flags['retry-backoff-seconds']) {
+      childArgs.push('--retry-backoff-seconds', String(flags['retry-backoff-seconds']));
+    }
+
+    let payload = null;
+    let commandError = '';
+    try {
+      const output = runCommand(
+        process.execPath,
+        [path.join(ROOT_DIR, 'scripts', 'tasks.js'), ...childArgs],
+        {
+          timeoutMs: perStepTimeoutMs,
+          label: `linear-engine step ${step}`,
+        },
+      );
+      payload = extractJson(output.stdout || '');
+    } catch (error) {
+      commandError = error instanceof Error ? error.message : String(error);
+    }
+
+    const stepRun = {
+      step,
+      atMs: Date.now(),
+      ok: payload ? payload.ok !== false : false,
+      skipped: payload ? Boolean(payload.skipped) : false,
+      reason: payload ? String(payload.reason || '') : '',
+      status: payload ? String(payload.status || '') : '',
+      runId: payload ? String(payload.runId || '') : '',
+      nextState: payload ? String(payload.nextState || '') : '',
+      transitionStatus:
+        payload && payload.transition && payload.transition.status
+          ? String(payload.transition.status)
+          : '',
+      summary: payload ? singleLine(trimMessage(String(payload.summary || ''), 240)) : '',
+      error: commandError || (payload ? String(payload.error || payload.commentError || '') : ''),
+      agentUsed: payload ? String(payload.agentUsed || payload.agentId || '') : '',
+    };
+    runs.push(stepRun);
+
+    if (stepRun.error) {
+      stopReason = 'error';
+      break;
+    }
+    if (stepRun.skipped) {
+      stopReason = `skipped:${stepRun.reason || 'unknown'}`;
+      break;
+    }
+
+    const normalizedStatus = String(stepRun.status || '').trim().toLowerCase();
+    if (normalizedStatus === 'done' || normalizedStatus === 'blocked') {
+      stopReason = `status:${normalizedStatus}`;
+      break;
+    }
+
+    const fingerprint = [
+      normalizedStatus || '-',
+      String(stepRun.nextState || '-').toLowerCase(),
+      String(stepRun.transitionStatus || '-').toLowerCase(),
+      String(stepRun.summary || '-').toLowerCase(),
+    ].join('|');
+    if (fingerprint === previousFingerprint) {
+      consecutiveSameFingerprint += 1;
+    } else {
+      consecutiveSameFingerprint = 1;
+      previousFingerprint = fingerprint;
+    }
+    if (consecutiveSameFingerprint >= noProgressThreshold) {
+      stopReason = 'no-progress';
+      break;
+    }
+
+    if (step < maxSteps && stepSleepMs > 0) {
+      await sleepMs(stepSleepMs);
+    }
+  }
+
+  const finalRun = runs.length > 0 ? runs[runs.length - 1] : null;
+  const hasError = runs.some((item) => String(item.error || '').trim().length > 0);
+  const result = {
+    ok: !hasError,
+    issueIdentifier,
+    stepsPlanned: maxSteps,
+    stepsExecuted: runs.length,
+    stopReason,
+    finalStatus: finalRun ? finalRun.status : '',
+    finalNextState: finalRun ? finalRun.nextState : '',
+    finalRunId: finalRun ? finalRun.runId : '',
+    runs,
+  };
+
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  } else {
+    const lines = [];
+    lines.push('Linear engine result:');
+    lines.push(`- issue: ${issueIdentifier}`);
+    lines.push(`- steps: ${result.stepsExecuted}/${result.stepsPlanned}`);
+    lines.push(`- stop reason: ${result.stopReason}`);
+    lines.push(`- final status: ${result.finalStatus || '-'}`);
+    lines.push(`- final next state: ${result.finalNextState || '-'}`);
+    if (result.finalRunId) {
+      lines.push(`- final run id: ${result.finalRunId}`);
+    }
+    if (hasError && finalRun && finalRun.error) {
+      lines.push(`- error: ${singleLine(trimMessage(finalRun.error, 320))}`);
+    }
+    process.stdout.write(`${lines.join('\n')}\n`);
+  }
+
+  if (strictFailure && hasError) {
+    throw new Error(`linear-engine failed: ${finalRun ? finalRun.error : 'unknown error'}`);
   }
 }
 
@@ -9516,6 +9683,9 @@ function normalizeTriggerJobId(value) {
     autopilot: 'linear-autopilot',
     execution: 'linear-autopilot',
     'execution-loop': 'linear-autopilot',
+    engine: 'linear-engine',
+    'execution-engine': 'linear-engine',
+    'autopilot-engine': 'linear-engine',
     reminder: 'remind',
     brief: 'briefing',
     'briefing-daily': 'briefing',

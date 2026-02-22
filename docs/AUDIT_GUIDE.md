@@ -80,6 +80,12 @@ Force a specific issue:
 npm run tasks -- linear-autopilot --issue CLAW-128 --json
 ```
 
+Run a bounded multi-step execution loop for one issue:
+
+```bash
+npm run tasks -- linear-engine --issue CLAW-128 --max-steps 5 --json
+```
+
 Key acceptance checks:
 
 ```bash

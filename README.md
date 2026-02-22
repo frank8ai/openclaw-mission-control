@@ -51,6 +51,7 @@ Tracking page for ongoing OpenClaw development projects:
 - `tasks audit-rollback`: rollback auditable local JSON writes by audit id
 - `tasks sla-check`: stale issue SLA check (Blocked/In Progress) with owner mention + escalation issue
 - `tasks linear-autopilot`: pull one runnable Linear issue and let configured execution agent execute exactly one next step, then auto comment/state update (supports `--issue CLAW-123`)
+- `tasks linear-engine`: run multiple `linear-autopilot` steps for one issue until `done/blocked/max-steps`
 - `tasks eval-replay`: export replay artifact for eval/distillation workflow
 - `tasks runbook-exec`: run SOP runbook cards in dry-run or guarded execute mode
 - `tasks trigger`: one-click run for sync/report/watchdog jobs with confirmation token
@@ -219,6 +220,9 @@ npm run tasks -- linear-autopilot
 
 # Execute one specific Linear issue step
 npm run tasks -- linear-autopilot --issue CLAW-128 --json
+
+# Execute multiple steps for one specific issue
+npm run tasks -- linear-engine --issue CLAW-128 --max-steps 5 --json
 
 # Backfill around a specific Discord message id (one-time import of historical directives)
 npm run tasks -- discord-intake-sync --around <MESSAGE_ID> --backfill --limit 60
