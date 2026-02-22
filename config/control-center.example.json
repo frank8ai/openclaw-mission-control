@@ -242,6 +242,13 @@
     "enabled": true,
     "pollMinutes": 5,
     "agentId": "main",
+    "agentPreferred": [
+      "codex",
+      "coder",
+      "main"
+    ],
+    "agentAllowlist": [],
+    "agentDenylist": [],
     "timeoutSeconds": 900,
     "includeStates": [
       "In Progress",

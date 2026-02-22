@@ -58,6 +58,7 @@ Apply mode:
 cd /Users/yizhi/.openclaw/workspace/mission-control
 npm run tasks -- schedule --apply --mode minimal
 npm run tasks -- schedule --apply --mode full
+npm run tasks -- schedule --apply --mode minimal --agent auto
 ```
 
 Inspect installed block:
@@ -78,6 +79,12 @@ Force a specific issue:
 
 ```bash
 npm run tasks -- linear-autopilot --issue CLAW-128 --json
+```
+
+Force auto agent selector (round-robin over available agents):
+
+```bash
+npm run tasks -- linear-autopilot --issue CLAW-128 --agent auto --json
 ```
 
 Run a bounded multi-step execution loop for one issue:

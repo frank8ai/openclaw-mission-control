@@ -42,6 +42,7 @@ const DISCORD_INTAKE_STATE_PATH = path.join(DATA_DIR, 'discord-intake-state.json
 const LINEAR_AUTOPILOT_PATH = path.join(DATA_DIR, 'linear-autopilot.json');
 const LINEAR_AUTOPILOT_LOCK_PATH = path.join(DATA_DIR, 'linear-autopilot.lock.json');
 const LINEAR_AUTOPILOT_CIRCUIT_PATH = path.join(DATA_DIR, 'linear-autopilot-circuit.json');
+const LINEAR_AUTOPILOT_AGENT_CURSOR_PATH = path.join(DATA_DIR, 'linear-autopilot-agent-cursor.json');
 let OPENCLAW_AGENT_IDS_CACHE = {
   loadedAtMs: 0,
   ids: null,
@@ -84,6 +85,7 @@ const DEFAULTS = {
       'queue-drain',
       'sla-check',
       'linear-autopilot',
+      'linear-engine',
     ],
   },
   linear: {
@@ -343,7 +345,7 @@ Integrations:
   todoist-backsync             Mark Todoist tasks complete when linked Linear issues are Done
   calendar-sync                Sync Google Calendar events snapshot (browser logged-in tab)
   discord-intake-sync          Auto ingest main Discord directives into Linear Triage
-  linear-autopilot             Pick one runnable Linear issue and execute one next step via main agent
+  linear-autopilot             Pick one runnable Linear issue and execute one next step via configured execution agent
   linear-engine                Multi-step execution engine for one issue (until done/blocked/max-steps)
 
 Write commands (require one-time confirmation):
@@ -358,7 +360,7 @@ Write commands (require one-time confirmation):
   runbook-exec --card CARD [--issue CLAW-123] [--cron-id ID] --confirm CODE [--execute]
 
 Scheduling:
-  schedule [--apply] [--mode full|minimal] [--channel CH] [--target TGT]
+  schedule [--apply] [--mode full|minimal] [--agent AGENT|auto] [--channel CH] [--target TGT]
     Prepare (or install) crontab block:
     - mode=full: report + watchdog + sync/governance + queue drain + linear-autopilot + reminders/briefing
     - mode=minimal: discord-intake-sync + queue-drain + linear-autopilot
@@ -371,6 +373,7 @@ Examples:
   npm run tasks -- sla-check
   npm run tasks -- linear-autopilot --json
   npm run tasks -- linear-autopilot --issue CLAW-128 --json
+  npm run tasks -- linear-autopilot --issue CLAW-128 --agent auto --json
   npm run tasks -- linear-engine --issue CLAW-128 --max-steps 5 --json
   npm run tasks -- briefing daily --send
   npm run tasks -- discord-intake-sync --channel 1468117725040742527
@@ -1221,7 +1224,7 @@ async function cmdTrigger(settings, flags) {
   const jobId = normalizeTriggerJobId(flags._[0] || flags.job || '');
   if (!jobId) {
     throw new Error(
-      'trigger requires a job id. Allowed: github-sync,todoist-sync,calendar-sync,discord-intake-sync,watchdog,report,briefing,remind,status-sync,queue-drain,sla-check,linear-autopilot',
+      'trigger requires a job id. Allowed: github-sync,todoist-sync,calendar-sync,discord-intake-sync,watchdog,report,briefing,remind,status-sync,queue-drain,sla-check,linear-autopilot,linear-engine',
     );
   }
 
@@ -1705,6 +1708,10 @@ async function cmdSchedule(settings, flags) {
   const queueDrainParts = [nodeBin, scriptPath, 'queue-drain'];
   const slaCheckParts = [nodeBin, scriptPath, 'sla-check'];
   const linearAutopilotParts = [nodeBin, scriptPath, 'linear-autopilot'];
+  const executionAgentOverride = String(flags.agent || '').trim();
+  if (executionAgentOverride) {
+    linearAutopilotParts.push('--agent', executionAgentOverride);
+  }
   const remindDueParts = [nodeBin, scriptPath, 'remind', 'due'];
   const remindCycleParts = [nodeBin, scriptPath, 'remind', 'cycle'];
   const briefingDailyParts = [nodeBin, scriptPath, 'briefing', 'daily'];
@@ -3755,7 +3762,42 @@ async function cmdLinearAutopilot(settings, flags) {
     return;
   }
 
-  const agentId = String(flags.agent || (settings.execution && settings.execution.agentId) || 'main').trim();
+  const requestedAgentId = String(
+    flags.agent || (settings.execution && settings.execution.agentId) || 'main',
+  ).trim();
+  let agentId = requestedAgentId;
+  let agentSelection = {
+    mode: 'fixed',
+    requested: requestedAgentId || 'main',
+    selected: requestedAgentId || 'main',
+    candidates: [requestedAgentId || 'main'],
+  };
+  if (isAutoAgentSelector(requestedAgentId)) {
+    const dynamicCandidates = resolveAutopilotDynamicAgentCandidates(settings, flags);
+    const selected = pickRoundRobinAutopilotAgent(dynamicCandidates);
+    if (!selected) {
+      const skipped = {
+        ok: true,
+        skipped: true,
+        reason: 'no-agent-candidate',
+        requestedAgentId,
+        candidates: dynamicCandidates,
+      };
+      if (flags.json) {
+        process.stdout.write(`${JSON.stringify(skipped, null, 2)}\n`);
+      } else {
+        process.stdout.write('Linear autopilot skipped: no available execution agent candidates.\n');
+      }
+      return;
+    }
+    agentId = selected;
+    agentSelection = {
+      mode: 'auto-round-robin',
+      requested: requestedAgentId,
+      selected,
+      candidates: dynamicCandidates,
+    };
+  }
   const timeoutSeconds = Math.max(
     60,
     Number(flags['timeout-seconds'] || (settings.execution && settings.execution.timeoutSeconds) || 900),
@@ -3912,7 +3954,9 @@ async function cmdLinearAutopilot(settings, flags) {
     },
     runId,
     agentId,
+    requestedAgentId,
     agentUsed,
+    agentSelection,
     timeoutSeconds,
     attempts: agentAttempts,
     session: {
@@ -3968,6 +4012,7 @@ async function cmdLinearAutopilot(settings, flags) {
     runId: result.runId,
     nextState: result.nextState || '',
     transitionStatus: result.transition && result.transition.status ? result.transition.status : '',
+    requestedAgentId: result.requestedAgentId || requestedAgentId,
     agentUsed: result.agentUsed || agentId,
     commented: result.commented,
     circuitStatus: result.circuit && result.circuit.status ? result.circuit.status : 'unknown',
@@ -7407,6 +7452,84 @@ function getOpenclawAgentIds() {
   }
 }
 
+function resolveAutopilotDynamicAgentCandidates(settings, flags) {
+  const knownAgentIds = getOpenclawAgentIds();
+  let candidates = knownAgentIds && knownAgentIds.size > 0 ? Array.from(knownAgentIds) : ['main'];
+  candidates = dedupeStrings(candidates.map((item) => String(item || '').trim()).filter(Boolean));
+
+  const allowlist = new Set(
+    normalizeAgentIds(
+      flags['agent-allowlist'] ||
+        (settings.execution && settings.execution.agentAllowlist) ||
+        [],
+    ),
+  );
+  const denylist = new Set(
+    normalizeAgentIds(
+      flags['agent-denylist'] ||
+        (settings.execution && settings.execution.agentDenylist) ||
+        [],
+    ),
+  );
+
+  if (allowlist.size > 0) {
+    candidates = candidates.filter((item) => allowlist.has(item.toLowerCase()));
+  }
+  if (denylist.size > 0) {
+    candidates = candidates.filter((item) => !denylist.has(item.toLowerCase()));
+  }
+
+  const preferredRaw = normalizeAgentIds(
+    flags['agent-preferred'] ||
+      (settings.execution && settings.execution.agentPreferred) ||
+      ['codex', 'coder', 'main'],
+  );
+  const preferred = preferredRaw.map((item) => String(item || '').trim().toLowerCase());
+
+  const rank = new Map();
+  preferred.forEach((item, index) => {
+    if (!rank.has(item)) {
+      rank.set(item, index);
+    }
+  });
+
+  candidates.sort((a, b) => {
+    const ar = rank.has(a.toLowerCase()) ? rank.get(a.toLowerCase()) : Number.MAX_SAFE_INTEGER;
+    const br = rank.has(b.toLowerCase()) ? rank.get(b.toLowerCase()) : Number.MAX_SAFE_INTEGER;
+    if (ar !== br) {
+      return ar - br;
+    }
+    return a.localeCompare(b);
+  });
+  return candidates;
+}
+
+function pickRoundRobinAutopilotAgent(candidates) {
+  const list = Array.isArray(candidates) ? candidates.filter(Boolean) : [];
+  if (list.length === 0) {
+    return '';
+  }
+
+  const state = readJsonFile(LINEAR_AUTOPILOT_AGENT_CURSOR_PATH, {
+    version: 1,
+    index: 0,
+    updatedAtMs: 0,
+    lastSelected: '',
+  });
+  const rawIndex = Number(state.index || 0);
+  const index = Number.isFinite(rawIndex) ? Math.max(0, rawIndex) % list.length : 0;
+  const selected = list[index];
+  const nextIndex = (index + 1) % list.length;
+  writeJsonFile(LINEAR_AUTOPILOT_AGENT_CURSOR_PATH, {
+    version: 1,
+    index: nextIndex,
+    updatedAtMs: Date.now(),
+    lastSelected: selected,
+    candidates: list,
+  });
+  return selected;
+}
+
 function extractAgentRuntimeMeta(agentPayload) {
   const meta = agentPayload && agentPayload.result && agentPayload.result.meta ? agentPayload.result.meta : {};
   const agentMeta = meta && meta.agentMeta ? meta.agentMeta : {};
@@ -9556,6 +9679,21 @@ function dedupeStrings(list) {
   return output;
 }
 
+function normalizeAgentIds(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || '').trim().toLowerCase()).filter(Boolean);
+  }
+  return String(value || '')
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function isAutoAgentSelector(value) {
+  const text = String(value || '').trim().toLowerCase();
+  return text === 'auto' || text === 'any' || text === '*';
+}
+
 function runOpenclawJson(args) {
   const { stdout, stderr } = runCommand('openclaw', args);
   const payload = `${stdout || ''}\n${stderr || ''}`.trim();
@@ -9766,8 +9904,26 @@ function buildTriggerChildArgs(jobId, settings, flags) {
       if (flags.all) {
         args.push('--all');
       }
+      if (flags.issue) {
+        args.push('--issue', String(flags.issue));
+      }
+      if (flags.agent) {
+        args.push('--agent', String(flags.agent));
+      }
       if (flags.labels) {
         args.push('--labels', String(flags.labels));
+      }
+      break;
+    case 'linear-engine':
+      args.push('linear-engine', '--json');
+      if (flags.issue) {
+        args.push('--issue', String(flags.issue));
+      }
+      if (flags.agent) {
+        args.push('--agent', String(flags.agent));
+      }
+      if (flags['max-steps']) {
+        args.push('--max-steps', String(flags['max-steps']));
       }
       break;
     default:

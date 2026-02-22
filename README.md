@@ -50,7 +50,7 @@ Tracking page for ongoing OpenClaw development projects:
 - `tasks state-machine-rules`: config-driven rule versions + validate/rollback
 - `tasks audit-rollback`: rollback auditable local JSON writes by audit id
 - `tasks sla-check`: stale issue SLA check (Blocked/In Progress) with owner mention + escalation issue
-- `tasks linear-autopilot`: pull one runnable Linear issue and let configured execution agent execute exactly one next step, then auto comment/state update (supports `--issue CLAW-123`)
+- `tasks linear-autopilot`: pull one runnable Linear issue and let configured execution agent execute exactly one next step, then auto comment/state update (supports `--issue CLAW-123`, `--agent <id>`, `--agent auto`)
 - `tasks linear-engine`: run multiple `linear-autopilot` steps for one issue until `done/blocked/max-steps`
 - `tasks eval-replay`: export replay artifact for eval/distillation workflow
 - `tasks runbook-exec`: run SOP runbook cards in dry-run or guarded execute mode
@@ -221,6 +221,9 @@ npm run tasks -- linear-autopilot
 # Execute one specific Linear issue step
 npm run tasks -- linear-autopilot --issue CLAW-128 --json
 
+# Execute using auto agent selector (round-robin over available agents, with optional allow/deny list in config)
+npm run tasks -- linear-autopilot --issue CLAW-128 --agent auto --json
+
 # Execute multiple steps for one specific issue
 npm run tasks -- linear-engine --issue CLAW-128 --max-steps 5 --json
 
@@ -350,6 +353,12 @@ Install full mode:
 
 ```bash
 npm run tasks -- schedule --apply --mode full
+```
+
+Install minimal mode with auto agent selector for autopilot lane:
+
+```bash
+npm run tasks -- schedule --apply --mode minimal --agent auto
 ```
 
 Install with report push target:
@@ -631,6 +640,12 @@ Fields:
 - `intakeQueue.*`
 - `sla.*`
 - `runbook.*`
+- `execution.*` (including `agentId`, `agentPreferred`, `agentAllowlist`, `agentDenylist`)
+
+`execution.agentId` behavior:
+
+- fixed agent id (for example `codex`, `coder`, `main`)
+- `auto` / `any` / `*`: round-robin across available agents (optionally constrained by allow/deny list)
 
 ## Storage files
 
