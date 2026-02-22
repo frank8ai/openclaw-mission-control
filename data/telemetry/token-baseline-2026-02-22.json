@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-02-22T19:26:21.426Z",
+  "timestamp": "2026-02-22T20:28:13.462Z",
   "scope": "baseline-control-group",
   "agents": {
     "gemini": {
@@ -7,29 +7,29 @@
       "totalTokens": 0,
       "avgTokens": 0,
       "models": [
-        "gpt-5.3-codex"
+        "gpt-5.2"
       ]
     },
     "main-autopilot": {
       "sessionCount": 1,
-      "totalTokens": 57500,
-      "avgTokens": 57500,
+      "totalTokens": 58728,
+      "avgTokens": 58728,
       "models": [
         "gpt-5.3-codex"
       ]
     },
     "coder": {
       "sessionCount": 1,
-      "totalTokens": 35297,
-      "avgTokens": 35297,
+      "totalTokens": 36550,
+      "avgTokens": 36550,
       "models": [
         "gpt-5.3-codex"
       ]
     },
     "codex": {
       "sessionCount": 1,
-      "totalTokens": 33157,
-      "avgTokens": 33157,
+      "totalTokens": 33819,
+      "avgTokens": 33819,
       "models": [
         "gpt-5.3-codex"
       ]
@@ -90,6 +90,68 @@
     },
     "blocked": {
       "count": 18
+    }
+  },
+  "jobTokens": {
+    "CLAW-165": {
+      "totalTokens": 0,
+      "sessions": [
+        {
+          "key": "agent:gemini:main",
+          "agentId": "gemini",
+          "tokens": 0
+        }
+      ]
+    },
+    "CLAW-109": {
+      "totalTokens": 95278,
+      "sessions": [
+        {
+          "key": "agent:main-autopilot:main",
+          "agentId": "main-autopilot",
+          "tokens": 58728
+        },
+        {
+          "key": "agent:coder:main",
+          "agentId": "coder",
+          "tokens": 36550
+        }
+      ]
+    },
+    "CLAW-108": {
+      "totalTokens": 93955,
+      "sessions": [
+        {
+          "key": "agent:codex:main",
+          "agentId": "codex",
+          "tokens": 33819
+        },
+        {
+          "key": "agent:writer:main",
+          "agentId": "writer",
+          "tokens": 31626
+        },
+        {
+          "key": "agent:researcher-deep:main",
+          "agentId": "researcher-deep",
+          "tokens": 28510
+        }
+      ]
+    },
+    "CLAW-123": {
+      "totalTokens": 43600,
+      "sessions": [
+        {
+          "key": "agent:researcher:main",
+          "agentId": "researcher",
+          "tokens": 24670
+        },
+        {
+          "key": "agent:openclaw-dev:main",
+          "agentId": "openclaw-dev",
+          "tokens": 18930
+        }
+      ]
     }
   },
   "meta": {

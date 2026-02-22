@@ -29,6 +29,15 @@ async function main() {
   const sessions = (status && status.sessions && status.sessions.recent) || [];
   const agentBaseline = {};
 
+  // Load issue-session links
+  const linksPath = path.join(WORKSPACE_ROOT, 'data', 'control-center', 'runtime-issue-links.json');
+  let issueLinks = { bySessionId: {}, bySessionKey: {} };
+  if (fs.existsSync(linksPath)) {
+    issueLinks = JSON.parse(fs.readFileSync(linksPath, 'utf8'));
+  }
+
+  const jobTokenBaseline = {};
+
   sessions.forEach((session) => {
     const agentId = session.agentId || 'unknown';
     if (!agentBaseline[agentId]) {
@@ -41,9 +50,27 @@ async function main() {
     }
     const currentAgent = agentBaseline[agentId];
     currentAgent.sessionCount++;
-    currentAgent.totalTokens += (session.totalTokens || 0);
+    const totalTokens = (session.totalTokens || 0);
+    currentAgent.totalTokens += totalTokens;
     if (session.model && !currentAgent.models.includes(session.model)) {
       currentAgent.models.push(session.model);
+    }
+
+    // Associate tokens with jobs
+    const issueId = issueLinks.bySessionId[session.sessionId] || issueLinks.bySessionKey[session.key];
+    if (issueId) {
+      if (!jobTokenBaseline[issueId]) {
+        jobTokenBaseline[issueId] = {
+          totalTokens: 0,
+          sessions: []
+        };
+      }
+      jobTokenBaseline[issueId].totalTokens += totalTokens;
+      jobTokenBaseline[issueId].sessions.push({
+        key: session.key,
+        agentId: session.agentId,
+        tokens: totalTokens
+      });
     }
   });
 
@@ -81,6 +108,7 @@ async function main() {
     scope: 'baseline-control-group',
     agents: agentBaseline,
     jobs: jobStats,
+    jobTokens: jobTokenBaseline,
     meta: {
       totalSessions: sessions.length,
       totalAutopilotRuns: autopilotHistory.runs.length
