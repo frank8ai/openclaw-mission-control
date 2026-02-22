@@ -1,0 +1,99 @@
+{
+  "timestamp": "2026-02-22T19:26:21.426Z",
+  "scope": "baseline-control-group",
+  "agents": {
+    "gemini": {
+      "sessionCount": 1,
+      "totalTokens": 0,
+      "avgTokens": 0,
+      "models": [
+        "gpt-5.3-codex"
+      ]
+    },
+    "main-autopilot": {
+      "sessionCount": 1,
+      "totalTokens": 57500,
+      "avgTokens": 57500,
+      "models": [
+        "gpt-5.3-codex"
+      ]
+    },
+    "coder": {
+      "sessionCount": 1,
+      "totalTokens": 35297,
+      "avgTokens": 35297,
+      "models": [
+        "gpt-5.3-codex"
+      ]
+    },
+    "codex": {
+      "sessionCount": 1,
+      "totalTokens": 33157,
+      "avgTokens": 33157,
+      "models": [
+        "gpt-5.3-codex"
+      ]
+    },
+    "writer": {
+      "sessionCount": 1,
+      "totalTokens": 31626,
+      "avgTokens": 31626,
+      "models": [
+        "gpt-5.3-codex"
+      ]
+    },
+    "researcher-deep": {
+      "sessionCount": 1,
+      "totalTokens": 28510,
+      "avgTokens": 28510,
+      "models": [
+        "gpt-5.3-codex"
+      ]
+    },
+    "researcher": {
+      "sessionCount": 1,
+      "totalTokens": 24670,
+      "avgTokens": 24670,
+      "models": [
+        "gpt-5.3-codex"
+      ]
+    },
+    "openclaw-dev": {
+      "sessionCount": 1,
+      "totalTokens": 18930,
+      "avgTokens": 18930,
+      "models": [
+        "gpt-5.3-codex"
+      ]
+    },
+    "main": {
+      "sessionCount": 2,
+      "totalTokens": 16464,
+      "avgTokens": 8232,
+      "models": [
+        "gpt-5.2"
+      ]
+    }
+  },
+  "jobs": {
+    "success": {
+      "count": 0
+    },
+    "failure": {
+      "count": 0
+    },
+    "in_progress": {
+      "count": 166
+    },
+    "done": {
+      "count": 16
+    },
+    "blocked": {
+      "count": 18
+    }
+  },
+  "meta": {
+    "totalSessions": 10,
+    "totalAutopilotRuns": 200
+  }
+}
