@@ -31,6 +31,11 @@ const SLA_STATE_PATH = path.join(DATA_DIR, 'sla-check.json');
 const RUNBOOK_EXEC_PATH = path.join(DATA_DIR, 'runbook-exec.json');
 const DISCORD_INTAKE_STATE_PATH = path.join(DATA_DIR, 'discord-intake-state.json');
 const LINEAR_AUTOPILOT_PATH = path.join(DATA_DIR, 'linear-autopilot.json');
+const LINEAR_AUTOPILOT_LOCK_PATH = path.join(DATA_DIR, 'linear-autopilot.lock.json');
+let OPENCLAW_AGENT_IDS_CACHE = {
+  loadedAtMs: 0,
+  ids: null,
+};
 
 hydrateEnvFromDotEnv();
 
@@ -251,6 +256,11 @@ const DEFAULTS = {
     pollMinutes: 5,
     agentId: 'main',
     timeoutSeconds: 900,
+    agentRetries: 2,
+    retryBackoffSeconds: 20,
+    lockTtlSeconds: 1800,
+    fallbackAgentSuffix: 'autopilot',
+    failOnError: false,
     includeStates: ['In Progress', 'Triage', 'Blocked'],
     includeLabels: ['auto-intake', 'main-directive'],
     maxPromptChars: 1400,
@@ -565,7 +575,9 @@ function loadSettings() {
 function hydrateEnvFromDotEnv() {
   const files = [
     path.join(ROOT_DIR, '.env'),
+    path.join(ROOT_DIR, '.env.local'),
     path.join(path.resolve(ROOT_DIR, '..'), '.env'),
+    path.join(path.resolve(ROOT_DIR, '..'), '.env.local'),
   ];
 
   for (const filePath of files) {
@@ -1961,6 +1973,7 @@ async function cmdStatusSync(settings, flags) {
     issueState.lastSignal = {
       activeSessions: context.activeSessions.length,
       activeSubagents: context.activeSubagents.length,
+      autopilotRecent: context.autopilotRecent.length,
       cronWarnings: context.cronWarnings.length,
       githubOpen: context.githubOpen.length,
       githubMerged: context.githubMerged.length,
@@ -1992,6 +2005,7 @@ async function cmdStatusSync(settings, flags) {
       signal: {
         activeSessions: context.activeSessions.length,
         activeSubagents: context.activeSubagents.length,
+        autopilotRecent: context.autopilotRecent.length,
         cronWarnings: context.cronWarnings.length,
         githubOpen: context.githubOpen.length,
         githubMerged: context.githubMerged.length,
@@ -3283,7 +3297,17 @@ async function cmdLinearAutopilot(settings, flags) {
     throw new Error('LINEAR_API_KEY is required for linear-autopilot.');
   }
 
+  const t0 = Date.now();
+  const traceAutopilot = Boolean(flags.trace);
+  const trace = (msg) => {
+    if (traceAutopilot) {
+      process.stderr.write(`[linear-autopilot] +${Date.now() - t0}ms ${msg}\n`);
+    }
+  };
+
+  trace('resolve team id: start');
   const teamId = settings.linear.teamId || (await resolveLinearTeamId(apiKey, settings.linear.teamKey));
+  trace(`resolve team id: done (${teamId || 'null'})`);
   if (!teamId) {
     throw new Error('Unable to resolve Linear team id for linear-autopilot.');
   }
@@ -3322,7 +3346,9 @@ async function cmdLinearAutopilot(settings, flags) {
   const historyState = readJsonFile(LINEAR_AUTOPILOT_PATH, { version: 1, updatedAtMs: 0, runs: [] });
   const historyRuns = Array.isArray(historyState.runs) ? historyState.runs : [];
 
+  trace('fetch open issues: start');
   const openIssues = await fetchOpenLinearIssuesForSla(apiKey, teamId);
+  trace(`fetch open issues: done (count=${Array.isArray(openIssues) ? openIssues.length : 0})`);
   let selection = pickLinearAutopilotCandidate(openIssues, {
     includeStates,
     includeLabels,
@@ -3374,28 +3400,108 @@ async function cmdLinearAutopilot(settings, flags) {
     60,
     Number(flags['timeout-seconds'] || (settings.execution && settings.execution.timeoutSeconds) || 900),
   );
+  const agentRetries = Math.max(
+    0,
+    Number(flags['agent-retries'] || (settings.execution && settings.execution.agentRetries) || 2),
+  );
+  const retryBackoffSeconds = Math.max(
+    1,
+    Number(
+      flags['retry-backoff-seconds'] || (settings.execution && settings.execution.retryBackoffSeconds) || 20,
+    ),
+  );
+  const lockTtlSeconds = Math.max(
+    60,
+    Number(flags['lock-ttl-seconds'] || (settings.execution && settings.execution.lockTtlSeconds) || 1800),
+  );
+  const fallbackAgentSuffix = String(
+    flags['fallback-agent-suffix'] || (settings.execution && settings.execution.fallbackAgentSuffix) || 'autopilot',
+  )
+    .trim()
+    .replace(/^[-_]+/, '');
+  const strictFailure =
+    flags.strict !== undefined
+      ? isTruthyLike(flags.strict)
+      : Boolean(settings.execution && settings.execution.failOnError === true);
+  trace(`candidate selected: ${candidate.identifier}`);
   const prompt = buildLinearAutopilotPrompt(candidate, maxPromptChars);
+  trace('build prompt: done');
+
+  const lock = acquireTaskLock(LINEAR_AUTOPILOT_LOCK_PATH, lockTtlSeconds * 1000);
+  if (!lock.acquired) {
+    const skipped = {
+      ok: true,
+      skipped: true,
+      reason: 'already-running',
+      lock: {
+        path: LINEAR_AUTOPILOT_LOCK_PATH,
+        pid: Number(lock.pid || 0),
+        ageMs: Number(lock.ageMs || 0),
+        message: String(lock.message || lock.reason || ''),
+      },
+      issue: {
+        identifier: candidate.identifier,
+      },
+      selectionStrategy: selection && selection.strategy ? selection.strategy : '',
+    };
+    if (flags.json) {
+      process.stdout.write(`${JSON.stringify(skipped, null, 2)}\n`);
+    } else {
+      const age = Number(lock.ageMs || 0) > 0 ? ` age=${formatDuration(Number(lock.ageMs || 0))}` : '';
+      process.stdout.write(
+        `Linear autopilot skipped: another run is active (pid=${lock.pid || '-'}${age}).\n`,
+      );
+    }
+    return;
+  }
 
   let agentPayload = null;
   let agentText = '';
   let agentError = '';
   let runId = '';
+  let agentUsed = agentId;
+  let agentSessionId = '';
+  let agentSessionKey = '';
+  let agentAttempts = [];
   try {
-    const output = runCommand('openclaw', [
-      'agent',
-      '--agent',
-      agentId,
-      '--message',
+    trace('openclaw agent: start');
+    const execution = await runLinearAutopilotAgent({
       prompt,
-      '--timeout',
-      String(timeoutSeconds),
-      '--json',
-    ]);
-    agentPayload = extractJson(output.stdout || '');
-    runId = String(agentPayload && agentPayload.runId ? agentPayload.runId : '').trim();
-    agentText = extractAgentText(agentPayload);
-  } catch (error) {
-    agentError = error instanceof Error ? error.message : String(error);
+      primaryAgentId: agentId,
+      timeoutSeconds,
+      retries: agentRetries,
+      retryBackoffSeconds,
+      fallbackAgentSuffix,
+      trace,
+    });
+    agentAttempts = execution.attempts || [];
+    if (!execution.ok) {
+      agentError = execution.error || 'openclaw agent run failed';
+    } else {
+      agentUsed = execution.agentId || agentId;
+      agentPayload = execution.payload || null;
+      runId = String(execution.runId || '').trim();
+      agentText = String(execution.text || '').trim();
+      agentSessionId = String(execution.sessionId || '').trim();
+      agentSessionKey = String(execution.sessionKey || '').trim();
+      const linkUpsert = upsertRuntimeIssueBindings(candidate.identifier, {
+        sessionId: agentSessionId,
+        sessionKey: agentSessionKey,
+        agentId: agentUsed,
+      });
+      if (linkUpsert.updated) {
+        appendAuditEvent('runtime-issue-link-upsert', {
+          issueIdentifier: candidate.identifier,
+          sessionId: agentSessionId,
+          sessionKey: agentSessionKey,
+          agentId: agentUsed,
+          updated: true,
+        });
+      }
+      trace('openclaw agent: done');
+    }
+  } finally {
+    releaseTaskLock(lock);
   }
 
   const parsed = parseLinearAutopilotResponse(agentText);
@@ -3407,7 +3513,9 @@ async function cmdLinearAutopilot(settings, flags) {
     settings.execution &&
     settings.execution.autoTransition !== false
   ) {
+    trace(`transition: start -> ${nextState}`);
     transition = await transitionIssueByIdentifier(candidate.identifier, nextState, settings);
+    trace(`transition: done (${transition && transition.status ? transition.status : '-'})`);
   }
 
   let commented = false;
@@ -3443,7 +3551,13 @@ async function cmdLinearAutopilot(settings, flags) {
     },
     runId,
     agentId,
+    agentUsed,
     timeoutSeconds,
+    attempts: agentAttempts,
+    session: {
+      sessionId: agentSessionId,
+      sessionKey: agentSessionKey,
+    },
     status: parsed.status || (agentError ? 'error' : 'in_progress'),
     summary: parsed.summary || singleLine(trimMessage(agentText || '', 400)),
     nextAction: parsed.nextAction || '',
@@ -3481,6 +3595,7 @@ async function cmdLinearAutopilot(settings, flags) {
     runId: result.runId,
     nextState: result.nextState || '',
     transitionStatus: result.transition && result.transition.status ? result.transition.status : '',
+    agentUsed: result.agentUsed || agentId,
     commented: result.commented,
     error: result.error || result.commentError || '',
   });
@@ -3511,7 +3626,7 @@ async function cmdLinearAutopilot(settings, flags) {
     process.stdout.write(`${lines.join('\n')}\n`);
   }
 
-  if (agentError) {
+  if (agentError && strictFailure) {
     throw new Error(`linear-autopilot agent run failed: ${agentError}`);
   }
 }
@@ -4737,6 +4852,21 @@ async function transitionIssueByIdentifier(identifier, targetStateName, settings
   }
 
   const currentState = issue.state ? String(issue.state.name || '') : '';
+  const currentStateType = issue.state ? String(issue.state.type || '').trim().toLowerCase() : '';
+  const targetStateLower = String(targetStateName || '').trim().toLowerCase();
+  const targetLooksInProgress =
+    targetStateLower === 'in progress' || targetStateLower === 'in_progress' || targetStateLower === 'doing';
+  if ((currentStateType === 'completed' || currentStateType === 'canceled') && targetLooksInProgress) {
+    return {
+      issueId: issue.id,
+      identifier: issue.identifier,
+      status: 'skipped_closed',
+      state: currentState,
+      previousState: currentState,
+      targetStateName,
+      url: issue.url,
+    };
+  }
   if (currentState.trim().toLowerCase() === String(targetStateName || '').trim().toLowerCase()) {
     return {
       issueId: issue.id,
@@ -4933,6 +5063,7 @@ async function handleGithubPullRequestEvent(eventName, payload, settings, meta =
 
 function collectLinkedIssueSignals(settings, flags) {
   const bindings = readJsonFile(ISSUE_LINKS_PATH, {});
+  const nowMs = Date.now();
   const activeWindowMinutes = Math.max(
     5,
     Number(flags['active-minutes'] || settings.statusMachine.activeWindowMinutes || 120),
@@ -4954,6 +5085,7 @@ function collectLinkedIssueSignals(settings, flags) {
         cronWarnings: [],
         githubOpen: [],
         githubMerged: [],
+        autopilotRecent: [],
       });
     }
     return byIssue.get(normalized);
@@ -4987,10 +5119,20 @@ function collectLinkedIssueSignals(settings, flags) {
   const subagents = loadSubagents(settings).filter((item) => item.isActive);
   for (const item of subagents) {
     const taskId = `subagent:${item.id}`;
-    const identifier = resolveIssueFromBindings(bindings, {
+    let identifier = resolveIssueFromBindings(bindings, {
       taskId,
       subagentId: item.id,
     });
+    if (!identifier) {
+      const inferred = inferIssueFromSubagent(item, settings);
+      if (inferred) {
+        identifier = inferred;
+        upsertRuntimeIssueBindings(inferred, {
+          subagentId: item.id,
+          taskId,
+        });
+      }
+    }
     const context = ensureContext(identifier);
     if (!context) {
       continue;
@@ -5002,6 +5144,45 @@ function collectLinkedIssueSignals(settings, flags) {
       durationMs: Number(item.durationMs || 0),
       status: item.status || '',
     });
+  }
+
+  const autopilotState = readJsonFile(LINEAR_AUTOPILOT_PATH, { runs: [] });
+  const autopilotRuns = Array.isArray(autopilotState.runs) ? autopilotState.runs : [];
+  const autopilotMaxIssues = Math.max(
+    5,
+    Number(flags['autopilot-max-issues'] || settings.statusMachine.autopilotMaxIssues || 20),
+  );
+  const autopilotIssueSet = new Set();
+  for (const run of autopilotRuns.slice(0, 120)) {
+    const identifier = normalizeLinearIssueId(run && run.issueIdentifier ? run.issueIdentifier : '');
+    if (!identifier) {
+      continue;
+    }
+    const atMs = Number(run && run.atMs ? run.atMs : 0);
+    if (!atMs || nowMs - atMs > activeWindowMs) {
+      continue;
+    }
+    const context = ensureContext(identifier);
+    if (!context) {
+      continue;
+    }
+    context.autopilotRecent.push({
+      atMs,
+      status: String(run && run.status ? run.status : '').trim().toLowerCase(),
+      ok: Boolean(run && run.ok),
+      runId: String(run && run.runId ? run.runId : '').trim(),
+      nextState: String(run && run.nextState ? run.nextState : '').trim(),
+    });
+    autopilotIssueSet.add(identifier);
+    if (autopilotIssueSet.size >= autopilotMaxIssues) {
+      break;
+    }
+  }
+  for (const context of byIssue.values()) {
+    if (Array.isArray(context.autopilotRecent) && context.autopilotRecent.length > 1) {
+      context.autopilotRecent.sort((a, b) => Number(b.atMs || 0) - Number(a.atMs || 0));
+      context.autopilotRecent = context.autopilotRecent.slice(0, 5);
+    }
   }
 
   const cronWarnings = loadCronJobs(settings).filter((job) => {
@@ -5101,6 +5282,14 @@ function decideIssueTargetState(context, settings) {
     context.reason = 'runtime-active';
     return String(settings.statusMachine.stateInProgress || 'In Progress');
   }
+  if (Array.isArray(context.autopilotRecent) && context.autopilotRecent.length > 0) {
+    const latest = context.autopilotRecent[0] || {};
+    context.reason = 'autopilot-recent';
+    if (String(latest.status || '').toLowerCase() === 'blocked') {
+      return String(settings.statusMachine.stateBlocked || 'Blocked');
+    }
+    return String(settings.statusMachine.stateInProgress || 'In Progress');
+  }
   context.reason = 'no-signal';
   return '';
 }
@@ -5148,6 +5337,49 @@ function normalizeLinearIssueId(value) {
   return `${match[1]}-${Number(match[2])}`;
 }
 
+function inferIssueFromSubagent(item, settings) {
+  const source = item && item.raw && typeof item.raw === 'object' ? item.raw : {};
+  const teamKey = String(settings && settings.linear && settings.linear.teamKey ? settings.linear.teamKey : 'CLAW')
+    .trim()
+    .toUpperCase();
+  const issuePattern = new RegExp(`\\b${escapeRegExp(teamKey)}-(\\d+)\\b`, 'i');
+
+  const explicitCandidates = [
+    source.issueIdentifier || '',
+    source.issueId || '',
+    source.linearIssue || '',
+    source.linearIssueId || '',
+  ];
+  for (const candidate of explicitCandidates) {
+    const normalized = normalizeLinearIssueId(candidate);
+    if (normalized && normalized.startsWith(`${teamKey}-`)) {
+      return normalized;
+    }
+  }
+
+  const textCandidates = [
+    item && item.label ? item.label : '',
+    item && item.id ? item.id : '',
+    source.taskId || '',
+    source.name || '',
+    source.title || '',
+  ];
+  for (const candidate of textCandidates) {
+    const text = String(candidate || '').trim();
+    if (!text) {
+      continue;
+    }
+    const inline = text.match(issuePattern);
+    if (inline && inline[0]) {
+      const normalized = normalizeLinearIssueId(inline[0]);
+      if (normalized) {
+        return normalized;
+      }
+    }
+  }
+  return '';
+}
+
 function renderStatusSyncComment(context, transition, settings) {
   const nowMs = Date.now();
   const lines = [];
@@ -5157,7 +5389,7 @@ function renderStatusSyncComment(context, transition, settings) {
   );
   lines.push(`- reason: ${context.reason}`);
   lines.push(
-    `- signals: sessions=${context.activeSessions.length}, subagents=${context.activeSubagents.length}, cronWarnings=${context.cronWarnings.length}, githubOpen=${context.githubOpen.length}, githubMerged=${context.githubMerged.length}`,
+    `- signals: sessions=${context.activeSessions.length}, subagents=${context.activeSubagents.length}, autopilotRecent=${context.autopilotRecent.length}, cronWarnings=${context.cronWarnings.length}, githubOpen=${context.githubOpen.length}, githubMerged=${context.githubMerged.length}`,
   );
 
   if (context.activeSessions.length > 0) {
@@ -5208,6 +5440,16 @@ function renderStatusSyncComment(context, transition, settings) {
     }
     for (const item of context.githubMerged.slice(0, 5)) {
       lines.push(`- merged PR: ${item.repo}#${item.prNumber} ${singleLine(item.prTitle)}`);
+    }
+  }
+
+  if (Array.isArray(context.autopilotRecent) && context.autopilotRecent.length > 0) {
+    lines.push('');
+    lines.push('#### Recent Autopilot Runs');
+    for (const item of context.autopilotRecent.slice(0, 5)) {
+      lines.push(
+        `- ${formatTime(item.atMs, settings.timezone)} status=${item.status || '-'} runId=${item.runId || '-'}`,
+      );
     }
   }
 
@@ -5952,6 +6194,282 @@ function parseLinearAutopilotResponse(text) {
   };
 }
 
+async function runLinearAutopilotAgent(options) {
+  const prompt = String(options && options.prompt ? options.prompt : '').trim();
+  const primaryAgentId = String(options && options.primaryAgentId ? options.primaryAgentId : 'main').trim();
+  const timeoutSeconds = Math.max(30, Number(options && options.timeoutSeconds ? options.timeoutSeconds : 900));
+  const retries = Math.max(0, Number(options && options.retries ? options.retries : 0));
+  const retryBackoffSeconds = Math.max(
+    1,
+    Number(options && options.retryBackoffSeconds ? options.retryBackoffSeconds : 20),
+  );
+  const fallbackAgentSuffix = String(
+    options && options.fallbackAgentSuffix ? options.fallbackAgentSuffix : 'autopilot',
+  ).trim();
+  const trace = typeof (options && options.trace) === 'function' ? options.trace : () => {};
+
+  const candidateAgents = buildAutopilotAgentCandidates(primaryAgentId, fallbackAgentSuffix);
+  const attempts = [];
+  const totalAttempts = Math.max(1, retries + 1);
+  let fallbackPreferred = false;
+
+  for (let index = 0; index < totalAttempts; index += 1) {
+    const attemptNo = index + 1;
+    const agentForAttempt = fallbackPreferred && candidateAgents.length > 1
+      ? candidateAgents[1]
+      : candidateAgents[Math.min(index, candidateAgents.length - 1)];
+
+    trace(`openclaw agent: attempt ${attemptNo}/${totalAttempts} agent=${agentForAttempt}`);
+    try {
+      const output = runCommand(
+        'openclaw',
+        [
+          'agent',
+          '--agent',
+          agentForAttempt,
+          '--message',
+          prompt,
+          '--timeout',
+          String(timeoutSeconds),
+          '--json',
+        ],
+        {
+          timeoutMs: Math.max(45_000, Math.ceil(timeoutSeconds * 1000 * 1.2)),
+          label: `openclaw agent(${agentForAttempt})`,
+        },
+      );
+      const payload = extractJson(output.stdout || '');
+      const runId = String(payload && payload.runId ? payload.runId : '').trim();
+      const text = extractAgentText(payload);
+      const meta = extractAgentRuntimeMeta(payload);
+      attempts.push({
+        attempt: attemptNo,
+        agentId: agentForAttempt,
+        ok: true,
+        runId,
+        sessionId: meta.sessionId || '',
+        sessionKey: meta.sessionKey || '',
+      });
+      return {
+        ok: true,
+        agentId: agentForAttempt,
+        payload,
+        runId,
+        text,
+        sessionId: meta.sessionId || '',
+        sessionKey: meta.sessionKey || '',
+        attempts,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const retryable = isRetryableAutopilotError(message);
+      attempts.push({
+        attempt: attemptNo,
+        agentId: agentForAttempt,
+        ok: false,
+        retryable,
+        error: singleLine(trimMessage(message, 320)),
+      });
+
+      if (message.toLowerCase().includes('session file locked')) {
+        fallbackPreferred = true;
+      }
+
+      if (!retryable || attemptNo >= totalAttempts) {
+        return {
+          ok: false,
+          error: message,
+          attempts,
+        };
+      }
+
+      const sleepForMs = retryBackoffSeconds * 1000 * attemptNo;
+      trace(`openclaw agent: retry in ${sleepForMs}ms`);
+      // Space retries to reduce collisions with rate limit/session lock windows.
+      await sleepMs(sleepForMs);
+    }
+  }
+
+  return {
+    ok: false,
+    error: 'openclaw agent run failed without usable result',
+    attempts,
+  };
+}
+
+function buildAutopilotAgentCandidates(primaryAgentId, fallbackAgentSuffix) {
+  const output = [];
+  const primary = String(primaryAgentId || '').trim() || 'main';
+  const suffix = String(fallbackAgentSuffix || '').trim().replace(/^[-_]+/, '');
+  const isolated = suffix ? `${primary}-${suffix}` : '';
+  // For the busy "main" lane, prefer an isolated lane first to avoid session lock collisions.
+  if (isolated && primary.toLowerCase() === 'main' && isolated !== primary) {
+    output.push(isolated);
+    output.push(primary);
+  } else {
+    output.push(primary);
+  }
+  if (suffix && !(isolated && primary.toLowerCase() === 'main')) {
+    if (isolated !== primary) {
+      output.push(isolated);
+    }
+  }
+  const deduped = dedupeStrings(output);
+  const knownAgentIds = getOpenclawAgentIds();
+  if (!knownAgentIds || knownAgentIds.size === 0) {
+    return deduped;
+  }
+  const filtered = deduped.filter((item) => knownAgentIds.has(item));
+  return filtered.length > 0 ? filtered : [primary];
+}
+
+function getOpenclawAgentIds() {
+  const nowMs = Date.now();
+  const ttlMs = 5 * 60 * 1000;
+  if (
+    OPENCLAW_AGENT_IDS_CACHE &&
+    OPENCLAW_AGENT_IDS_CACHE.ids instanceof Set &&
+    nowMs - Number(OPENCLAW_AGENT_IDS_CACHE.loadedAtMs || 0) < ttlMs
+  ) {
+    return OPENCLAW_AGENT_IDS_CACHE.ids;
+  }
+
+  try {
+    const output = runCommand(
+      'openclaw',
+      ['agents', 'list', '--json'],
+      {
+        timeoutMs: 20_000,
+        label: 'openclaw agents list',
+      },
+    );
+    const payload = extractJson(output.stdout || '');
+    const ids = new Set(
+      (Array.isArray(payload) ? payload : [])
+        .map((item) => String(item && item.id ? item.id : '').trim())
+        .filter(Boolean),
+    );
+    OPENCLAW_AGENT_IDS_CACHE = {
+      loadedAtMs: nowMs,
+      ids,
+    };
+    return ids;
+  } catch {
+    OPENCLAW_AGENT_IDS_CACHE = {
+      loadedAtMs: nowMs,
+      ids: null,
+    };
+    return null;
+  }
+}
+
+function extractAgentRuntimeMeta(agentPayload) {
+  const meta = agentPayload && agentPayload.result && agentPayload.result.meta ? agentPayload.result.meta : {};
+  const agentMeta = meta && meta.agentMeta ? meta.agentMeta : {};
+  const report = meta && meta.systemPromptReport ? meta.systemPromptReport : {};
+  return {
+    sessionId: String(agentMeta && agentMeta.sessionId ? agentMeta.sessionId : report.sessionId || '').trim(),
+    sessionKey: String(report && report.sessionKey ? report.sessionKey : '').trim(),
+  };
+}
+
+function isRetryableAutopilotError(message) {
+  const text = String(message || '').toLowerCase();
+  if (!text) {
+    return false;
+  }
+  return (
+    text.includes('etimedout') ||
+    text.includes('timed out') ||
+    text.includes('timeout') ||
+    text.includes('rate limit') ||
+    text.includes('cooldown') ||
+    text.includes('session file locked') ||
+    text.includes('gateway closed') ||
+    text.includes('service restart') ||
+    text.includes('econnreset') ||
+    text.includes('temporarily unavailable')
+  );
+}
+
+function upsertRuntimeIssueBindings(issueIdentifier, refs) {
+  const normalized = normalizeLinearIssueId(issueIdentifier);
+  if (!normalized) {
+    return { updated: false };
+  }
+  const sessionId = String(refs && refs.sessionId ? refs.sessionId : '').trim();
+  const sessionKey = String(refs && refs.sessionKey ? refs.sessionKey : '').trim();
+  const agentId = String(refs && refs.agentId ? refs.agentId : '').trim();
+  const taskId = String(refs && refs.taskId ? refs.taskId : '').trim();
+  const subagentId = String(refs && refs.subagentId ? refs.subagentId : '').trim();
+  const cronId = String(refs && refs.cronId ? refs.cronId : '').trim();
+  if (!sessionId && !sessionKey && !taskId && !subagentId && !cronId) {
+    return { updated: false };
+  }
+
+  const bindings = readJsonFile(ISSUE_LINKS_PATH, {
+    version: 1,
+    updatedAtMs: 0,
+    byTaskId: {},
+    bySessionId: {},
+    bySessionKey: {},
+    bySubagentId: {},
+    byCronId: {},
+  });
+
+  bindings.byTaskId = bindings.byTaskId && typeof bindings.byTaskId === 'object' ? bindings.byTaskId : {};
+  bindings.bySessionId =
+    bindings.bySessionId && typeof bindings.bySessionId === 'object' ? bindings.bySessionId : {};
+  bindings.bySessionKey =
+    bindings.bySessionKey && typeof bindings.bySessionKey === 'object' ? bindings.bySessionKey : {};
+  bindings.bySubagentId =
+    bindings.bySubagentId && typeof bindings.bySubagentId === 'object' ? bindings.bySubagentId : {};
+  bindings.byCronId = bindings.byCronId && typeof bindings.byCronId === 'object' ? bindings.byCronId : {};
+
+  let changed = false;
+  if (taskId && bindings.byTaskId[taskId] !== normalized) {
+    bindings.byTaskId[taskId] = normalized;
+    changed = true;
+  }
+  if (sessionId && bindings.bySessionId[sessionId] !== normalized) {
+    bindings.bySessionId[sessionId] = normalized;
+    changed = true;
+  }
+  if (sessionKey && bindings.bySessionKey[sessionKey] !== normalized) {
+    bindings.bySessionKey[sessionKey] = normalized;
+    changed = true;
+  }
+  if (sessionKey) {
+    const inferredAgentId = agentId || inferAgentId(sessionKey) || 'main';
+    const taskId = `session:${inferredAgentId}:${sessionKey}`;
+    if (bindings.byTaskId[taskId] !== normalized) {
+      bindings.byTaskId[taskId] = normalized;
+      changed = true;
+    }
+  }
+  if (subagentId && bindings.bySubagentId[subagentId] !== normalized) {
+    bindings.bySubagentId[subagentId] = normalized;
+    changed = true;
+  }
+  if (cronId && bindings.byCronId[cronId] !== normalized) {
+    bindings.byCronId[cronId] = normalized;
+    changed = true;
+  }
+
+  if (!changed) {
+    return { updated: false };
+  }
+
+  bindings.version = 1;
+  bindings.updatedAtMs = Date.now();
+  writeJsonFile(ISSUE_LINKS_PATH, bindings);
+  return {
+    updated: true,
+    sessionId,
+    sessionKey,
+  };
+}
+
 function normalizeAutopilotStatus(value) {
   const text = String(value || '').trim().toLowerCase();
   if (!text) {
@@ -5992,6 +6510,15 @@ function normalizeAutopilotStateName(value) {
 function resolveLinearAutopilotNextState(candidate, parsed, settings) {
   if (parsed && parsed.nextState) {
     return parsed.nextState;
+  }
+  if (parsed && parsed.status === 'done') {
+    return 'Done';
+  }
+  if (parsed && parsed.status === 'blocked') {
+    return 'Blocked';
+  }
+  if (parsed && parsed.status === 'in_progress') {
+    return 'In Progress';
   }
   const stateName = String((candidate && candidate.state && candidate.state.name) || '').trim().toLowerCase();
   if (stateName === 'triage') {
@@ -7166,14 +7693,23 @@ async function resolveLinearTeamId(apiKey, teamKey) {
 }
 
 async function linearRequest(apiKey, query, variables) {
-  const response = await fetch('https://api.linear.app/graphql', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: apiKey,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
+  const timeoutMs = 15000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetch('https://api.linear.app/graphql', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: apiKey,
+      },
+      body: JSON.stringify({ query, variables }),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
 
   const raw = await response.text();
   let body = null;
@@ -7803,21 +8339,28 @@ function runOpenclawJson(args) {
   return extractJson(payload);
 }
 
-function runCommand(bin, args) {
+function runCommand(bin, args, opts = {}) {
+  const timeoutMs = Number(opts.timeoutMs || 0);
+  const label = String(opts.label || '').trim();
   const result = spawnSync(bin, args, {
     cwd: ROOT_DIR,
     encoding: 'utf8',
     env: process.env,
     maxBuffer: 10 * 1024 * 1024,
+    timeout: timeoutMs > 0 ? timeoutMs : undefined,
   });
 
   if (result.error) {
-    throw result.error;
+    const meta = label ? `${label}: ` : '';
+    throw new Error(`${meta}${result.error.message || String(result.error)}`);
   }
 
   if (result.status !== 0) {
+    const meta = label ? `${label}: ` : '';
     const detail = [result.stdout, result.stderr].filter(Boolean).join('\n').trim();
-    throw new Error(`${bin} ${args.join(' ')} failed with code ${result.status}${detail ? `: ${detail}` : ''}`);
+    throw new Error(
+      `${meta}${bin} ${args.join(' ')} failed with code ${result.status}${detail ? `: ${detail}` : ''}`,
+    );
   }
 
   return {
@@ -8235,6 +8778,100 @@ function generateCode(size) {
   return output;
 }
 
+function acquireTaskLock(lockPath, staleMs) {
+  ensureDir(path.dirname(lockPath));
+  const staleThreshold = Math.max(30_000, Number(staleMs || 30 * 60 * 1000));
+  const nowMs = Date.now();
+  const payload = {
+    pid: process.pid,
+    createdAtMs: nowMs,
+    updatedAtMs: nowMs,
+    host: os.hostname(),
+  };
+
+  for (let pass = 0; pass < 2; pass += 1) {
+    try {
+      const fd = fs.openSync(lockPath, 'wx');
+      try {
+        fs.writeFileSync(fd, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
+      return { acquired: true, path: lockPath, pid: process.pid, ageMs: 0 };
+    } catch (error) {
+      const code = error && error.code ? String(error.code) : '';
+      if (code !== 'EEXIST') {
+        return {
+          acquired: false,
+          path: lockPath,
+          reason: 'lock-error',
+          message: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
+
+    const existing = readJsonFile(lockPath, {});
+    const existingPid = Number(existing && existing.pid ? existing.pid : 0);
+    const existingUpdatedAtMs = Number(
+      existing && (existing.updatedAtMs || existing.createdAtMs) ? existing.updatedAtMs || existing.createdAtMs : 0,
+    );
+    const ageMs = existingUpdatedAtMs > 0 ? Math.max(0, nowMs - existingUpdatedAtMs) : Number.MAX_SAFE_INTEGER;
+    const alive = existingPid > 0 ? isPidAlive(existingPid) : false;
+    const stale = ageMs > staleThreshold;
+
+    if (!alive || stale) {
+      try {
+        fs.unlinkSync(lockPath);
+      } catch {
+        // ignore unlink races
+      }
+      continue;
+    }
+
+    return {
+      acquired: false,
+      path: lockPath,
+      reason: 'already-running',
+      pid: existingPid,
+      ageMs,
+      message: 'another autopilot process holds the lock',
+    };
+  }
+
+  return {
+    acquired: false,
+    path: lockPath,
+    reason: 'already-running',
+    pid: 0,
+    ageMs: 0,
+    message: 'lock is currently held',
+  };
+}
+
+function releaseTaskLock(lock) {
+  if (!lock || !lock.acquired || !lock.path) {
+    return;
+  }
+  try {
+    fs.unlinkSync(lock.path);
+  } catch {
+    // ignore unlock races
+  }
+}
+
+function isPidAlive(pid) {
+  const n = Number(pid || 0);
+  if (!Number.isFinite(n) || n <= 0) {
+    return false;
+  }
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function readJsonFile(filePath, fallback) {
   try {
     const raw = fs.readFileSync(filePath, 'utf8');
@@ -8265,6 +8902,16 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function sleepMs(ms) {
+  const duration = Math.max(0, Number(ms || 0));
+  if (!duration) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    setTimeout(resolve, duration);
+  });
+}
+
 function listDir(dirPath) {
   try {
     return fs.readdirSync(dirPath);
@@ -8291,6 +8938,10 @@ function shellQuote(value) {
     return text;
   }
   return `'${text.replace(/'/g, `'"'"'`)}'`;
+}
+
+function escapeRegExp(text) {
+  return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function joinShell(parts) {
