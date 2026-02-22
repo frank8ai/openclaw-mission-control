@@ -357,12 +357,10 @@ Write commands (require one-time confirmation):
   runbook-exec --card CARD [--issue CLAW-123] [--cron-id ID] --confirm CODE [--execute]
 
 Scheduling:
-  schedule [--apply] [--channel CH] [--target TGT]
+  schedule [--apply] [--mode full|minimal] [--channel CH] [--target TGT]
     Prepare (or install) crontab block:
-    - 09:00 + 18:00 report
-    - every 5 minutes watchdog
-    - status machine + queue drain + sla-check + linear-autopilot
-    - reminders + daily/weekly briefing
+    - mode=full: report + watchdog + sync/governance + queue drain + linear-autopilot + reminders/briefing
+    - mode=minimal: discord-intake-sync + queue-drain + linear-autopilot
 
 Examples:
   npm run tasks -- triage --title "Fix Discord manual model switch" --source discord --source-id discord:msg:123
@@ -371,6 +369,7 @@ Examples:
   npm run tasks -- queue-drain
   npm run tasks -- sla-check
   npm run tasks -- linear-autopilot --json
+  npm run tasks -- linear-autopilot --issue CLAW-128 --json
   npm run tasks -- briefing daily --send
   npm run tasks -- discord-intake-sync --channel 1468117725040742527
   npm run tasks -- trigger github-sync --confirm "CONFIRM ABC123"
@@ -1608,6 +1607,11 @@ async function cmdEvalReplay(settings, flags) {
 async function cmdSchedule(settings, flags) {
   const timezone = String(flags.tz || settings.timezone || 'Asia/Shanghai').trim();
   const apply = Boolean(flags.apply);
+  const mode = String(flags.mode || 'minimal').trim().toLowerCase();
+  if (!['full', 'minimal'].includes(mode)) {
+    throw new Error(`invalid schedule mode: ${mode}. expected full|minimal`);
+  }
+  const minimalMode = mode === 'minimal';
 
   const channel = String(flags.channel || settings.report.channel || '').trim();
   const target = String(flags.target || settings.report.target || '').trim();
@@ -1618,7 +1622,7 @@ async function cmdSchedule(settings, flags) {
     flags['reminder-target'] || settings.reminders.target || target || '',
   ).trim();
   const withReminders =
-    !Boolean(flags['without-reminders']) && Boolean(settings.reminders.enabled !== false);
+    !minimalMode && !Boolean(flags['without-reminders']) && Boolean(settings.reminders.enabled !== false);
   const briefingChannel = String(
     flags['briefing-channel'] || settings.briefing.channel || channel || '',
   ).trim();
@@ -1626,7 +1630,7 @@ async function cmdSchedule(settings, flags) {
     flags['briefing-target'] || settings.briefing.target || target || '',
   ).trim();
   const withBriefing =
-    !Boolean(flags['without-briefing']) && Boolean(settings.briefing.enabled !== false);
+    !minimalMode && !Boolean(flags['without-briefing']) && Boolean(settings.briefing.enabled !== false);
   const nodeBin = process.execPath;
   const scriptPath = path.join(ROOT_DIR, 'scripts', 'tasks.js');
   const reportLog = path.join(DATA_DIR, 'report-cron.log');
@@ -1660,16 +1664,16 @@ async function cmdSchedule(settings, flags) {
   const executionPollMinutes = Number(
     flags['execution-poll-minutes'] || settings.execution.pollMinutes || 15,
   );
-  const githubExpr = cronEveryMinutesExpr(githubPollMinutes);
-  const todoistExpr = cronEveryMinutesExpr(todoistPollMinutes);
-  const calendarExpr = cronEveryMinutesExpr(calendarPollMinutes);
+  const githubExpr = minimalMode ? '' : cronEveryMinutesExpr(githubPollMinutes);
+  const todoistExpr = minimalMode ? '' : cronEveryMinutesExpr(todoistPollMinutes);
+  const calendarExpr = minimalMode ? '' : cronEveryMinutesExpr(calendarPollMinutes);
   const discordIntakeExpr =
     settings.discordIntake.enabled === false ? '' : cronEveryMinutesExpr(discordIntakeMinutes);
   const statusSyncExpr =
-    settings.statusMachine.enabled === false ? '' : cronEveryMinutesExpr(statusSyncMinutes);
+    minimalMode || settings.statusMachine.enabled === false ? '' : cronEveryMinutesExpr(statusSyncMinutes);
   const queueDrainExpr =
     settings.intakeQueue.enabled === false ? '' : cronEveryMinutesExpr(queueDrainMinutes);
-  const slaExpr = settings.sla.enabled === false ? '' : cronEveryMinutesExpr(slaPollMinutes);
+  const slaExpr = minimalMode || settings.sla.enabled === false ? '' : cronEveryMinutesExpr(slaPollMinutes);
   const linearAutopilotExpr =
     settings.execution.enabled === false ? '' : cronEveryMinutesExpr(executionPollMinutes);
 
@@ -1715,8 +1719,12 @@ async function cmdSchedule(settings, flags) {
     '# OPENCLAW_CONTROL_CENTER_BEGIN',
     `CRON_TZ=${timezone}`,
     'PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin',
-    `0 9,18 * * * cd ${shellQuote(ROOT_DIR)} && ${joinShell(reportParts)} >> ${shellQuote(reportLog)} 2>&1`,
-    `*/${watchdogInterval} * * * * cd ${shellQuote(ROOT_DIR)} && ${joinShell(watchdogParts)} >> ${shellQuote(watchdogLog)} 2>&1`,
+    ...(!minimalMode
+      ? [
+          `0 9,18 * * * cd ${shellQuote(ROOT_DIR)} && ${joinShell(reportParts)} >> ${shellQuote(reportLog)} 2>&1`,
+          `*/${watchdogInterval} * * * * cd ${shellQuote(ROOT_DIR)} && ${joinShell(watchdogParts)} >> ${shellQuote(watchdogLog)} 2>&1`,
+        ]
+      : []),
     ...(discordIntakeExpr
       ? [
           `${discordIntakeExpr} cd ${shellQuote(ROOT_DIR)} && ${joinShell(discordIntakeParts)} >> ${shellQuote(discordIntakeLog)} 2>&1`,
@@ -1775,7 +1783,7 @@ async function cmdSchedule(settings, flags) {
   const block = blockLines.join('\n');
 
   if (!apply) {
-    process.stdout.write('Proposed crontab block:\n');
+    process.stdout.write(`Proposed crontab block (mode=${mode}):\n`);
     process.stdout.write(`${block}\n`);
     process.stdout.write('\nRun with --apply to install this block into your user crontab.\n');
     return;
@@ -1785,7 +1793,7 @@ async function cmdSchedule(settings, flags) {
   const next = replaceCrontabBlock(current, block);
   writeCrontab(next);
 
-  process.stdout.write('Crontab updated with OpenClaw Control Center schedule.\n');
+  process.stdout.write(`Crontab updated with OpenClaw Control Center schedule (mode=${mode}).\n`);
 }
 
 async function cmdTriage(settings, flags) {
@@ -3677,35 +3685,52 @@ async function cmdLinearAutopilot(settings, flags) {
   trace('fetch open issues: start');
   const openIssues = await fetchOpenLinearIssuesForSla(apiKey, teamId);
   trace(`fetch open issues: done (count=${Array.isArray(openIssues) ? openIssues.length : 0})`);
-  let selection = pickLinearAutopilotCandidate(openIssues, {
-    includeStates,
-    includeLabels,
-    includeAll,
-    historyRuns,
-    issueCooldownMinutes,
-    maxConsecutiveSameIssue,
-    preferNewTriage,
-  });
-  let candidate = selection.issue;
-  const usedLabelFallback = !candidate && !includeAll && includeLabels.length > 0;
-  if (usedLabelFallback) {
+  const forcedIssueIdentifier = normalizeLinearIssueId(
+    flags.issue || flags['issue-id'] || flags.identifier || '',
+  );
+  let selection = { issue: null, strategy: 'none' };
+  let candidate = null;
+  let usedLabelFallback = false;
+  if (forcedIssueIdentifier) {
+    candidate = openIssues.find(
+      (item) => normalizeLinearIssueId(item && item.identifier ? item.identifier : '') === forcedIssueIdentifier,
+    ) || null;
+    selection = {
+      issue: candidate,
+      strategy: candidate ? 'forced-issue' : 'forced-issue-not-found',
+    };
+  } else {
     selection = pickLinearAutopilotCandidate(openIssues, {
       includeStates,
-      includeLabels: [],
-      includeAll: true,
+      includeLabels,
+      includeAll,
       historyRuns,
       issueCooldownMinutes,
       maxConsecutiveSameIssue,
       preferNewTriage,
     });
     candidate = selection.issue;
+    usedLabelFallback = !candidate && !includeAll && includeLabels.length > 0;
+    if (usedLabelFallback) {
+      selection = pickLinearAutopilotCandidate(openIssues, {
+        includeStates,
+        includeLabels: [],
+        includeAll: true,
+        historyRuns,
+        issueCooldownMinutes,
+        maxConsecutiveSameIssue,
+        preferNewTriage,
+      });
+      candidate = selection.issue;
+    }
   }
 
   if (!candidate) {
     const empty = {
       ok: true,
       skipped: true,
-      reason: 'no-runnable-issue',
+      reason: forcedIssueIdentifier ? 'forced-issue-not-found' : 'no-runnable-issue',
+      forcedIssueIdentifier: forcedIssueIdentifier || '',
       scanned: openIssues.length,
       includeStates,
       includeLabels,

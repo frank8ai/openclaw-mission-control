@@ -7,6 +7,8 @@ Tracking page for ongoing OpenClaw development projects:
 - `OPENCLAW_DEV_PROJECT_TRACKING.md`
 - SOP index for mission-control automation:
   - `docs/sop/SOP_INDEX.md`
+- Audit entry guide:
+  - `docs/AUDIT_GUIDE.md`
 
 ## What this includes
 
@@ -48,19 +50,16 @@ Tracking page for ongoing OpenClaw development projects:
 - `tasks state-machine-rules`: config-driven rule versions + validate/rollback
 - `tasks audit-rollback`: rollback auditable local JSON writes by audit id
 - `tasks sla-check`: stale issue SLA check (Blocked/In Progress) with owner mention + escalation issue
-- `tasks linear-autopilot`: pull one runnable Linear issue and let main agent execute exactly one next step, then auto comment/state update
+- `tasks linear-autopilot`: pull one runnable Linear issue and let configured execution agent execute exactly one next step, then auto comment/state update (supports `--issue CLAW-123`)
 - `tasks eval-replay`: export replay artifact for eval/distillation workflow
 - `tasks runbook-exec`: run SOP runbook cards in dry-run or guarded execute mode
 - `tasks trigger`: one-click run for sync/report/watchdog jobs with confirmation token
 - `tasks autopr`: guarded low-risk auto PR flow (dry-run default)
 - `tasks run|enable|disable|kill`: control actions with one-time confirmation token
 - `tasks approve`: one-time approval token for high-risk write actions (`run/enable/disable/kill/trigger/autopr/runbook-exec`)
-- `tasks schedule`: generate/install crontab for:
-  - Daily report at `09:00` and `18:00`
-  - Watchdog every `5` minutes
-  - Linear autopilot every `5` minutes (with issue cooldown/rotation)
-  - Due-soon reminder daily + cycle reminder weekly
-  - Daily + weekly briefing
+- `tasks schedule`: generate/install crontab with mode switch:
+  - `minimal` (default): `discord-intake-sync` + `queue-drain` + `linear-autopilot`
+  - `full`: report/watchdog/github/todoist/calendar/status/sla + reminders/briefing + minimal loop
 
 ## Quick start
 
@@ -215,8 +214,11 @@ npm run tasks -- state-machine-rules --validate --json
 # Stale SLA checks + escalation
 npm run tasks -- sla-check
 
-# Execute one Linear issue step via main agent (auto comment/state)
+# Execute one Linear issue step via configured execution agent (auto comment/state)
 npm run tasks -- linear-autopilot
+
+# Execute one specific Linear issue step
+npm run tasks -- linear-autopilot --issue CLAW-128 --json
 
 # Backfill around a specific Discord message id (one-time import of historical directives)
 npm run tasks -- discord-intake-sync --around <MESSAGE_ID> --backfill --limit 60
@@ -316,34 +318,58 @@ Preview crontab block:
 npm run tasks -- schedule
 ```
 
+Preview minimal mode explicitly:
+
+```bash
+npm run tasks -- schedule --mode minimal
+```
+
+Preview full mode explicitly:
+
+```bash
+npm run tasks -- schedule --mode full
+```
+
 Install crontab block:
 
 ```bash
 npm run tasks -- schedule --apply
 ```
 
+Install minimal mode (default):
+
+```bash
+npm run tasks -- schedule --apply --mode minimal
+```
+
+Install full mode:
+
+```bash
+npm run tasks -- schedule --apply --mode full
+```
+
 Install with report push target:
 
 ```bash
-npm run tasks -- schedule --apply --channel discord --target channel:123456789012345678
+npm run tasks -- schedule --apply --mode full --channel discord --target channel:123456789012345678
 ```
 
-Disable reminder cron lines:
+Disable reminder cron lines (full mode):
 
 ```bash
-npm run tasks -- schedule --without-reminders
+npm run tasks -- schedule --mode full --without-reminders
 ```
 
-Disable briefing cron lines:
+Disable briefing cron lines (full mode):
 
 ```bash
-npm run tasks -- schedule --without-briefing
+npm run tasks -- schedule --mode full --without-briefing
 ```
 
-Disable integration poll lines:
+Disable integration poll lines (full mode):
 
 ```bash
-npm run tasks -- schedule --github-poll-minutes 0 --todoist-poll-minutes 0 --calendar-poll-minutes 0
+npm run tasks -- schedule --mode full --github-poll-minutes 0 --todoist-poll-minutes 0 --calendar-poll-minutes 0
 ```
 
 ## Linear integration
