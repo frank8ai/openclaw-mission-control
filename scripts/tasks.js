@@ -272,7 +272,10 @@ const DEFAULTS = {
   execution: {
     enabled: true,
     pollMinutes: 5,
-    agentId: 'main',
+    agentId: 'auto',
+    agentPreferred: ['codex', 'coder', 'main'],
+    agentAllowlist: [],
+    agentDenylist: [],
     timeoutSeconds: 900,
     agentRetries: 2,
     retryBackoffSeconds: 20,
@@ -3826,7 +3829,9 @@ async function cmdLinearAutopilot(settings, flags) {
       ? isTruthyLike(flags.strict)
       : Boolean(settings.execution && settings.execution.failOnError === true);
   trace(`candidate selected: ${candidate.identifier}`);
-  const prompt = buildLinearAutopilotPrompt(candidate, maxPromptChars);
+  const prompt = buildLinearAutopilotPrompt(candidate, maxPromptChars, {
+    workdir: ROOT_DIR,
+  });
   trace('build prompt: done');
 
   const lock = acquireTaskLock(LINEAR_AUTOPILOT_LOCK_PATH, lockTtlSeconds * 1000);
@@ -6860,7 +6865,7 @@ function extractLinearIssueRawInput(description, maxChars) {
   return trimMessage(raw, Math.max(200, Number(maxChars || 1200)));
 }
 
-function buildLinearAutopilotPrompt(issue, maxPromptChars) {
+function buildLinearAutopilotPrompt(issue, maxPromptChars, options = {}) {
   const stateName = String((issue && issue.state && issue.state.name) || '').trim();
   const priority = Number.isFinite(Number(issue && issue.priority)) ? Number(issue.priority) : 0;
   const labels = (((issue && issue.labels) || {}).nodes || [])
@@ -6869,11 +6874,16 @@ function buildLinearAutopilotPrompt(issue, maxPromptChars) {
   const dueDate = String(issue && issue.dueDate ? issue.dueDate : '').trim();
   const cycle = issue && issue.cycle && issue.cycle.name ? String(issue.cycle.name) : '';
   const rawInput = extractLinearIssueRawInput(issue && issue.description ? issue.description : '', maxPromptChars);
+  const workdir = String(options && options.workdir ? options.workdir : ROOT_DIR).trim();
 
   const lines = [];
   lines.push('You are OpenClaw execution autopilot.');
   lines.push('Do exactly ONE concrete next step for this issue in local workspace.');
   lines.push('If blocked, report exact blocker and next unblock action.');
+  if (workdir) {
+    lines.push(`Repository root for this task: ${workdir}`);
+    lines.push('Run all local commands and file operations under this repository root.');
+  }
   lines.push('');
   lines.push(`Issue: ${issue.identifier} ${singleLine(issue.title || '')}`);
   lines.push(`URL: ${issue.url || '-'}`);

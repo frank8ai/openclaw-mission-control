@@ -241,7 +241,7 @@
   "execution": {
     "enabled": true,
     "pollMinutes": 5,
-    "agentId": "main",
+    "agentId": "auto",
     "agentPreferred": [
       "codex",
       "coder",

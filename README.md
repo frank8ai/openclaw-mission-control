@@ -646,6 +646,7 @@ Fields:
 
 - fixed agent id (for example `codex`, `coder`, `main`)
 - `auto` / `any` / `*`: round-robin across available agents (optionally constrained by allow/deny list)
+- default: `auto` (recommended for shared execution capability across current and future agents)
 
 ## Storage files
 
