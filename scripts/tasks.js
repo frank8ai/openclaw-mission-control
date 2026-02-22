@@ -7914,6 +7914,7 @@ function buildLinearAutopilotPrompt(issue, maxPromptChars, options = {}) {
   lines.push('You are OpenClaw execution autopilot.');
   lines.push('Do exactly ONE concrete next step for this issue in local workspace.');
   lines.push('If blocked, report exact blocker and next unblock action.');
+  lines.push('Standard Operating Procedure (SOP): All actions MUST follow the standard development SOP located at docs/sop/linear-codex-dev-sop.md.');
   if (workdir) {
     lines.push(`Repository root for this task: ${workdir}`);
     lines.push('Run all local commands and file operations under this repository root.');
