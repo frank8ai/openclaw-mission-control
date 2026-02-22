@@ -15,6 +15,16 @@
   },
   "control": {
     "confirmTtlMinutes": 10,
+    "approvalTtlMinutes": 30,
+    "approvalRequiredActions": [
+      "run",
+      "enable",
+      "disable",
+      "kill",
+      "trigger",
+      "autopr",
+      "runbook-exec"
+    ],
     "killWhitelist": [
       "example-subagent-id"
     ],
@@ -45,7 +55,8 @@
     "discordPath": "/discord/message",
     "githubPath": "/github/pr",
     "token": "",
-    "maxBodyBytes": 1048576
+    "maxBodyBytes": 1048576,
+    "replayWindowHours": 72
   },
   "reminders": {
     "enabled": true,
@@ -111,7 +122,9 @@
     "stateDone": "Done",
     "stateBlocked": "Blocked",
     "commentOnStateChange": true,
-    "pollMinutes": 10
+    "pollMinutes": 10,
+    "autoActivateConfig": true,
+    "rules": []
   },
   "intakeQueue": {
     "enabled": true,
@@ -245,6 +258,12 @@
     "defaultTransitionFromTriage": "In Progress",
     "issueCooldownMinutes": 30,
     "maxConsecutiveSameIssue": 2,
-    "preferNewTriage": true
+    "preferNewTriage": true,
+    "backoffByFailureClass": {
+      "timeout": 1.2,
+      "rate_limit": 1.6,
+      "lock_conflict": 0.8,
+      "unknown": 1
+    }
   }
 }

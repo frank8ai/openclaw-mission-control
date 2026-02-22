@@ -38,7 +38,15 @@ Tracking page for ongoing OpenClaw development projects:
 - `tasks calendar-sync`: capture Google Calendar events from logged-in browser tab
 - `tasks status-sync`: auto status machine (`Triage -> In Progress -> In Review -> Done/Blocked`) for linked runtime issues
 - `tasks queue-drain`: retry ingest queue and move exhausted items to DLQ
+- `tasks queue-replay`: replay DLQ payloads back to queue (single/batch, optional immediate drain)
 - `tasks queue-stats`: inspect queue/DLQ health, retry buckets, and top sources
+- `tasks ingest-test`: acceptance checks for idempotency + DLQ + replay loop
+- `tasks binding-coverage`: coverage report + auto-repair for session/subagent -> Linear issue mapping
+- `tasks webhook-metrics`: webhook p95/volume/replay-protection metrics
+- `tasks webhook-test`: acceptance check for replay protection + latency budget
+- `tasks executor-test`: acceptance check for lock, retry classes (`rate_limit/lock_conflict/timeout/unknown`)
+- `tasks state-machine-rules`: config-driven rule versions + validate/rollback
+- `tasks audit-rollback`: rollback auditable local JSON writes by audit id
 - `tasks sla-check`: stale issue SLA check (Blocked/In Progress) with owner mention + escalation issue
 - `tasks linear-autopilot`: pull one runnable Linear issue and let main agent execute exactly one next step, then auto comment/state update
 - `tasks eval-replay`: export replay artifact for eval/distillation workflow
@@ -46,6 +54,7 @@ Tracking page for ongoing OpenClaw development projects:
 - `tasks trigger`: one-click run for sync/report/watchdog jobs with confirmation token
 - `tasks autopr`: guarded low-risk auto PR flow (dry-run default)
 - `tasks run|enable|disable|kill`: control actions with one-time confirmation token
+- `tasks approve`: one-time approval token for high-risk write actions (`run/enable/disable/kill/trigger/autopr/runbook-exec`)
 - `tasks schedule`: generate/install crontab for:
   - Daily report at `09:00` and `18:00`
   - Watchdog every `5` minutes
@@ -180,8 +189,28 @@ npm run tasks -- status-sync
 # Retry queued ingest items
 npm run tasks -- queue-drain
 
+# Replay DLQ item(s) back to queue
+npm run tasks -- queue-replay --all --drain
+
 # Queue/DLQ health snapshot
 npm run tasks -- queue-stats --json
+
+# Ingest acceptance checks
+npm run tasks -- ingest-test --json
+
+# Runtime binding coverage report (auto-repair + orphan auto-bind)
+npm run tasks -- binding-coverage --json
+
+# Webhook metrics / acceptance checks
+npm run tasks -- webhook-metrics --json
+npm run tasks -- webhook-test --json
+
+# Executor stability acceptance checks
+npm run tasks -- executor-test --json
+
+# Status machine rules (config-driven versions)
+npm run tasks -- state-machine-rules --json
+npm run tasks -- state-machine-rules --validate --json
 
 # Stale SLA checks + escalation
 npm run tasks -- sla-check
@@ -195,6 +224,9 @@ npm run tasks -- discord-intake-sync --around <MESSAGE_ID> --backfill --limit 60
 # Trigger one-click control job (requires confirm token)
 npm run tasks -- trigger github-sync --confirm "CONFIRM <CODE>"
 
+# High-risk write approval token
+npm run tasks -- approve --action trigger
+
 # Guarded auto PR (dry-run default)
 npm run tasks -- autopr --issue CLAW-123
 
@@ -206,7 +238,26 @@ npm run tasks -- runbook-exec --card cron-recover --issue CLAW-123
 
 # Runbook v2 execute mode (requires confirm token + runbook.allowExecute=true)
 npm run tasks -- runbook-exec --card cron-recover --issue CLAW-123 --confirm "CONFIRM <CODE>" --execute
+
+# Rollback auditable local writes by audit id
+npm run tasks -- audit-rollback --audit-id <AUDIT_ID> --confirm "CONFIRM <CODE>" --approval "APPROVE <CODE>"
 ```
+
+## Auditable data artifacts
+
+All control-plane evidence is stored in `data/control-center/`:
+
+- `ingest-queue.json` / `ingest-dlq.json`: unified ingest queue + DLQ
+- `ingest-ledger.json`: idempotency ledger (`source + sourceId + eventType`)
+- `runtime-issue-links.json`: forward + reverse runtime binding indexes
+- `binding-coverage.json`: latest coverage report (`orphan` target = 0)
+- `webhook-metrics.json`: webhook latency/replay metrics
+- `webhook-replay-index.json`: replay protection index
+- `executor-stability.json`: executor resilience reports
+- `status-machine-versions.json`: config-driven state-machine versions
+- `audit.jsonl`: immutable audit trail with `auditId`
+- `rollback-journal.json`: rollback snapshots keyed by `auditId`
+- `approvals.json`: one-time approval tokens for high-risk writes
 
 ## API response contract
 

@@ -27,8 +27,16 @@ const TRIAGE_SIGNATURE_INDEX_PATH = path.join(DATA_DIR, 'triage-signature-index.
 const TRIAGE_CREATE_LOCK_PATH = path.join(DATA_DIR, 'triage-create.lock.json');
 const INGEST_QUEUE_PATH = path.join(DATA_DIR, 'ingest-queue.json');
 const INGEST_DLQ_PATH = path.join(DATA_DIR, 'ingest-dlq.json');
+const INGEST_LEDGER_PATH = path.join(DATA_DIR, 'ingest-ledger.json');
+const WEBHOOK_METRICS_PATH = path.join(DATA_DIR, 'webhook-metrics.json');
+const WEBHOOK_REPLAY_INDEX_PATH = path.join(DATA_DIR, 'webhook-replay-index.json');
 const AUDIT_LOG_PATH = path.join(DATA_DIR, 'audit.jsonl');
+const APPROVALS_PATH = path.join(DATA_DIR, 'approvals.json');
+const ROLLBACK_JOURNAL_PATH = path.join(DATA_DIR, 'rollback-journal.json');
 const SLA_STATE_PATH = path.join(DATA_DIR, 'sla-check.json');
+const EXECUTOR_STABILITY_PATH = path.join(DATA_DIR, 'executor-stability.json');
+const BINDING_COVERAGE_PATH = path.join(DATA_DIR, 'binding-coverage.json');
+const STATUS_MACHINE_VERSIONS_PATH = path.join(DATA_DIR, 'status-machine-versions.json');
 const RUNBOOK_EXEC_PATH = path.join(DATA_DIR, 'runbook-exec.json');
 const DISCORD_INTAKE_STATE_PATH = path.join(DATA_DIR, 'discord-intake-state.json');
 const LINEAR_AUTOPILOT_PATH = path.join(DATA_DIR, 'linear-autopilot.json');
@@ -60,6 +68,8 @@ const DEFAULTS = {
   },
   control: {
     confirmTtlMinutes: 10,
+    approvalTtlMinutes: 30,
+    approvalRequiredActions: ['run', 'enable', 'disable', 'kill', 'trigger', 'autopr', 'runbook-exec'],
     killWhitelist: [],
     triggerWhitelist: [
       'github-sync',
@@ -91,6 +101,7 @@ const DEFAULTS = {
     githubPath: process.env.CONTROL_CENTER_GITHUB_PATH || '/github/pr',
     token: process.env.CONTROL_CENTER_INGEST_TOKEN || '',
     maxBodyBytes: 1024 * 1024,
+    replayWindowHours: 72,
   },
   reminders: {
     enabled: true,
@@ -172,6 +183,8 @@ const DEFAULTS = {
     stateBlocked: 'Blocked',
     commentOnStateChange: true,
     pollMinutes: 10,
+    rules: [],
+    autoActivateConfig: true,
   },
   intakeQueue: {
     enabled: true,
@@ -263,6 +276,12 @@ const DEFAULTS = {
     retryBackoffSeconds: 20,
     lockTtlSeconds: 1800,
     fallbackAgentSuffix: 'autopilot',
+    backoffByFailureClass: {
+      timeout: 1.2,
+      rate_limit: 1.6,
+      lock_conflict: 0.8,
+      unknown: 1.0,
+    },
     failOnError: false,
     includeStates: ['In Progress', 'Triage', 'Blocked'],
     includeLabels: ['auto-intake', 'main-directive'],
@@ -302,8 +321,16 @@ Read commands:
   remind [due|cycle|all]       Send reminders from Linear (due soon/current cycle)
   status-sync [--json]         Auto state machine + comment trail for linked runtime issues
   queue-drain [--json]         Retry ingest queue and move failed payloads to DLQ
+  queue-replay [--json]        Replay DLQ payloads back into queue (single or batch)
   queue-stats [--json]         Show ingest queue/DLQ health, retries, and source distribution
+  ingest-test [--json]         Run ingest idempotency + DLQ + replay acceptance checks
   sla-check [--json]           Stale/blocked SLA checks with owner mention + escalation issue
+  binding-coverage [--json]    Report and auto-repair runtime issue binding coverage
+  webhook-metrics [--json]     Webhook latency/replay-protection metrics
+  webhook-test [--json]        Run webhook replay/latency acceptance checks
+  executor-test [--json]       Run executor lock/retry/failure-class acceptance checks
+  state-machine-rules [--json] Show/apply/rollback config-driven status-machine rule versions
+  audit-rollback --audit-id ID Roll back auditable local writes by audit id
   eval-replay [--json]         Build replay artifact for evaluation/distillation workflow
 
 Integrations:
@@ -320,6 +347,7 @@ Integrations:
 
 Write commands (require one-time confirmation):
   confirm                      Generate one-time confirmation code
+  approve                      Generate one-time approval code for high-risk writes
   run <jobId> --confirm CODE   Run cron job now
   enable <jobId> --confirm CODE
   disable <jobId> --confirm CODE
@@ -404,13 +432,42 @@ async function main() {
       case 'retry-queue':
         await cmdQueueDrain(settings, flags);
         return;
+      case 'queue-replay':
+      case 'replay-dlq':
+        await cmdQueueReplay(settings, flags);
+        return;
       case 'queue-stats':
       case 'ingest-stats':
         await cmdQueueStats(settings, flags);
         return;
+      case 'ingest-test':
+        await cmdIngestTest(settings, flags);
+        return;
       case 'sla-check':
       case 'sla':
         await cmdSlaCheck(settings, flags);
+        return;
+      case 'binding-coverage':
+      case 'bindings':
+        await cmdBindingCoverage(settings, flags);
+        return;
+      case 'webhook-metrics':
+      case 'webhook-stats':
+        await cmdWebhookMetrics(settings, flags);
+        return;
+      case 'webhook-test':
+        await cmdWebhookTest(settings, flags);
+        return;
+      case 'executor-test':
+        await cmdExecutorTest(settings, flags);
+        return;
+      case 'state-machine-rules':
+      case 'state-rules':
+        await cmdStatusMachineRules(settings, flags);
+        return;
+      case 'audit-rollback':
+      case 'rollback':
+        await cmdAuditRollback(settings, flags);
         return;
       case 'eval-replay':
       case 'replay-eval':
@@ -459,14 +516,17 @@ async function main() {
       case 'confirm':
         await cmdConfirm(settings, flags);
         return;
+      case 'approve':
+        await cmdApprove(settings, flags);
+        return;
       case 'run':
-        await cmdCronControl('run', flags);
+        await cmdCronControl(settings, 'run', flags);
         return;
       case 'enable':
-        await cmdCronControl('enable', flags);
+        await cmdCronControl(settings, 'enable', flags);
         return;
       case 'disable':
-        await cmdCronControl('disable', flags);
+        await cmdCronControl(settings, 'disable', flags);
         return;
       case 'kill':
         await cmdKill(settings, flags);
@@ -1055,22 +1115,41 @@ async function cmdConfirm(settings) {
   );
 }
 
-async function cmdCronControl(action, flags) {
+async function cmdCronControl(settings, action, flags) {
   const id = String(flags._[0] || '').trim();
   if (!id) {
     throw new Error(`tasks ${action} requires a cron job id.`);
   }
 
   consumeConfirmation(flags.confirm);
+  const approval = consumeApprovalIfRequired(settings, flags.approval, action, id);
 
   const args = ['cron', action, id];
   const output = runCommand('openclaw', args);
-  appendAuditEvent('control-cron-action', {
+  const audit = appendAuditEvent('control-cron-action', {
     action,
     jobId: id,
     confirm: String(flags.confirm || ''),
+    approvalId: approval.approvalId || '',
   });
 
+  if (flags.json) {
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          ok: true,
+          action,
+          jobId: id,
+          auditId: audit.auditId,
+          approval,
+          output: String(output.stdout || output.stderr || 'ok').trim(),
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    return;
+  }
   process.stdout.write(`${output.stdout || output.stderr || 'ok'}\n`);
 }
 
@@ -1081,6 +1160,7 @@ async function cmdKill(settings, flags) {
   }
 
   consumeConfirmation(flags.confirm);
+  const approval = consumeApprovalIfRequired(settings, flags.approval, 'kill', subagentId);
 
   const whitelist = new Set((settings.control.killWhitelist || []).map((item) => String(item)));
   if (!whitelist.has(subagentId)) {
@@ -1105,12 +1185,29 @@ async function cmdKill(settings, flags) {
     throw new Error(`failed to SIGTERM PID ${target.pid}: ${String(error)}`);
   }
 
-  appendAuditEvent('control-kill-subagent', {
+  const audit = appendAuditEvent('control-kill-subagent', {
     subagentId,
     pid: target.pid,
     confirm: String(flags.confirm || ''),
+    approvalId: approval.approvalId || '',
   });
 
+  if (flags.json) {
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          ok: true,
+          subagentId,
+          pid: target.pid,
+          auditId: audit.auditId,
+          approval,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    return;
+  }
   process.stdout.write(`Sent SIGTERM to subagent ${subagentId} (pid ${target.pid}).\n`);
 }
 
@@ -1123,6 +1220,7 @@ async function cmdTrigger(settings, flags) {
   }
 
   consumeConfirmation(flags.confirm);
+  const approval = consumeApprovalIfRequired(settings, flags.approval, 'trigger', jobId);
 
   const whitelist = new Set(
     (Array.isArray(settings.control.triggerWhitelist) ? settings.control.triggerWhitelist : [])
@@ -1141,11 +1239,18 @@ async function cmdTrigger(settings, flags) {
   try {
     const output = runCommand(process.execPath, [scriptPath, ...childArgs]);
     payload = extractJson(output.stdout || '');
-    appendAuditEvent('control-trigger-job', {
+    const audit = appendAuditEvent('control-trigger-job', {
       jobId,
       command: commandText,
       ok: true,
+      approvalId: approval.approvalId || '',
     });
+    payload = payload && typeof payload === 'object'
+      ? {
+          ...payload,
+          _triggerAuditId: audit.auditId,
+        }
+      : payload;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     appendAuditEvent('control-trigger-job-error', {
@@ -1161,6 +1266,7 @@ async function cmdTrigger(settings, flags) {
     ok: true,
     jobId,
     command: commandText,
+    approval,
     payload,
   };
 
@@ -1294,6 +1400,12 @@ async function cmdAutoPr(settings, flags) {
     throw new Error('autopr execute mode is disabled. Set autopr.allowExecute=true in config first.');
   }
   consumeConfirmation(flags.confirm);
+  const approval = consumeApprovalIfRequired(
+    settings,
+    flags.approval,
+    'autopr',
+    issueIdentifier || branchName,
+  );
 
   const token = String(flags.token || settings.github.token || '').trim();
   if (!token) {
@@ -1335,17 +1447,20 @@ async function cmdAutoPr(settings, flags) {
     githubRepo,
     branch: branchName,
     base: baseBranch,
+    approval,
     pullRequest,
   };
 
-  appendAuditEvent('autopr-created', {
+  const audit = appendAuditEvent('autopr-created', {
     repo: githubRepo,
     branch: branchName,
     base: baseBranch,
     prNumber: pullRequest.number,
     prUrl: pullRequest.url,
     draft,
+    approvalId: approval.approvalId || '',
   });
+  result.auditId = audit.auditId;
 
   if (flags.json) {
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
@@ -1685,6 +1800,7 @@ async function cmdTriage(settings, flags) {
   const labels = normalizeLabelNames(flags.labels || flags.label || '');
   const dueDate = String(flags['due-date'] || '').trim();
   const priority = Number(flags.priority || 3);
+  const eventType = normalizeIngestEventType(flags['event-type'] || flags.eventType || '', 'triage.cli');
 
   const delivery = await createTriageIssueWithFallback(
     {
@@ -1698,6 +1814,7 @@ async function cmdTriage(settings, flags) {
       state,
       labels,
       dueDate,
+      eventType,
       priority: Number.isFinite(priority) ? priority : 3,
     },
     settings,
@@ -2113,6 +2230,7 @@ async function cmdMemoSave(settings, flags) {
         description: `${memo.body}\n\n---\nSource: ${memo.sourceUrl}`,
         source: 'memo',
         sourceId: memo.sourceId,
+        eventType: 'discord.memo',
         author: memo.author,
         sourceUrl: memo.sourceUrl,
         state: 'Triage',
@@ -2216,122 +2334,27 @@ async function cmdMemoSave(settings, flags) {
 }
 
 async function cmdQueueDrain(settings, flags) {
-  const queueState = readJsonFile(INGEST_QUEUE_PATH, { version: 1, items: [] });
-  const dlqState = readJsonFile(INGEST_DLQ_PATH, { version: 1, items: [] });
-  const queueItems = Array.isArray(queueState.items) ? queueState.items : [];
-  const dlqItems = Array.isArray(dlqState.items) ? dlqState.items : [];
-  const nowMs = Date.now();
-  const maxRetries = Math.max(1, Number(settings.intakeQueue.maxRetries || 5));
-
-  const kept = [];
-  const processed = [];
-  let success = 0;
-  let retried = 0;
-  let movedToDlq = 0;
-
-  for (const item of queueItems) {
-    const nextAt = Number(item.nextAttemptAtMs || 0);
-    if (nextAt > nowMs) {
-      kept.push(item);
-      continue;
-    }
-
-    try {
-      const issue = await processQueuedIngestItem(item, settings);
-      success += 1;
-      processed.push({
-        id: item.id,
-        status: 'delivered',
-        issueIdentifier: issue.identifier,
-      });
-      appendAuditEvent('ingest-queue-delivered', {
-        queueId: item.id,
-        kind: item.kind,
-        issueIdentifier: issue.identifier,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const attempts = Number(item.attempts || 0) + 1;
-      if (attempts >= maxRetries) {
-        movedToDlq += 1;
-        dlqItems.push({
-          ...item,
-          attempts,
-          lastError: message,
-          movedToDlqAtMs: nowMs,
-        });
-        processed.push({
-          id: item.id,
-          status: 'dlq',
-          attempts,
-          error: message,
-        });
-        appendAuditEvent('ingest-queue-dlq', {
-          queueId: item.id,
-          kind: item.kind,
-          attempts,
-          error: message,
-        });
-      } else {
-        retried += 1;
-        const backoffMs = computeIngestBackoffMs(attempts);
-        kept.push({
-          ...item,
-          attempts,
-          lastError: message,
-          nextAttemptAtMs: nowMs + backoffMs,
-          updatedAtMs: nowMs,
-        });
-        processed.push({
-          id: item.id,
-          status: 'retry',
-          attempts,
-          nextAttemptAtMs: nowMs + backoffMs,
-          error: message,
-        });
-      }
-    }
-  }
-
-  queueState.updatedAtMs = nowMs;
-  queueState.items = kept;
-  dlqState.updatedAtMs = nowMs;
-  dlqState.items = dlqItems;
-  writeJsonFile(INGEST_QUEUE_PATH, queueState);
-  writeJsonFile(INGEST_DLQ_PATH, dlqState);
-
+  const result = await drainIngestQueue(settings, flags, {
+    maxRetriesOverride: flags['max-retries'],
+  });
   if (flags.json) {
-    process.stdout.write(
-      `${JSON.stringify(
-        {
-          ok: true,
-          queuedBefore: queueItems.length,
-          queuedAfter: kept.length,
-          success,
-          retried,
-          movedToDlq,
-          processed,
-        },
-        null,
-        2,
-      )}\n`,
-    );
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     return;
   }
-
   const lines = [];
   lines.push('Queue drain result:');
-  lines.push(`- queued before: ${queueItems.length}`);
-  lines.push(`- delivered: ${success}`);
-  lines.push(`- retried: ${retried}`);
-  lines.push(`- moved to DLQ: ${movedToDlq}`);
-  lines.push(`- queued after: ${kept.length}`);
+  lines.push(`- queued before: ${result.queuedBefore}`);
+  lines.push(`- delivered: ${result.success}`);
+  lines.push(`- retried: ${result.retried}`);
+  lines.push(`- moved to DLQ: ${result.movedToDlq}`);
+  lines.push(`- queued after: ${result.queuedAfter}`);
   process.stdout.write(`${lines.join('\n')}\n`);
 }
 
 async function cmdQueueStats(settings, flags) {
   const queueState = readJsonFile(INGEST_QUEUE_PATH, { version: 1, items: [], updatedAtMs: 0 });
   const dlqState = readJsonFile(INGEST_DLQ_PATH, { version: 1, items: [], updatedAtMs: 0 });
+  const ingestLedger = readIngestLedger();
   const queueItems = Array.isArray(queueState.items) ? queueState.items : [];
   const dlqItems = Array.isArray(dlqState.items) ? dlqState.items : [];
 
@@ -2376,11 +2399,20 @@ async function cmdQueueStats(settings, flags) {
     ok: true,
     queued: queueItems.length,
     dlq: dlqItems.length,
+    ledgerItems: Object.keys(ingestLedger.items || {}).length,
     queueUpdatedAtMs: Number(queueState.updatedAtMs || 0),
     dlqUpdatedAtMs: Number(dlqState.updatedAtMs || 0),
     retryBuckets,
     topQueueSources: topN(queueBySource, 8),
     topDlqSources: topN(dlqBySource, 8),
+    topLedgerStatus: topN(
+      Object.values(ingestLedger.items || {}).reduce((acc, item) => {
+        const key = String(item && item.status ? item.status : 'unknown').trim().toLowerCase() || 'unknown';
+        acc[key] = Number(acc[key] || 0) + 1;
+        return acc;
+      }, {}),
+      8,
+    ),
   };
 
   if (flags.json) {
@@ -2392,6 +2424,7 @@ async function cmdQueueStats(settings, flags) {
   lines.push('Ingest queue stats:');
   lines.push(`- queue: ${result.queued}`);
   lines.push(`- dlq: ${result.dlq}`);
+  lines.push(`- ledger: ${result.ledgerItems}`);
   lines.push(
     `- retries: a0=${retryBuckets.attempts0}, a1=${retryBuckets.attempts1}, a2=${retryBuckets.attempts2}, a3+=${retryBuckets.attempts3Plus}`,
   );
@@ -2508,6 +2541,7 @@ async function cmdSlaCheck(settings, flags) {
             .join('\n'),
           source: 'sla-check',
           sourceId: `blocked:${issue.identifier}:${issue.updatedAt}`,
+          eventType: 'sla.blocked',
           labels: ['ops', 'sla'],
           state: 'Triage',
           priority: 2,
@@ -2622,6 +2656,7 @@ async function cmdRunbookExec(settings, flags) {
   const explicitDryRun = Boolean(flags['dry-run'] || flags.dryRun);
   const dryRun = explicitExecute ? false : explicitDryRun ? true : defaultDryRun;
   const continueOnError = Boolean(flags['continue-on-error']);
+  let approval = { required: false, approved: true, approvalId: '' };
 
   if (!dryRun) {
     if (settings.runbook.allowExecute === false) {
@@ -2630,6 +2665,12 @@ async function cmdRunbookExec(settings, flags) {
       );
     }
     consumeConfirmation(flags.confirm);
+    approval = consumeApprovalIfRequired(
+      settings,
+      flags.approval,
+      'runbook-exec',
+      `${card}:${issueIdentifier || 'none'}`,
+    );
   }
 
   const startedAtMs = Date.now();
@@ -2709,6 +2750,7 @@ async function cmdRunbookExec(settings, flags) {
     issueIdentifier: plan.issueIdentifier || '',
     dryRun,
     continueOnError,
+    approval,
     startedAtMs,
     finishedAtMs: Date.now(),
     durationMs: Date.now() - startedAtMs,
@@ -2736,7 +2778,7 @@ async function cmdRunbookExec(settings, flags) {
   runbookState.runs = runHistory.slice(0, 100);
   writeJsonFile(RUNBOOK_EXEC_PATH, runbookState);
 
-  appendAuditEvent('runbook-exec-summary', {
+  const summaryAudit = appendAuditEvent('runbook-exec-summary', {
     card: summary.card,
     issueIdentifier: summary.issueIdentifier,
     dryRun: summary.dryRun,
@@ -2745,7 +2787,9 @@ async function cmdRunbookExec(settings, flags) {
     actionsAttempted: summary.actionsAttempted,
     actionsFailed: summary.actionsFailed,
     durationMs: summary.durationMs,
+    approvalId: approval.approvalId || '',
   });
+  summary.auditId = summaryAudit.auditId;
 
   if (flags.json) {
     process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
@@ -2919,6 +2963,7 @@ async function cmdIngestServer(settings, flags) {
 
   const server = http.createServer(async (req, res) => {
     const requestPath = new URL(String(req.url || '/'), `http://${host}`).pathname;
+    const startedAtMs = Date.now();
 
     try {
       if (String(req.method || '').toUpperCase() !== 'POST') {
@@ -2951,10 +2996,20 @@ async function cmdIngestServer(settings, flags) {
           labels: normalizeLabelNames(body.labels || ''),
           dueDate: String(body.dueDate || '').trim(),
           priority: Number(body.priority || 3),
+          eventType: normalizeIngestEventType(
+            String(body.eventType || body.type || '').trim(),
+            'webhook.triage',
+          ),
         };
 
         const delivery = await createTriageIssueWithFallback(input, settings, { context: 'ingest-server-triage' });
         if (delivery.queued) {
+          recordWebhookMetric({
+            source: 'triage',
+            eventType: String(input.eventType || 'webhook.triage'),
+            status: 'queued',
+            latencyMs: Date.now() - startedAtMs,
+          });
           sendJson(res, 202, {
             ok: true,
             queued: true,
@@ -2962,6 +3017,12 @@ async function cmdIngestServer(settings, flags) {
             error: delivery.error,
           });
         } else {
+          recordWebhookMetric({
+            source: 'triage',
+            eventType: String(input.eventType || 'webhook.triage'),
+            status: 'ok',
+            latencyMs: Date.now() - startedAtMs,
+          });
           sendJson(res, 200, { ok: true, issue: delivery.issue });
         }
         return;
@@ -2980,6 +3041,12 @@ async function cmdIngestServer(settings, flags) {
         const input = buildDiscordTriageInput(body);
         const delivery = await createTriageIssueWithFallback(input, settings, { context: 'ingest-server-discord' });
         if (delivery.queued) {
+          recordWebhookMetric({
+            source: 'discord',
+            eventType: String(input.eventType || 'discord.message'),
+            status: 'queued',
+            latencyMs: Date.now() - startedAtMs,
+          });
           sendJson(res, 202, {
             ok: true,
             source: 'discord',
@@ -2988,6 +3055,12 @@ async function cmdIngestServer(settings, flags) {
             error: delivery.error,
           });
         } else {
+          recordWebhookMetric({
+            source: 'discord',
+            eventType: String(input.eventType || 'discord.message'),
+            status: 'ok',
+            latencyMs: Date.now() - startedAtMs,
+          });
           sendJson(res, 200, { ok: true, issue: delivery.issue, source: 'discord' });
         }
         return;
@@ -3004,17 +3077,71 @@ async function cmdIngestServer(settings, flags) {
         const body = rawBody.parsed;
         const event = String(req.headers['x-github-event'] || '').toLowerCase();
         const delivery = String(req.headers['x-github-delivery'] || '').trim();
+        if (delivery && isWebhookReplayDuplicate('github', delivery, settings)) {
+          recordWebhookMetric({
+            source: 'github',
+            eventType: `github.${event || 'unknown'}.replay`,
+            status: 'replay',
+            latencyMs: Date.now() - startedAtMs,
+            delivery,
+            replay: true,
+          });
+          sendJson(res, 409, { ok: false, error: 'replay_detected', delivery });
+          return;
+        }
         const result = await handleGithubPullRequestEvent(event, body, settings, {
           delivery,
           via: 'webhook',
         });
-        sendJson(res, 200, { ok: true, event, result });
+        const action = String(body && body.action ? body.action : '').trim().toLowerCase();
+        const ingestEvent = {
+          id: delivery || crypto.randomUUID(),
+          kind: 'github-webhook',
+          payload: {
+            source: 'github',
+            sourceId: delivery || `github:${event}:${action}:${Date.now()}`,
+            eventType: `github.${event || 'unknown'}${action ? `.${action}` : ''}`,
+          },
+          dedupeKey: buildIngestIdempotencyKey(
+            {
+              source: 'github',
+              sourceId: delivery || `github:${event}:${action}:${Date.now()}`,
+              eventType: `github.${event || 'unknown'}${action ? `.${action}` : ''}`,
+            },
+            'github.pull_request',
+          ),
+        };
+        updateIngestLedgerForItem(ingestEvent, result && result.handled ? 'delivered' : 'ignored', {
+          issueIdentifier:
+            result && Array.isArray(result.identifiers) && result.identifiers.length > 0
+              ? result.identifiers[0]
+              : '',
+        });
+        if (delivery) {
+          markWebhookReplaySeen('github', delivery);
+        }
+        const metric = recordWebhookMetric({
+          source: 'github',
+          eventType: `github.${event || 'unknown'}${action ? `.${action}` : ''}`,
+          status: result && result.handled ? 'ok' : 'ignored',
+          latencyMs: Date.now() - startedAtMs,
+          delivery,
+        });
+        sendJson(res, 200, { ok: true, event, result, metrics: { p95Ms: metric.p95Ms, events: metric.events } });
         return;
       }
 
       sendJson(res, 404, { ok: false, error: 'not_found' });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const source =
+        requestPath === githubPath ? 'github' : requestPath === discordPath ? 'discord' : requestPath === triagePath ? 'triage' : 'webhook';
+      recordWebhookMetric({
+        source,
+        eventType: `webhook.error.${source}`,
+        status: 'error',
+        latencyMs: Date.now() - startedAtMs,
+      });
       sendJson(res, 500, { ok: false, error: message });
     }
   });
@@ -3054,15 +3181,40 @@ async function cmdGithubHooks(settings, flags) {
 }
 
 async function cmdGithubSync(settings, flags) {
-  const token = String(flags.token || settings.github.token || '').trim();
-  if (!token) {
-    throw new Error('GitHub token missing. Set GITHUB_TOKEN or ~/.openclaw/credentials/github-token.txt');
-  }
-
   const lookbackHours = Number(flags['lookback-hours'] || settings.github.lookbackHours || 72);
   const repos = resolveGithubRepos(settings, flags);
   if (repos.length === 0) {
     throw new Error('No GitHub repositories configured for sync.');
+  }
+
+  const forcePoll = isTruthyLike(flags.force || flags['force-poll']);
+  const webhookSummary = summarizeWebhookMetrics(readWebhookMetrics());
+  const pollIntervalMinutes = Math.max(1, Number(settings.github.pollIntervalMinutes || 15));
+  const webhookFresh =
+    webhookSummary.githubEvents > 0 &&
+    webhookSummary.lastEventAtMs > 0 &&
+    Date.now() - webhookSummary.lastEventAtMs <= pollIntervalMinutes * 60 * 1000;
+  if (webhookFresh && !forcePoll) {
+    const skipped = {
+      ok: true,
+      skipped: true,
+      reason: 'webhook-fresh',
+      webhook: webhookSummary,
+      repos,
+    };
+    if (flags.json) {
+      process.stdout.write(`${JSON.stringify(skipped, null, 2)}\n`);
+      return;
+    }
+    process.stdout.write(
+      `GitHub sync skipped: webhook path is fresh (last event ${formatDuration(Date.now() - webhookSummary.lastEventAtMs)} ago).\n`,
+    );
+    return;
+  }
+
+  const token = String(flags.token || settings.github.token || '').trim();
+  if (!token) {
+    throw new Error('GitHub token missing. Set GITHUB_TOKEN or ~/.openclaw/credentials/github-token.txt');
   }
 
   const sinceMs = Date.now() - Math.max(1, lookbackHours) * 60 * 60 * 1000;
@@ -3340,6 +3492,7 @@ async function cmdDiscordIntakeSync(settings, flags) {
       ...baseLabels,
       'discord',
     ]);
+    input.eventType = normalizeIngestEventType(input.eventType || '', 'discord.directive');
 
     const delivery = await createTriageIssueWithFallback(input, settings, { context: 'discord-intake-sync' });
     state.items[sourceId] = tsMs || Date.now();
@@ -3647,6 +3800,7 @@ async function cmdLinearAutopilot(settings, flags) {
       retries: agentRetries,
       retryBackoffSeconds,
       fallbackAgentSuffix,
+      settings,
       trace,
     });
     agentAttempts = execution.attempts || [];
@@ -3787,6 +3941,34 @@ async function cmdLinearAutopilot(settings, flags) {
     circuitStatus: result.circuit && result.circuit.status ? result.circuit.status : 'unknown',
     error: result.error || result.commentError || '',
   });
+  const failureClasses = Array.isArray(result.attempts)
+    ? result.attempts
+        .map((item) => String(item && item.failureClass ? item.failureClass : '').trim().toLowerCase())
+        .filter(Boolean)
+    : [];
+  const failureClassCount = {
+    rate_limit: failureClasses.filter((item) => item === 'rate_limit').length,
+    lock_conflict: failureClasses.filter((item) => item === 'lock_conflict').length,
+    timeout: failureClasses.filter((item) => item === 'timeout').length,
+    unknown: failureClasses.filter((item) => item === 'unknown').length,
+  };
+  recordExecutorStabilityRun({
+    source: 'linear-autopilot',
+    ok: result.ok,
+    issueIdentifier: result.issue.identifier,
+    attempts: Array.isArray(result.attempts) ? result.attempts.length : 0,
+    maxAttemptsUsed: Array.isArray(result.attempts) ? result.attempts.length : 0,
+    failureClassCount,
+    recovered: result.ok ? 1 : 0,
+    failed: result.ok ? 0 : 1,
+    maxConcurrentCritical: 1,
+    retryable: {
+      total: failureClassCount.rate_limit + failureClassCount.lock_conflict + failureClassCount.timeout,
+      recovered: result.ok ? failureClassCount.rate_limit + failureClassCount.lock_conflict + failureClassCount.timeout : 0,
+    },
+    p95RecoveryMs: 0,
+    avgRecoveryMs: 0,
+  });
 
   if (flags.json) {
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
@@ -3886,6 +4068,7 @@ async function cmdTodoistSync(settings, flags) {
           .join('\n'),
         source: 'todoist',
         sourceId: key,
+        eventType: 'todoist.task',
         state: String(settings.todoist.defaultState || 'Triage'),
         labels: [String(settings.todoist.label || 'todoist')],
         dueDate: task.due && task.due.date ? String(task.due.date) : '',
@@ -4184,6 +4367,7 @@ async function cmdCalendarSync(settings, flags) {
           description: `Google Calendar event snapshot\nid: ${event.id}\nsource: ${tab.url}`,
           source: 'google-calendar',
           sourceId: event.id,
+          eventType: 'calendar.event',
           labels: [String(settings.calendar.label || 'calendar')],
           state: String(settings.calendar.defaultState || 'Triage'),
           priority: 3,
@@ -4360,13 +4544,14 @@ async function createTriageIssueFromInput(input, settings) {
 
   const source = String(input.source || '').trim().toLowerCase();
   const sourceIdRaw = String(input.sourceId || '').trim();
+  const eventType = normalizeIngestEventType(input.eventType || '', 'triage.create');
   let sourceId = sourceIdRaw ? normalizeSourceId(sourceIdRaw) : '';
   let sourceIdDerived = false;
   if (!sourceId && source) {
     sourceId = deriveAutoSourceId(input);
     sourceIdDerived = Boolean(sourceId);
   }
-  const dedupeKey = source && sourceId ? `${source}:${sourceId}` : '';
+  const dedupeKey = buildIngestIdempotencyKey({ source, sourceId, eventType }, 'triage.create');
   const signature = buildTriageSignatureCandidate(input, settings);
   return withTaskLock(
     TRIAGE_CREATE_LOCK_PATH,
@@ -4386,12 +4571,13 @@ async function createTriageIssueFromInput(input, settings) {
             title: String(existing.title || existing.identifier),
             url: String(existing.url || ''),
             stateName: String(existing.stateName || ''),
-            labels: Array.isArray(existing.labels) ? existing.labels.map((item) => String(item)) : [],
-            source,
-            sourceId,
-            sourceIdDerived,
-            deduped: true,
-            dedupeKey,
+              labels: Array.isArray(existing.labels) ? existing.labels.map((item) => String(item)) : [],
+              source,
+              sourceId,
+              eventType,
+              sourceIdDerived,
+              deduped: true,
+              dedupeKey,
           };
         }
       }
@@ -4405,12 +4591,13 @@ async function createTriageIssueFromInput(input, settings) {
             title: String(existingBySignature.title || existingBySignature.identifier),
             url: String(existingBySignature.url || ''),
             stateName: String(existingBySignature.stateName || ''),
-            labels: [],
-            source,
-            sourceId,
-            sourceIdDerived,
-            deduped: true,
-            dedupeKey: `signature:${signature.signature}`,
+              labels: [],
+              source,
+              sourceId,
+              eventType,
+              sourceIdDerived,
+              deduped: true,
+              dedupeKey: `signature:${signature.signature}`,
           };
         }
       }
@@ -4497,6 +4684,7 @@ async function createTriageIssueFromInput(input, settings) {
           labels: (((issue.labels || {}).nodes || []).map((item) => item.name)).filter(Boolean),
           source,
           sourceId,
+          eventType,
           createdAtMs: Date.now(),
         };
         writeJsonFile(SOURCE_ID_INDEX_PATH, index);
@@ -4516,6 +4704,7 @@ async function createTriageIssueFromInput(input, settings) {
         routeHits: Array.isArray(routedInput.routeHits) ? routedInput.routeHits : [],
         source,
         sourceId,
+        eventType,
         sourceIdDerived,
         deduped: false,
         dedupeKey: dedupeKey || (signature && signature.signature ? `signature:${signature.signature}` : ''),
@@ -4525,8 +4714,25 @@ async function createTriageIssueFromInput(input, settings) {
 }
 
 async function createTriageIssueWithFallback(input, settings, options = {}) {
+  const normalizedInput = {
+    ...input,
+    eventType: normalizeIngestEventType(input && input.eventType ? input.eventType : '', 'triage.create'),
+  };
   try {
-    const issue = await createTriageIssueFromInput(input, settings);
+    const issue = await createTriageIssueFromInput(normalizedInput, settings);
+    const ingestItem = {
+      id: '',
+      kind: 'triage',
+      payload: normalizedInput,
+      dedupeKey: issue && issue.dedupeKey ? issue.dedupeKey : buildIngestIdempotencyKey(normalizedInput, 'triage.create'),
+      idempotencyKey: issue && issue.dedupeKey ? issue.dedupeKey : buildIngestIdempotencyKey(normalizedInput, 'triage.create'),
+      attempts: 0,
+    };
+    updateIngestLedgerForItem(ingestItem, issue && issue.deduped ? 'deduped-existing' : 'delivered', {
+      issueIdentifier: issue && issue.identifier ? issue.identifier : '',
+      issueId: issue && issue.id ? issue.id : '',
+      attempts: 0,
+    });
     return {
       ok: true,
       queued: false,
@@ -4541,12 +4747,13 @@ async function createTriageIssueWithFallback(input, settings, options = {}) {
     if (options.queueOnError === false) {
       throw error;
     }
-    const queued = enqueueIngestItem('triage', input, error, settings);
+    const queued = enqueueIngestItem('triage', normalizedInput, error, settings);
     const message = error instanceof Error ? error.message : String(error);
     appendAuditEvent('triage-create-queued-fallback', {
       context: String(options.context || 'unknown'),
-      source: String(input && input.source ? input.source : ''),
-      sourceId: String(input && input.sourceId ? input.sourceId : ''),
+      source: String(normalizedInput && normalizedInput.source ? normalizedInput.source : ''),
+      sourceId: String(normalizedInput && normalizedInput.sourceId ? normalizedInput.sourceId : ''),
+      eventType: String(normalizedInput.eventType || ''),
       queueId: queued.id,
       dedupe: Boolean(queued.reused),
       error: message,
@@ -5396,11 +5603,23 @@ function collectLinkedIssueSignals(settings, flags) {
     .sort((a, b) => Number(a.ageMs || 0) - Number(b.ageMs || 0));
   for (const session of sessions) {
     const taskId = `session:${session.agentId}:${session.key}`;
-    const identifier = resolveIssueFromBindings(bindings, {
+    let identifier = resolveIssueFromBindings(bindings, {
       taskId,
       sessionId: session.sessionId || '',
       sessionKey: session.key || '',
     });
+    if (!identifier) {
+      const inferred = inferIssueFromSession(session, settings);
+      if (inferred) {
+        identifier = inferred;
+        upsertRuntimeIssueBindings(inferred, {
+          taskId,
+          sessionId: session.sessionId || '',
+          sessionKey: session.key || '',
+          agentId: session.agentId || inferAgentId(session.key) || '',
+        });
+      }
+    }
     const context = ensureContext(identifier);
     if (!context) {
       continue;
@@ -5566,29 +5785,17 @@ function collectLinkedIssueSignals(settings, flags) {
 }
 
 function decideIssueTargetState(context, settings) {
-  if (context.cronWarnings.length > 0) {
-    context.reason = 'cron-warning';
-    return String(settings.statusMachine.stateBlocked || 'Blocked');
-  }
-  if (context.githubMerged.length > 0) {
-    context.reason = 'github-merged';
-    return String(settings.statusMachine.stateDone || settings.github.stateDone || 'Done');
-  }
-  if (context.githubOpen.length > 0) {
-    context.reason = 'github-open-pr';
-    return String(settings.statusMachine.stateInReview || settings.github.stateInReview || 'In Review');
-  }
-  if (context.activeSessions.length > 0 || context.activeSubagents.length > 0) {
-    context.reason = 'runtime-active';
-    return String(settings.statusMachine.stateInProgress || 'In Progress');
-  }
-  if (Array.isArray(context.autopilotRecent) && context.autopilotRecent.length > 0) {
-    const latest = context.autopilotRecent[0] || {};
-    context.reason = 'autopilot-recent';
-    if (String(latest.status || '').toLowerCase() === 'blocked') {
-      return String(settings.statusMachine.stateBlocked || 'Blocked');
+  const rules = getActiveStatusMachineRules(settings);
+  for (const rule of rules) {
+    if (!evaluateStatusRule(rule, context)) {
+      continue;
     }
-    return String(settings.statusMachine.stateInProgress || 'In Progress');
+    const targetState = resolveRuleTargetState(rule, settings);
+    if (!targetState) {
+      continue;
+    }
+    context.reason = String(rule.reason || rule.id || 'rule-match').trim();
+    return targetState;
   }
   context.reason = 'no-signal';
   return '';
@@ -6670,22 +6877,7 @@ function classifyAutopilotFailure(result) {
     return { failed: false, reason: '', message: '' };
   }
 
-  const lower = errorText.toLowerCase();
-  let reason = 'error';
-  if (
-    lower.includes('etimedout') ||
-    lower.includes('timed out') ||
-    /timeout\s+\d+ms/i.test(errorText) ||
-    lower.includes('timeoutexpired')
-  ) {
-    reason = 'timeout';
-  } else if (lower.includes('rate limit') || lower.includes('cooldown')) {
-    reason = 'rate_limit';
-  } else if (lower.includes('session file locked') || lower.includes('already-running')) {
-    reason = 'session_lock';
-  } else if (lower.includes('gateway closed') || lower.includes('service restart')) {
-    reason = 'gateway_restart';
-  }
+  const reason = classifyExecutorFailure(errorText);
 
   return {
     failed: true,
@@ -6744,6 +6936,7 @@ async function updateAutopilotCircuitState(input) {
           title: `[ops] linear-autopilot circuit open (${state.consecutiveFailures} consecutive failures)`,
           source: 'mission-control',
           sourceId: `ops:linear-autopilot-circuit:${state.openedAtMs}`,
+          eventType: 'mission-control.circuit-open',
           state: circuitSettings.issueState || 'Triage',
           priority: normalizeLinearPriority(circuitSettings.issuePriority || 2),
           labels: dedupeStrings([
@@ -6912,12 +7105,21 @@ async function runLinearAutopilotAgent(options) {
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const retryable = isRetryableAutopilotError(message);
+      const failureClass = classifyExecutorFailure(message);
+      const retryable = isRetryableExecutorCategory(failureClass) || isRetryableAutopilotError(message);
+      const backoffMs = computeExecutorBackoffMs(
+        failureClass,
+        attemptNo,
+        retryBackoffSeconds,
+        options && options.settings ? options.settings : {},
+      );
       attempts.push({
         attempt: attemptNo,
         agentId: agentForAttempt,
         ok: false,
+        failureClass,
         retryable,
+        backoffMs: retryable ? backoffMs : 0,
         error: singleLine(trimMessage(message, 320)),
       });
 
@@ -6933,8 +7135,8 @@ async function runLinearAutopilotAgent(options) {
         };
       }
 
-      const sleepForMs = retryBackoffSeconds * 1000 * attemptNo;
-      trace(`openclaw agent: retry in ${sleepForMs}ms`);
+      const sleepForMs = backoffMs;
+      trace(`openclaw agent: retry in ${sleepForMs}ms (class=${failureClass})`);
       // Space retries to reduce collisions with rate limit/session lock windows.
       await sleepMs(sleepForMs);
     }
@@ -7065,6 +7267,7 @@ function upsertRuntimeIssueBindings(issueIdentifier, refs) {
     bySessionKey: {},
     bySubagentId: {},
     byCronId: {},
+    byIssue: {},
   });
 
   bindings.byTaskId = bindings.byTaskId && typeof bindings.byTaskId === 'object' ? bindings.byTaskId : {};
@@ -7075,6 +7278,7 @@ function upsertRuntimeIssueBindings(issueIdentifier, refs) {
   bindings.bySubagentId =
     bindings.bySubagentId && typeof bindings.bySubagentId === 'object' ? bindings.bySubagentId : {};
   bindings.byCronId = bindings.byCronId && typeof bindings.byCronId === 'object' ? bindings.byCronId : {};
+  bindings.byIssue = bindings.byIssue && typeof bindings.byIssue === 'object' ? bindings.byIssue : {};
 
   let changed = false;
   if (taskId && bindings.byTaskId[taskId] !== normalized) {
@@ -7103,6 +7307,38 @@ function upsertRuntimeIssueBindings(issueIdentifier, refs) {
   }
   if (cronId && bindings.byCronId[cronId] !== normalized) {
     bindings.byCronId[cronId] = normalized;
+    changed = true;
+  }
+
+  const issueEntry = bindings.byIssue[normalized] && typeof bindings.byIssue[normalized] === 'object'
+    ? bindings.byIssue[normalized]
+    : {
+        taskIds: [],
+        sessionIds: [],
+        sessionKeys: [],
+        subagentIds: [],
+        cronIds: [],
+      };
+  const pushUnique = (arr, value) => {
+    if (!value) {
+      return false;
+    }
+    const key = String(value);
+    if (arr.includes(key)) {
+      return false;
+    }
+    arr.push(key);
+    return true;
+  };
+  let reverseChanged = false;
+  reverseChanged = pushUnique(issueEntry.taskIds, taskId) || reverseChanged;
+  reverseChanged = pushUnique(issueEntry.sessionIds, sessionId) || reverseChanged;
+  reverseChanged = pushUnique(issueEntry.sessionKeys, sessionKey) || reverseChanged;
+  reverseChanged = pushUnique(issueEntry.subagentIds, subagentId) || reverseChanged;
+  reverseChanged = pushUnique(issueEntry.cronIds, cronId) || reverseChanged;
+  if (reverseChanged) {
+    issueEntry.updatedAtMs = Date.now();
+    bindings.byIssue[normalized] = issueEntry;
     changed = true;
   }
 
@@ -7335,6 +7571,7 @@ function buildDiscordTriageInput(body) {
     description: String(payload.description || '').trim(),
     source: 'discord',
     sourceId,
+    eventType: normalizeIngestEventType(payload.eventType || payload.type || '', 'discord.message'),
     author,
     sourceUrl: url,
     state: String(payload.state || 'Triage').trim(),
@@ -7696,26 +7933,77 @@ async function fetchDiscordMessagesViaOpenClaw(channelId, messageId, contextLimi
 }
 
 function enqueueIngestItem(kind, payload, error, settings) {
+  const normalizedPayload = {
+    ...(payload && typeof payload === 'object' ? payload : {}),
+    source: String(payload && payload.source ? payload.source : '').trim().toLowerCase(),
+    sourceId: String(payload && payload.sourceId ? normalizeSourceId(payload.sourceId) : '').trim(),
+    eventType: normalizeIngestEventType(payload && payload.eventType ? payload.eventType : '', 'triage.create'),
+  };
   const queue = readJsonFile(INGEST_QUEUE_PATH, { version: 1, items: [] });
   const items = Array.isArray(queue.items) ? queue.items : [];
-  const dedupeKey = buildIngestQueueDedupeKey(payload);
+  const dedupeKey = buildIngestQueueDedupeKey(normalizedPayload);
+  const ledger = readIngestLedger();
+  const existingLedger = dedupeKey && ledger.items ? ledger.items[dedupeKey] : null;
+  if (
+    existingLedger &&
+    ['delivered', 'deduped-delivered', 'deduped-existing'].includes(String(existingLedger.status || '').toLowerCase())
+  ) {
+    updateIngestLedgerForItem(
+      {
+        id: String(existingLedger.queueId || ''),
+        kind,
+        payload: normalizedPayload,
+        dedupeKey,
+        idempotencyKey: dedupeKey,
+        attempts: Number(existingLedger.attempts || 0),
+      },
+      'deduped-delivered',
+      {
+        issueIdentifier: existingLedger.issueIdentifier || '',
+      },
+    );
+    appendAuditEvent('ingest-queue-dedupe-delivered', {
+      kind,
+      dedupeKey,
+      source: normalizedPayload.source || '',
+      sourceId: normalizedPayload.sourceId || '',
+      eventType: normalizedPayload.eventType || '',
+      issueIdentifier: existingLedger.issueIdentifier || '',
+    });
+    return {
+      id: String(existingLedger.queueId || ''),
+      kind,
+      payload: normalizedPayload,
+      dedupeKey,
+      idempotencyKey: dedupeKey,
+      reused: true,
+      fromLedger: true,
+      issueIdentifier: String(existingLedger.issueIdentifier || ''),
+    };
+  }
   if (dedupeKey) {
     const existing = items.find((entry) => String(entry.dedupeKey || '') === dedupeKey);
     if (existing) {
       existing.updatedAtMs = Date.now();
       existing.lastError = error instanceof Error ? error.message : String(error);
+      existing.idempotencyKey = dedupeKey;
       writeJsonFile(INGEST_QUEUE_PATH, {
         ...queue,
         version: 1,
         updatedAtMs: existing.updatedAtMs,
         items,
       });
+      updateIngestLedgerForItem(existing, 'deduped-pending', {
+        error: existing.lastError || '',
+        attempts: Number(existing.attempts || 0),
+      });
       appendAuditEvent('ingest-queue-dedupe-hit', {
         queueId: existing.id,
         kind,
         dedupeKey,
-        source: payload && payload.source ? payload.source : '',
-        sourceId: payload && payload.sourceId ? payload.sourceId : '',
+        source: normalizedPayload.source || '',
+        sourceId: normalizedPayload.sourceId || '',
+        eventType: normalizedPayload.eventType || '',
       });
       return {
         ...existing,
@@ -7727,24 +8015,31 @@ function enqueueIngestItem(kind, payload, error, settings) {
   const item = {
     id: crypto.randomUUID(),
     kind,
-    payload,
+    payload: normalizedPayload,
     dedupeKey,
+    idempotencyKey: dedupeKey,
     attempts: 0,
     createdAtMs: nowMs,
     updatedAtMs: nowMs,
     nextAttemptAtMs: nowMs,
     lastError: error instanceof Error ? error.message : String(error),
+    retryHistory: [],
   };
   items.push(item);
   queue.version = 1;
   queue.updatedAtMs = nowMs;
   queue.items = items;
   writeJsonFile(INGEST_QUEUE_PATH, queue);
+  updateIngestLedgerForItem(item, 'queued', {
+    error: item.lastError,
+    attempts: 0,
+  });
   appendAuditEvent('ingest-queue-enqueue', {
     queueId: item.id,
     kind,
-    source: payload && payload.source ? payload.source : '',
-    sourceId: payload && payload.sourceId ? payload.sourceId : '',
+    source: normalizedPayload.source || '',
+    sourceId: normalizedPayload.sourceId || '',
+    eventType: normalizedPayload.eventType || '',
     dedupeKey,
     error: item.lastError,
     enabled: settings.intakeQueue.enabled !== false,
@@ -7753,21 +8048,34 @@ function enqueueIngestItem(kind, payload, error, settings) {
 }
 
 function buildIngestQueueDedupeKey(payload) {
-  const source = String(payload && payload.source ? payload.source : '')
-    .trim()
-    .toLowerCase();
-  const sourceIdRaw = String(payload && payload.sourceId ? payload.sourceId : '').trim();
-  const sourceId = sourceIdRaw ? normalizeSourceId(sourceIdRaw) : '';
-  if (!source || !sourceId) {
-    return '';
-  }
-  return `${source}:${sourceId}`;
+  return buildIngestIdempotencyKey(payload, 'triage.create');
 }
 
 async function processQueuedIngestItem(item, settings) {
   const kind = String(item.kind || '');
+  const payload = item && item.payload && typeof item.payload === 'object' ? item.payload : {};
+  const failUntilAttempt = Math.max(0, Number(payload.failUntilAttempt || 0));
+  const nextAttempt = Math.max(1, Number(item.attempts || 0) + 1);
+  if (Boolean(payload.__simulateFailure) || failUntilAttempt >= nextAttempt) {
+    const simulatedMessage = String(payload.simulatedError || 'simulated ingest failure').trim();
+    throw new Error(simulatedMessage || 'simulated ingest failure');
+  }
   if (kind === 'triage') {
-    return createTriageIssueFromInput(item.payload || {}, settings);
+    return createTriageIssueFromInput(payload, settings);
+  }
+  if (kind === 'test-noop') {
+    return {
+      id: `test-${item.id}`,
+      identifier: String(payload.testIdentifier || `TEST-${String(item.id || '').slice(0, 6)}`).toUpperCase(),
+      title: String(payload.title || 'test noop item'),
+      url: '',
+      stateName: 'Triage',
+      source: String(payload.source || 'test'),
+      sourceId: String(payload.sourceId || ''),
+      eventType: normalizeIngestEventType(payload.eventType || '', 'test.noop'),
+      deduped: false,
+      dedupeKey: String(item.idempotencyKey || item.dedupeKey || ''),
+    };
   }
   throw new Error(`unknown queue kind: ${kind}`);
 }
@@ -7778,14 +8086,17 @@ function computeIngestBackoffMs(attempts) {
   return Math.min(60 * 60 * 1000, raw);
 }
 
-function appendAuditEvent(eventType, detail) {
+function appendAuditEvent(eventType, detail, options = {}) {
   ensureDir(DATA_DIR);
+  const auditId = String(options && options.auditId ? options.auditId : '').trim() || generateAuditId();
   const line = {
+    auditId,
     ts: new Date().toISOString(),
     eventType: String(eventType || ''),
     detail: detail || {},
   };
   fs.appendFileSync(AUDIT_LOG_PATH, `${JSON.stringify(line)}\n`, 'utf8');
+  return line;
 }
 
 function hashText(text) {
@@ -9778,6 +10089,1704 @@ function replaceCrontabBlock(current, block) {
   }
   pieces.push(block.trim());
   return `${pieces.join('\n\n')}\n`;
+}
+
+function generateAuditId() {
+  return `audit_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+}
+
+function readRollbackJournal() {
+  const state = readJsonFile(ROLLBACK_JOURNAL_PATH, { version: 1, updatedAtMs: 0, entries: [] });
+  const entries = Array.isArray(state.entries) ? state.entries : [];
+  return {
+    version: 1,
+    updatedAtMs: Number(state.updatedAtMs || 0),
+    entries,
+  };
+}
+
+function writeRollbackJournal(state) {
+  writeJsonFile(ROLLBACK_JOURNAL_PATH, {
+    version: 1,
+    updatedAtMs: Date.now(),
+    entries: Array.isArray(state && state.entries) ? state.entries.slice(-2000) : [],
+  });
+}
+
+function appendRollbackJournal(entry) {
+  if (!entry || typeof entry !== 'object') {
+    return;
+  }
+  const state = readRollbackJournal();
+  state.entries.push({
+    id: crypto.randomUUID(),
+    ts: new Date().toISOString(),
+    ...entry,
+  });
+  writeRollbackJournal(state);
+}
+
+function writeJsonFileWithAudit(filePath, value, meta = {}) {
+  const before = fs.existsSync(filePath) ? readJsonFile(filePath, null) : null;
+  writeJsonFile(filePath, value);
+  const auditId = String(meta.auditId || '').trim();
+  if (!auditId) {
+    return;
+  }
+  appendRollbackJournal({
+    auditId,
+    kind: 'json-write',
+    filePath,
+    reason: String(meta.reason || '').trim(),
+    before,
+    after: value,
+  });
+}
+
+function readApprovalsState() {
+  const state = readJsonFile(APPROVALS_PATH, { version: 1, tokens: [] });
+  return {
+    version: 1,
+    tokens: Array.isArray(state.tokens) ? state.tokens : [],
+  };
+}
+
+function normalizeApprovalCode(input) {
+  const text = String(input || '').trim();
+  if (!text) {
+    return '';
+  }
+  const match = text.match(/^APPROVE\s+([A-Za-z0-9]+)$/i);
+  if (match) {
+    return String(match[1] || '').trim().toUpperCase();
+  }
+  return text.toUpperCase();
+}
+
+function approvalActionRequired(settings, action) {
+  const required = Array.isArray(settings && settings.control && settings.control.approvalRequiredActions)
+    ? settings.control.approvalRequiredActions.map((item) => String(item || '').trim().toLowerCase())
+    : [];
+  return required.includes(String(action || '').trim().toLowerCase());
+}
+
+function consumeApprovalIfRequired(settings, approvalArg, action, target = '') {
+  if (!approvalActionRequired(settings, action)) {
+    return { required: false, approved: true, approvalId: '', action: String(action || '').trim().toLowerCase() };
+  }
+  if (!approvalArg) {
+    throw new Error(`high-risk action "${action}" requires --approval. Run: npm run tasks -- approve --action ${action}`);
+  }
+  const code = normalizeApprovalCode(approvalArg);
+  if (!code) {
+    throw new Error('invalid --approval value. Expected: "APPROVE <code>" or "<code>".');
+  }
+
+  const now = Date.now();
+  const state = readApprovalsState();
+  let matched = null;
+  const next = state.tokens.map((token) => {
+    if (token.used) {
+      return token;
+    }
+    if (Number(token.expiresAtMs || 0) <= now) {
+      return { ...token, used: true, expired: true };
+    }
+    const codeMatches = String(token.code || '').toUpperCase() === code;
+    const actionMatches =
+      !token.action || token.action === '*' || String(token.action || '').toLowerCase() === String(action || '').toLowerCase();
+    if (codeMatches && actionMatches) {
+      matched = token;
+      return {
+        ...token,
+        used: true,
+        usedAtMs: now,
+        usedTarget: String(target || ''),
+      };
+    }
+    return token;
+  });
+
+  writeJsonFile(APPROVALS_PATH, {
+    version: 1,
+    tokens: next.slice(-500),
+  });
+  if (!matched) {
+    throw new Error('approval code is invalid, mismatched action, or expired. Run: npm run tasks -- approve');
+  }
+  return {
+    required: true,
+    approved: true,
+    approvalId: String(matched.id || ''),
+    action: String(action || '').trim().toLowerCase(),
+  };
+}
+
+async function cmdApprove(settings, flags) {
+  const ttlMinutes = Math.max(1, Number(flags.ttl || settings.control.approvalTtlMinutes || 30));
+  const action = String(flags.action || flags.scope || '*').trim().toLowerCase() || '*';
+  const note = String(flags.note || '').trim();
+  const state = readApprovalsState();
+  const now = Date.now();
+  const token = {
+    id: crypto.randomUUID(),
+    code: generateCode(8),
+    action,
+    note,
+    createdAtMs: now,
+    expiresAtMs: now + ttlMinutes * 60 * 1000,
+    used: false,
+  };
+  const keep = state.tokens.filter((item) => !item.used && Number(item.expiresAtMs || 0) > now);
+  keep.push(token);
+  writeJsonFile(APPROVALS_PATH, {
+    version: 1,
+    tokens: keep.slice(-500),
+  });
+
+  const result = {
+    ok: true,
+    action,
+    expiresAtMs: token.expiresAtMs,
+    command: `APPROVE ${token.code}`,
+  };
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+  process.stdout.write(
+    `Approval code generated for action=${action} (valid ${ttlMinutes}m):\nAPPROVE ${token.code}\n`,
+  );
+}
+
+async function cmdAuditRollback(settings, flags) {
+  const auditId = String(flags['audit-id'] || flags.auditId || flags._[0] || '').trim();
+  if (!auditId) {
+    throw new Error('audit-rollback requires --audit-id <id>.');
+  }
+  consumeConfirmation(flags.confirm);
+  const approval = consumeApprovalIfRequired(settings, flags.approval, 'runbook-exec', `audit-rollback:${auditId}`);
+  const state = readRollbackJournal();
+  const targets = state.entries
+    .map((entry, index) => ({ entry, index }))
+    .filter((item) => String(item.entry.auditId || '') === auditId)
+    .filter((item) => !item.entry.rolledBackAtMs)
+    .reverse();
+  if (targets.length === 0) {
+    const result = {
+      ok: true,
+      rolledBack: 0,
+      auditId,
+      approval,
+      note: 'no rollback entry found or already rolled back',
+    };
+    if (flags.json) {
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } else {
+      process.stdout.write(`No rollback entry found for auditId ${auditId}.\n`);
+    }
+    return;
+  }
+
+  const restored = [];
+  for (const target of targets) {
+    if (target.entry.kind !== 'json-write') {
+      continue;
+    }
+    const filePath = String(target.entry.filePath || '').trim();
+    if (!filePath) {
+      continue;
+    }
+    if (target.entry.before === null || target.entry.before === undefined) {
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    } else {
+      writeJsonFile(filePath, target.entry.before);
+    }
+    state.entries[target.index] = {
+      ...target.entry,
+      rolledBackAtMs: Date.now(),
+      rolledBackBy: process.pid,
+    };
+    restored.push(filePath);
+  }
+  writeRollbackJournal(state);
+  const audit = appendAuditEvent('audit-rollback', {
+    auditId,
+    restoredFiles: restored,
+    count: restored.length,
+    approvalId: approval.approvalId || '',
+  });
+
+  const result = {
+    ok: true,
+    auditId,
+    rollbackAuditId: audit.auditId,
+    restoredFiles: restored,
+    rolledBack: restored.length,
+    approval,
+  };
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+  process.stdout.write(
+    `Rollback completed for ${auditId}: restored ${restored.length} file(s).\n`,
+  );
+}
+
+function readIngestLedger() {
+  const state = readJsonFile(INGEST_LEDGER_PATH, { version: 1, updatedAtMs: 0, items: {} });
+  const items = state.items && typeof state.items === 'object' ? state.items : {};
+  return {
+    version: 1,
+    updatedAtMs: Number(state.updatedAtMs || 0),
+    items,
+  };
+}
+
+function writeIngestLedger(state, auditId = '', reason = '') {
+  const next = {
+    version: 1,
+    updatedAtMs: Date.now(),
+    items: state && state.items && typeof state.items === 'object' ? state.items : {},
+  };
+  if (auditId) {
+    writeJsonFileWithAudit(INGEST_LEDGER_PATH, next, { auditId, reason });
+  } else {
+    writeJsonFile(INGEST_LEDGER_PATH, next);
+  }
+}
+
+function normalizeIngestEventType(value, fallback = 'triage.create') {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) {
+    return fallback;
+  }
+  return text.replace(/[^a-z0-9._:-]+/g, '-');
+}
+
+function buildIngestIdempotencyKey(payload, fallbackEventType = 'triage.create') {
+  const source = String(payload && payload.source ? payload.source : '').trim().toLowerCase();
+  const sourceIdRaw = String(payload && payload.sourceId ? payload.sourceId : '').trim();
+  const sourceId = sourceIdRaw ? normalizeSourceId(sourceIdRaw) : '';
+  const eventType = normalizeIngestEventType(payload && payload.eventType ? payload.eventType : '', fallbackEventType);
+  if (!source || !sourceId) {
+    return '';
+  }
+  return `${source}:${sourceId}:${eventType}`;
+}
+
+function appendIngestLedgerHistory(record, status, detail = {}) {
+  const history = Array.isArray(record.history) ? record.history.slice(-19) : [];
+  history.push({
+    atMs: Date.now(),
+    status,
+    detail,
+  });
+  return history;
+}
+
+function updateIngestLedgerForItem(item, status, detail = {}) {
+  const key = String(item && item.idempotencyKey ? item.idempotencyKey : item && item.dedupeKey ? item.dedupeKey : '').trim();
+  if (!key) {
+    return;
+  }
+  const ledger = readIngestLedger();
+  const existing = ledger.items[key] && typeof ledger.items[key] === 'object' ? ledger.items[key] : {};
+  const source = String(
+    item && item.payload && item.payload.source ? item.payload.source : existing.source || '',
+  ).trim().toLowerCase();
+  const sourceId = String(
+    item && item.payload && item.payload.sourceId ? normalizeSourceId(item.payload.sourceId) : existing.sourceId || '',
+  ).trim();
+  const eventType = normalizeIngestEventType(
+    item && item.payload && item.payload.eventType ? item.payload.eventType : existing.eventType || '',
+    'triage.create',
+  );
+  const nowMs = Date.now();
+  const merged = {
+    ...existing,
+    key,
+    source,
+    sourceId,
+    eventType,
+    queueId: String(item && item.id ? item.id : existing.queueId || ''),
+    kind: String(item && item.kind ? item.kind : existing.kind || ''),
+    status,
+    attempts: Number(detail.attempts || item.attempts || existing.attempts || 0),
+    retries: Number(detail.retries || existing.retries || 0),
+    issueIdentifier: String(detail.issueIdentifier || existing.issueIdentifier || ''),
+    issueId: String(detail.issueId || existing.issueId || ''),
+    lastError: String(detail.error || detail.lastError || item.lastError || existing.lastError || ''),
+    firstSeenAtMs: Number(existing.firstSeenAtMs || item.createdAtMs || nowMs),
+    lastSeenAtMs: nowMs,
+    updatedAtMs: nowMs,
+    history: appendIngestLedgerHistory(existing, status, detail),
+  };
+  ledger.items[key] = merged;
+  writeIngestLedger(ledger);
+}
+
+function readWebhookMetrics() {
+  const state = readJsonFile(WEBHOOK_METRICS_PATH, { version: 1, updatedAtMs: 0, samples: [] });
+  return {
+    version: 1,
+    updatedAtMs: Number(state.updatedAtMs || 0),
+    samples: Array.isArray(state.samples) ? state.samples : [],
+  };
+}
+
+function writeWebhookMetrics(state) {
+  writeJsonFile(WEBHOOK_METRICS_PATH, {
+    version: 1,
+    updatedAtMs: Date.now(),
+    samples: Array.isArray(state.samples) ? state.samples.slice(-4000) : [],
+  });
+}
+
+function calcPercentile(values, p) {
+  const nums = (Array.isArray(values) ? values : [])
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value))
+    .sort((a, b) => a - b);
+  if (nums.length === 0) {
+    return 0;
+  }
+  const rank = Math.min(nums.length - 1, Math.max(0, Math.ceil((Number(p || 0) / 100) * nums.length) - 1));
+  return nums[rank];
+}
+
+function summarizeWebhookMetrics(state) {
+  const samples = Array.isArray(state && state.samples) ? state.samples : [];
+  const latencies = samples.map((item) => Number(item.latencyMs || 0)).filter((n) => Number.isFinite(n) && n >= 0);
+  const githubEvents = samples.filter((item) => String(item.source || '').toLowerCase() === 'github');
+  const githubLatencies = githubEvents
+    .map((item) => Number(item.latencyMs || 0))
+    .filter((n) => Number.isFinite(n) && n >= 0);
+  return {
+    events: samples.length,
+    p50Ms: calcPercentile(latencies, 50),
+    p95Ms: calcPercentile(latencies, 95),
+    p99Ms: calcPercentile(latencies, 99),
+    githubEvents: githubEvents.length,
+    githubP95Ms: calcPercentile(githubLatencies, 95),
+    lastEventAtMs: samples.length > 0 ? Number(samples[samples.length - 1].atMs || 0) : 0,
+  };
+}
+
+function recordWebhookMetric(input) {
+  const state = readWebhookMetrics();
+  state.samples.push({
+    atMs: Date.now(),
+    source: String(input && input.source ? input.source : 'unknown').trim().toLowerCase(),
+    eventType: normalizeIngestEventType(input && input.eventType ? input.eventType : '', 'unknown.event'),
+    status: String(input && input.status ? input.status : 'ok').trim().toLowerCase(),
+    latencyMs: Math.max(0, Number(input && input.latencyMs ? input.latencyMs : 0)),
+    delivery: String(input && input.delivery ? input.delivery : '').trim(),
+    replay: Boolean(input && input.replay),
+  });
+  writeWebhookMetrics(state);
+  return summarizeWebhookMetrics(state);
+}
+
+function readWebhookReplayIndex() {
+  const state = readJsonFile(WEBHOOK_REPLAY_INDEX_PATH, { version: 1, updatedAtMs: 0, items: {} });
+  return {
+    version: 1,
+    updatedAtMs: Number(state.updatedAtMs || 0),
+    items: state.items && typeof state.items === 'object' ? state.items : {},
+  };
+}
+
+function writeWebhookReplayIndex(state) {
+  writeJsonFile(WEBHOOK_REPLAY_INDEX_PATH, {
+    version: 1,
+    updatedAtMs: Date.now(),
+    items: state.items && typeof state.items === 'object' ? state.items : {},
+  });
+}
+
+function isWebhookReplayDuplicate(source, deliveryId, settings) {
+  const sourceKey = String(source || '').trim().toLowerCase();
+  const id = String(deliveryId || '').trim();
+  if (!sourceKey || !id) {
+    return false;
+  }
+  const state = readWebhookReplayIndex();
+  const key = `${sourceKey}:${id}`;
+  const existingAt = Number(state.items[key] || 0);
+  if (!existingAt) {
+    return false;
+  }
+  const replayWindowHours = Math.max(1, Number(settings.ingest.replayWindowHours || 72));
+  return Date.now() - existingAt <= replayWindowHours * 60 * 60 * 1000;
+}
+
+function markWebhookReplaySeen(source, deliveryId) {
+  const sourceKey = String(source || '').trim().toLowerCase();
+  const id = String(deliveryId || '').trim();
+  if (!sourceKey || !id) {
+    return;
+  }
+  const state = readWebhookReplayIndex();
+  const nowMs = Date.now();
+  const key = `${sourceKey}:${id}`;
+  state.items[key] = nowMs;
+  const cutoffMs = nowMs - 7 * 24 * 60 * 60 * 1000;
+  const nextItems = {};
+  for (const [itemKey, ts] of Object.entries(state.items)) {
+    if (Number(ts || 0) >= cutoffMs) {
+      nextItems[itemKey] = Number(ts || 0);
+    }
+  }
+  state.items = nextItems;
+  writeWebhookReplayIndex(state);
+}
+
+async function cmdWebhookMetrics(_settings, flags) {
+  const state = readWebhookMetrics();
+  const summary = summarizeWebhookMetrics(state);
+  const result = {
+    ok: true,
+    ...summary,
+  };
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+  const lines = [];
+  lines.push('Webhook metrics:');
+  lines.push(`- events: ${summary.events}`);
+  lines.push(`- p95 latency: ${summary.p95Ms}ms`);
+  lines.push(`- github events: ${summary.githubEvents}`);
+  lines.push(`- github p95 latency: ${summary.githubP95Ms}ms`);
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+async function cmdWebhookTest(settings, flags) {
+  const events = Math.max(10, Number(flags.events || 100));
+  const maxLatencyMs = Math.max(20, Number(flags['max-latency-ms'] || 1500));
+  const replayId = `wh-test-${Date.now()}`;
+  const replayBefore = isWebhookReplayDuplicate('github', replayId, settings);
+  markWebhookReplaySeen('github', replayId);
+  const replayAfter = isWebhookReplayDuplicate('github', replayId, settings);
+  for (let i = 0; i < events; i += 1) {
+    const latencyMs = Math.max(5, Math.floor((i / events) * maxLatencyMs));
+    recordWebhookMetric({
+      source: i % 2 === 0 ? 'github' : 'discord',
+      eventType: i % 2 === 0 ? 'github.pull_request.opened' : 'discord.message',
+      status: 'ok',
+      latencyMs,
+      delivery: `test-${Date.now()}-${i}`,
+      replay: false,
+    });
+  }
+  const summary = summarizeWebhookMetrics(readWebhookMetrics());
+  const result = {
+    ok: true,
+    eventsInjected: events,
+    replayBefore,
+    replayAfter,
+    p95Ms: summary.p95Ms,
+    githubP95Ms: summary.githubP95Ms,
+    passLatency: summary.p95Ms < 30_000 && summary.githubP95Ms < 30_000,
+    passReplay: replayBefore === false && replayAfter === true,
+  };
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+  const lines = [];
+  lines.push('Webhook acceptance test:');
+  lines.push(`- events injected: ${events}`);
+  lines.push(`- replay protection: ${result.passReplay ? 'pass' : 'fail'}`);
+  lines.push(`- p95 latency: ${summary.p95Ms}ms`);
+  lines.push(`- github p95 latency: ${summary.githubP95Ms}ms`);
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+async function drainIngestQueue(settings, flags = {}, options = {}) {
+  const queueState = readJsonFile(INGEST_QUEUE_PATH, { version: 1, items: [] });
+  const dlqState = readJsonFile(INGEST_DLQ_PATH, { version: 1, items: [] });
+  const queueItems = Array.isArray(queueState.items) ? queueState.items : [];
+  const dlqItems = Array.isArray(dlqState.items) ? dlqState.items : [];
+  const nowMs = Date.now();
+  const maxRetries = Math.max(
+    1,
+    Number(options.maxRetriesOverride || flags['max-retries'] || settings.intakeQueue.maxRetries || 5),
+  );
+  const targetId = String(flags.id || '').trim();
+  const processLimit = Math.max(0, Number(flags.limit || 0));
+
+  const kept = [];
+  const processed = [];
+  let success = 0;
+  let retried = 0;
+  let movedToDlq = 0;
+  let attempted = 0;
+
+  for (const item of queueItems) {
+    const nextAt = Number(item.nextAttemptAtMs || 0);
+    if (targetId && String(item.id || '') !== targetId) {
+      kept.push(item);
+      continue;
+    }
+    if (processLimit > 0 && attempted >= processLimit) {
+      kept.push(item);
+      continue;
+    }
+    if (nextAt > nowMs && !flags.force) {
+      kept.push(item);
+      continue;
+    }
+    attempted += 1;
+    try {
+      const issue = await processQueuedIngestItem(item, settings);
+      success += 1;
+      processed.push({
+        id: item.id,
+        status: 'delivered',
+        issueIdentifier: issue && issue.identifier ? issue.identifier : '',
+      });
+      updateIngestLedgerForItem(item, 'delivered', {
+        issueIdentifier: issue && issue.identifier ? issue.identifier : '',
+        issueId: issue && issue.id ? issue.id : '',
+        attempts: Number(item.attempts || 0),
+      });
+      appendAuditEvent('ingest-queue-delivered', {
+        queueId: item.id,
+        kind: item.kind,
+        issueIdentifier: issue && issue.identifier ? issue.identifier : '',
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const attempts = Number(item.attempts || 0) + 1;
+      const retryEntry = {
+        atMs: nowMs,
+        attempts,
+        error: message,
+      };
+      const retryHistory = Array.isArray(item.retryHistory)
+        ? item.retryHistory.slice(-19).concat([retryEntry])
+        : [retryEntry];
+      if (attempts >= maxRetries) {
+        movedToDlq += 1;
+        const dlqItem = {
+          ...item,
+          attempts,
+          retryHistory,
+          lastError: message,
+          movedToDlqAtMs: nowMs,
+        };
+        dlqItems.push(dlqItem);
+        processed.push({
+          id: item.id,
+          status: 'dlq',
+          attempts,
+          error: message,
+        });
+        updateIngestLedgerForItem(dlqItem, 'dlq', {
+          attempts,
+          error: message,
+          retries: attempts,
+        });
+        appendAuditEvent('ingest-queue-dlq', {
+          queueId: item.id,
+          kind: item.kind,
+          attempts,
+          error: message,
+        });
+      } else {
+        retried += 1;
+        const backoffMs = computeIngestBackoffMs(attempts);
+        const retryItem = {
+          ...item,
+          attempts,
+          retryHistory,
+          lastError: message,
+          nextAttemptAtMs: nowMs + backoffMs,
+          updatedAtMs: nowMs,
+        };
+        kept.push(retryItem);
+        processed.push({
+          id: item.id,
+          status: 'retry',
+          attempts,
+          nextAttemptAtMs: nowMs + backoffMs,
+          error: message,
+        });
+        updateIngestLedgerForItem(retryItem, 'retry', {
+          attempts,
+          error: message,
+          retries: attempts,
+        });
+      }
+    }
+  }
+
+  queueState.version = 1;
+  queueState.updatedAtMs = nowMs;
+  queueState.items = kept;
+  dlqState.version = 1;
+  dlqState.updatedAtMs = nowMs;
+  dlqState.items = dlqItems;
+  writeJsonFile(INGEST_QUEUE_PATH, queueState);
+  writeJsonFile(INGEST_DLQ_PATH, dlqState);
+
+  return {
+    ok: true,
+    queuedBefore: queueItems.length,
+    queuedAfter: kept.length,
+    success,
+    retried,
+    movedToDlq,
+    attempted,
+    maxRetries,
+    processed,
+  };
+}
+
+function replayDlqItems(_settings, flags = {}, options = {}) {
+  const queueState = readJsonFile(INGEST_QUEUE_PATH, { version: 1, items: [] });
+  const dlqState = readJsonFile(INGEST_DLQ_PATH, { version: 1, items: [] });
+  const queueItems = Array.isArray(queueState.items) ? queueState.items : [];
+  const dlqItems = Array.isArray(dlqState.items) ? dlqState.items : [];
+  const id = String(flags.id || '').trim();
+  const source = String(flags.source || '').trim().toLowerCase();
+  const eventTypeFilter = normalizeIngestEventType(flags['event-type'] || flags.eventType || '', '');
+  const all = isTruthyLike(flags.all);
+  const limit = Math.max(1, Number(flags.limit || (id ? 1 : 20)));
+  const keepAttempts = isTruthyLike(flags['keep-attempts']);
+  const clearFailure = flags['clear-failure'] === undefined ? true : isTruthyLike(flags['clear-failure']);
+
+  const selected = [];
+  const remainingDlq = [];
+  for (const item of dlqItems) {
+    const matchesId = id ? String(item.id || '') === id : true;
+    const matchesSource = source
+      ? String(item && item.payload && item.payload.source ? item.payload.source : '').trim().toLowerCase() === source
+      : true;
+    const matchesEventType = eventTypeFilter
+      ? normalizeIngestEventType(item && item.payload ? item.payload.eventType : '', '') === eventTypeFilter
+      : true;
+    if (matchesId && matchesSource && matchesEventType && (all || selected.length < limit)) {
+      selected.push(item);
+    } else {
+      remainingDlq.push(item);
+    }
+  }
+
+  const nowMs = Date.now();
+  const moved = [];
+  for (const item of selected) {
+    const payload = item && item.payload && typeof item.payload === 'object' ? { ...item.payload } : {};
+    if (clearFailure) {
+      payload.__simulateFailure = false;
+      payload.failUntilAttempt = 0;
+    }
+    const replayed = {
+      ...item,
+      payload,
+      attempts: keepAttempts ? Number(item.attempts || 0) : 0,
+      nextAttemptAtMs: nowMs,
+      updatedAtMs: nowMs,
+      movedToDlqAtMs: 0,
+      replayedAtMs: nowMs,
+      replayCount: Number(item.replayCount || 0) + 1,
+    };
+    queueItems.push(replayed);
+    moved.push({
+      id: replayed.id,
+      source: payload.source || '',
+      sourceId: payload.sourceId || '',
+      eventType: payload.eventType || '',
+    });
+    updateIngestLedgerForItem(replayed, 'replayed', {
+      attempts: replayed.attempts,
+    });
+  }
+
+  queueState.version = 1;
+  queueState.updatedAtMs = nowMs;
+  queueState.items = queueItems;
+  dlqState.version = 1;
+  dlqState.updatedAtMs = nowMs;
+  dlqState.items = remainingDlq;
+  writeJsonFile(INGEST_QUEUE_PATH, queueState);
+  writeJsonFile(INGEST_DLQ_PATH, dlqState);
+  if (!options.silent) {
+    appendAuditEvent('ingest-dlq-replay', {
+      selected: moved.length,
+      id: id || '',
+      source: source || '',
+      eventType: eventTypeFilter || '',
+      keepAttempts,
+      clearFailure,
+    });
+  }
+  return {
+    ok: true,
+    moved: moved.length,
+    items: moved,
+    queueAfter: queueItems.length,
+    dlqAfter: remainingDlq.length,
+  };
+}
+
+async function cmdQueueReplay(settings, flags) {
+  const replay = replayDlqItems(settings, flags, { silent: false });
+  let drained = null;
+  if (isTruthyLike(flags.drain)) {
+    drained = await drainIngestQueue(settings, { json: true }, {});
+  }
+  const result = {
+    ...replay,
+    drained,
+  };
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+  const lines = [];
+  lines.push('DLQ replay result:');
+  lines.push(`- moved: ${replay.moved}`);
+  lines.push(`- queue after: ${replay.queueAfter}`);
+  lines.push(`- dlq after: ${replay.dlqAfter}`);
+  if (drained) {
+    lines.push(`- drained delivered: ${drained.success}`);
+    lines.push(`- drained dlq: ${drained.movedToDlq}`);
+  }
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+async function cmdIngestTest(settings, flags) {
+  const queueBackup = readJsonFile(INGEST_QUEUE_PATH, { version: 1, items: [] });
+  const dlqBackup = readJsonFile(INGEST_DLQ_PATH, { version: 1, items: [] });
+  const ledgerBackup = readIngestLedger();
+  const maxRetries = Math.max(2, Number(flags['max-retries'] || 2));
+
+  try {
+    writeJsonFile(INGEST_QUEUE_PATH, { version: 1, updatedAtMs: Date.now(), items: [] });
+    writeJsonFile(INGEST_DLQ_PATH, { version: 1, updatedAtMs: Date.now(), items: [] });
+    writeIngestLedger({ version: 1, updatedAtMs: Date.now(), items: {} });
+
+    const dedupePayload = {
+      source: 'acceptance',
+      sourceId: 'ingest-dedupe-case',
+      eventType: 'acceptance.ingest.dedupe',
+      title: 'dedupe check',
+    };
+    const dedupeItems = [];
+    for (let i = 0; i < 10; i += 1) {
+      dedupeItems.push(enqueueIngestItem('test-noop', dedupePayload, new Error('dedupe'), settings));
+    }
+    const uniqueQueueIds = new Set(dedupeItems.map((item) => String(item.id || '')).filter(Boolean));
+
+    const failItem = enqueueIngestItem(
+      'test-noop',
+      {
+        source: 'acceptance',
+        sourceId: 'ingest-dlq-case',
+        eventType: 'acceptance.ingest.dlq',
+        failUntilAttempt: 999,
+        simulatedError: 'forced dlq',
+      },
+      new Error('forced dlq'),
+      settings,
+    );
+
+    await drainIngestQueue(settings, { force: true }, { maxRetriesOverride: maxRetries });
+    const drainAfterSecond = await drainIngestQueue(settings, { force: true }, { maxRetriesOverride: maxRetries });
+    const dlqNow = readJsonFile(INGEST_DLQ_PATH, { version: 1, items: [] });
+    const inDlq = (Array.isArray(dlqNow.items) ? dlqNow.items : []).some((item) => String(item.id || '') === failItem.id);
+
+    const replay = replayDlqItems(
+      settings,
+      { id: failItem.id, limit: 1, all: false, 'clear-failure': true },
+      { silent: true },
+    );
+    const drainAfterReplay = await drainIngestQueue(settings, { force: true }, { maxRetriesOverride: maxRetries });
+
+    const ledger = readIngestLedger();
+    const dedupePass = uniqueQueueIds.size === 1;
+    const dlqPass = inDlq || drainAfterSecond.movedToDlq > 0;
+    const replayPass = replay.moved === 1 && drainAfterReplay.success >= 1;
+    const result = {
+      ok: dedupePass && dlqPass && replayPass,
+      dedupe: {
+        injected: 10,
+        uniqueQueueItems: uniqueQueueIds.size,
+        pass: dedupePass,
+      },
+      dlq: {
+        movedToDlq: drainAfterSecond.movedToDlq,
+        inDlq,
+        pass: dlqPass,
+      },
+      replay: {
+        moved: replay.moved,
+        deliveredAfterReplay: drainAfterReplay.success,
+        pass: replayPass,
+      },
+      ledgerItems: Object.keys(ledger.items || {}).length,
+    };
+    if (flags.json) {
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      return;
+    }
+    const lines = [];
+    lines.push('Ingest acceptance test:');
+    lines.push(`- dedupe: ${dedupePass ? 'pass' : 'fail'} (unique=${uniqueQueueIds.size})`);
+    lines.push(`- dlq path: ${dlqPass ? 'pass' : 'fail'} (moved=${drainAfterSecond.movedToDlq})`);
+    lines.push(`- replay path: ${replayPass ? 'pass' : 'fail'} (moved=${replay.moved}, delivered=${drainAfterReplay.success})`);
+    process.stdout.write(`${lines.join('\n')}\n`);
+  } finally {
+    writeJsonFile(INGEST_QUEUE_PATH, queueBackup);
+    writeJsonFile(INGEST_DLQ_PATH, dlqBackup);
+    writeIngestLedger(ledgerBackup);
+  }
+}
+
+function classifyExecutorFailure(message) {
+  const text = String(message || '').trim().toLowerCase();
+  if (!text) {
+    return 'unknown';
+  }
+  if (
+    text.includes('rate limit') ||
+    text.includes('429') ||
+    text.includes('cooldown') ||
+    text.includes('throttl')
+  ) {
+    return 'rate_limit';
+  }
+  if (
+    text.includes('session file locked') ||
+    text.includes('already-running') ||
+    text.includes('lock conflict') ||
+    text.includes('lock')
+  ) {
+    return 'lock_conflict';
+  }
+  if (
+    text.includes('timeout') ||
+    text.includes('timed out') ||
+    text.includes('etimedout') ||
+    text.includes('timeoutexpired')
+  ) {
+    return 'timeout';
+  }
+  return 'unknown';
+}
+
+function isRetryableExecutorCategory(category) {
+  return ['rate_limit', 'lock_conflict', 'timeout'].includes(String(category || '').trim().toLowerCase());
+}
+
+function computeExecutorBackoffMs(category, attemptNo, baseBackoffSeconds, settings = {}) {
+  const n = Math.max(1, Number(attemptNo || 1));
+  const baseSeconds = Math.max(1, Number(baseBackoffSeconds || 20));
+  const factors = settings && settings.execution && settings.execution.backoffByFailureClass
+    ? settings.execution.backoffByFailureClass
+    : {};
+  const factor = Math.max(
+    0.2,
+    Number(
+      factors && Object.prototype.hasOwnProperty.call(factors, category)
+        ? factors[category]
+        : factors.unknown || 1,
+    ),
+  );
+  const raw = baseSeconds * 1000 * n * factor;
+  return Math.min(10 * 60 * 1000, Math.round(raw));
+}
+
+function recordExecutorStabilityRun(sample) {
+  const state = readJsonFile(EXECUTOR_STABILITY_PATH, { version: 1, updatedAtMs: 0, runs: [] });
+  const runs = Array.isArray(state.runs) ? state.runs : [];
+  runs.unshift({
+    atMs: Date.now(),
+    ...sample,
+  });
+  const kept = runs.slice(0, 500);
+  writeJsonFile(EXECUTOR_STABILITY_PATH, {
+    version: 1,
+    updatedAtMs: Date.now(),
+    runs: kept,
+  });
+}
+
+function syntheticExecutorErrorMessage(category) {
+  if (category === 'rate_limit') {
+    return 'HTTP 429 rate limit';
+  }
+  if (category === 'timeout') {
+    return 'request timed out after 30s';
+  }
+  if (category === 'lock_conflict') {
+    return 'session file locked by another process';
+  }
+  return 'unknown upstream failure';
+}
+
+async function cmdExecutorTest(settings, flags) {
+  const concurrency = Math.max(20, Number(flags.concurrent || 20));
+  const maxAttempts = Math.max(2, Number(flags['max-attempts'] || 3));
+  const baseBackoffSeconds = Math.max(1, Number(flags['backoff-seconds'] || 1));
+  const lockPath = path.join(DATA_DIR, 'executor-test.lock.json');
+  try {
+    if (fs.existsSync(lockPath)) {
+      fs.unlinkSync(lockPath);
+    }
+  } catch {
+    // ignore
+  }
+
+  let activeCritical = 0;
+  let maxCritical = 0;
+  let lockConflicts = 0;
+  const durations = [];
+  const classCount = {
+    rate_limit: 0,
+    lock_conflict: 0,
+    timeout: 0,
+    unknown: 0,
+  };
+  const retryableSummary = {
+    total: 0,
+    recovered: 0,
+  };
+
+  const lockWorkers = Array.from({ length: concurrency }).map((_, idx) => (async () => {
+    const startedAtMs = Date.now();
+    await withTaskLock(
+      lockPath,
+      {
+        staleMs: 5_000,
+        waitMs: 2,
+        timeoutMs: 2_000,
+      },
+      async () => {
+        activeCritical += 1;
+        maxCritical = Math.max(maxCritical, activeCritical);
+        await sleepMs(2);
+        activeCritical -= 1;
+      },
+    ).catch(() => {
+      lockConflicts += 1;
+    });
+    durations.push(Date.now() - startedAtMs + idx % 3);
+  })());
+  await Promise.all(lockWorkers);
+
+  const scenarios = ['rate_limit', 'timeout', 'lock_conflict', 'unknown'];
+  const scenarioRuns = [];
+  for (const category of scenarios) {
+    const startedAtMs = Date.now();
+    let attempt = 0;
+    let recovered = false;
+    let terminal = '';
+    while (attempt < maxAttempts) {
+      attempt += 1;
+      if (attempt === 1) {
+        const message = syntheticExecutorErrorMessage(category);
+        const cls = classifyExecutorFailure(message);
+        terminal = cls;
+        classCount[cls] = Number(classCount[cls] || 0) + 1;
+        if (!isRetryableExecutorCategory(cls)) {
+          break;
+        }
+        retryableSummary.total += 1;
+        const backoffMs = computeExecutorBackoffMs(cls, attempt, baseBackoffSeconds, settings);
+        await sleepMs(Math.min(20, backoffMs));
+        continue;
+      }
+      recovered = true;
+      break;
+    }
+    if (recovered && isRetryableExecutorCategory(terminal)) {
+      retryableSummary.recovered += 1;
+    }
+    scenarioRuns.push({
+      category,
+      terminal,
+      attempts: attempt,
+      recovered,
+      durationMs: Date.now() - startedAtMs,
+    });
+    durations.push(Date.now() - startedAtMs);
+  }
+
+  const recoveredCount = scenarioRuns.filter((item) => item.recovered).length;
+  const failedCount = scenarioRuns.length - recoveredCount;
+  const maxAttemptsUsed = scenarioRuns.reduce((acc, item) => Math.max(acc, Number(item.attempts || 0)), 0);
+  const summary = {
+    ok:
+      maxCritical <= 1 &&
+      retryableSummary.total === retryableSummary.recovered &&
+      classCount.rate_limit > 0 &&
+      classCount.timeout > 0 &&
+      classCount.lock_conflict > 0,
+    totalRuns: scenarioRuns.length,
+    recovered: recoveredCount,
+    failed: failedCount,
+    lockConflicts,
+    maxConcurrentCritical: maxCritical,
+    failureClassCount: classCount,
+    retryable: retryableSummary,
+    avgRecoveryMs: durations.length > 0 ? Number((durations.reduce((a, b) => a + b, 0) / durations.length).toFixed(2)) : 0,
+    p95RecoveryMs: calcPercentile(durations, 95),
+    maxAttemptsUsed,
+    scenarios: scenarioRuns,
+  };
+  recordExecutorStabilityRun(summary);
+  appendAuditEvent('executor-test', summary);
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+    return;
+  }
+  const lines = [];
+  lines.push('Executor acceptance test:');
+  lines.push(`- total runs: ${summary.totalRuns}`);
+  lines.push(`- recovered: ${summary.recovered}`);
+  lines.push(`- failed: ${summary.failed}`);
+  lines.push(`- max concurrent critical sections: ${summary.maxConcurrentCritical}`);
+  lines.push(`- retryable recovered: ${summary.retryable.recovered}/${summary.retryable.total}`);
+  lines.push(`- p95 recovery: ${summary.p95RecoveryMs}ms`);
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+function inferIssueFromSession(session, settings) {
+  const teamKey = String(settings && settings.linear && settings.linear.teamKey ? settings.linear.teamKey : 'CLAW')
+    .trim()
+    .toUpperCase();
+  const issuePattern = new RegExp(`\\b${escapeRegExp(teamKey)}-(\\d+)\\b`, 'i');
+  const explicit = [
+    session && session.issueIdentifier ? session.issueIdentifier : '',
+    session && session.issueId ? session.issueId : '',
+    session && session.linearIssue ? session.linearIssue : '',
+  ];
+  for (const value of explicit) {
+    const normalized = normalizeLinearIssueId(value);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  const textCandidates = [
+    session && session.key ? session.key : '',
+    session && session.sessionId ? session.sessionId : '',
+    session && session.kind ? session.kind : '',
+    session && session.model ? session.model : '',
+  ];
+  for (const text of textCandidates) {
+    const match = String(text || '').match(issuePattern);
+    if (match && match[0]) {
+      const normalized = normalizeLinearIssueId(match[0]);
+      if (normalized) {
+        return normalized;
+      }
+    }
+  }
+  return '';
+}
+
+function buildReverseIssueBindings(bindings) {
+  const reverse = {};
+  const push = (identifier, field, value) => {
+    const normalized = normalizeLinearIssueId(identifier);
+    if (!normalized || !value) {
+      return;
+    }
+    if (!reverse[normalized]) {
+      reverse[normalized] = {
+        taskIds: [],
+        sessionIds: [],
+        sessionKeys: [],
+        subagentIds: [],
+        cronIds: [],
+      };
+    }
+    const arr = reverse[normalized][field];
+    const text = String(value);
+    if (!arr.includes(text)) {
+      arr.push(text);
+    }
+  };
+  for (const [taskId, identifier] of Object.entries(bindings.byTaskId || {})) {
+    push(identifier, 'taskIds', taskId);
+  }
+  for (const [sessionId, identifier] of Object.entries(bindings.bySessionId || {})) {
+    push(identifier, 'sessionIds', sessionId);
+  }
+  for (const [sessionKey, identifier] of Object.entries(bindings.bySessionKey || {})) {
+    push(identifier, 'sessionKeys', sessionKey);
+  }
+  for (const [subagentId, identifier] of Object.entries(bindings.bySubagentId || {})) {
+    push(identifier, 'subagentIds', subagentId);
+  }
+  for (const [cronId, identifier] of Object.entries(bindings.byCronId || {})) {
+    push(identifier, 'cronIds', cronId);
+  }
+  return reverse;
+}
+
+async function cmdBindingCoverage(settings, flags) {
+  const activeWindowMinutes = Math.max(10, Number(flags['active-minutes'] || settings.statusMachine.activeWindowMinutes || 120));
+  const activeWindowMs = activeWindowMinutes * 60 * 1000;
+  const autoRepair = flags['auto-repair'] === undefined ? true : isTruthyLike(flags['auto-repair']);
+  const autoCreateIssue = flags['auto-create-issue'] === undefined ? true : isTruthyLike(flags['auto-create-issue']);
+  const apiReady = Boolean(String(settings.linear.apiKey || '').trim());
+  const bindings = readJsonFile(ISSUE_LINKS_PATH, {
+    version: 1,
+    updatedAtMs: 0,
+    byTaskId: {},
+    bySessionId: {},
+    bySessionKey: {},
+    bySubagentId: {},
+    byCronId: {},
+    byIssue: {},
+  });
+
+  const sessions = loadSessions(settings).filter((item) => Number(item.ageMs || Number.POSITIVE_INFINITY) <= activeWindowMs);
+  const subagents = loadSubagents(settings).filter((item) => item.isActive);
+  const linkedSessions = [];
+  const orphanSessions = [];
+  const linkedSubagents = [];
+  const orphanSubagents = [];
+  let repaired = 0;
+
+  for (const session of sessions) {
+    const taskId = `session:${session.agentId}:${session.key}`;
+    let identifier = resolveIssueFromBindings(bindings, {
+      taskId,
+      sessionId: session.sessionId || '',
+      sessionKey: session.key || '',
+    });
+    if (!identifier && autoRepair) {
+      const inferred = inferIssueFromSession(session, settings);
+      if (inferred) {
+        const upsert = upsertRuntimeIssueBindings(inferred, {
+          taskId,
+          sessionId: session.sessionId || '',
+          sessionKey: session.key || '',
+          agentId: session.agentId || '',
+        });
+        if (upsert.updated) {
+          repaired += 1;
+        }
+        identifier = inferred;
+      }
+    }
+    if (identifier) {
+      linkedSessions.push({ taskId, identifier });
+    } else {
+      orphanSessions.push({
+        taskId,
+        sessionId: session.sessionId || '',
+        sessionKey: session.key || '',
+      });
+    }
+  }
+
+  for (const subagent of subagents) {
+    const taskId = `subagent:${subagent.id}`;
+    let identifier = resolveIssueFromBindings(bindings, {
+      taskId,
+      subagentId: subagent.id,
+    });
+    if (!identifier && autoRepair) {
+      const inferred = inferIssueFromSubagent(subagent, settings);
+      if (inferred) {
+        const upsert = upsertRuntimeIssueBindings(inferred, {
+          taskId,
+          subagentId: subagent.id,
+        });
+        if (upsert.updated) {
+          repaired += 1;
+        }
+        identifier = inferred;
+      }
+    }
+    if (identifier) {
+      linkedSubagents.push({ taskId, identifier });
+    } else {
+      orphanSubagents.push({
+        taskId,
+        subagentId: subagent.id,
+      });
+    }
+  }
+
+  let orphanIssue = null;
+  if ((orphanSessions.length > 0 || orphanSubagents.length > 0) && autoCreateIssue && apiReady) {
+    const orphanDelivery = await createTriageIssueWithFallback(
+      {
+        title: `[ops] Runtime orphan bindings (${orphanSessions.length + orphanSubagents.length})`,
+        description: [
+          'Auto-created by binding-coverage command.',
+          `orphan sessions: ${orphanSessions.length}`,
+          `orphan subagents: ${orphanSubagents.length}`,
+        ].join('\n'),
+        source: 'mission-control',
+        sourceId: `runtime-orphan:${Date.now()}`,
+        eventType: 'runtime.binding.orphan',
+        labels: ['ops', 'runtime-binding'],
+        state: 'Triage',
+        priority: 2,
+      },
+      settings,
+      { context: 'binding-coverage' },
+    );
+    if (!orphanDelivery.queued && orphanDelivery.issue && orphanDelivery.issue.identifier) {
+      orphanIssue = orphanDelivery.issue;
+      for (const item of orphanSessions) {
+        const upsert = upsertRuntimeIssueBindings(orphanIssue.identifier, {
+          taskId: item.taskId,
+          sessionId: item.sessionId,
+          sessionKey: item.sessionKey,
+        });
+        if (upsert.updated) {
+          repaired += 1;
+        }
+      }
+      for (const item of orphanSubagents) {
+        const upsert = upsertRuntimeIssueBindings(orphanIssue.identifier, {
+          taskId: item.taskId,
+          subagentId: item.subagentId,
+        });
+        if (upsert.updated) {
+          repaired += 1;
+        }
+      }
+    }
+  }
+
+  const refreshed = readJsonFile(ISSUE_LINKS_PATH, {
+    version: 1,
+    updatedAtMs: 0,
+    byTaskId: {},
+    bySessionId: {},
+    bySessionKey: {},
+    bySubagentId: {},
+    byCronId: {},
+    byIssue: {},
+  });
+  refreshed.byIssue = buildReverseIssueBindings(refreshed);
+  writeJsonFile(ISSUE_LINKS_PATH, refreshed);
+
+  const finalSessions = loadSessions(settings).filter((item) => Number(item.ageMs || Number.POSITIVE_INFINITY) <= activeWindowMs);
+  const finalSubagents = loadSubagents(settings).filter((item) => item.isActive);
+  const finalOrphanSessions = finalSessions.filter((session) => {
+    const taskId = `session:${session.agentId}:${session.key}`;
+    return !resolveIssueFromBindings(refreshed, {
+      taskId,
+      sessionId: session.sessionId || '',
+      sessionKey: session.key || '',
+    });
+  });
+  const finalOrphanSubagents = finalSubagents.filter((item) => {
+    const taskId = `subagent:${item.id}`;
+    return !resolveIssueFromBindings(refreshed, {
+      taskId,
+      subagentId: item.id,
+    });
+  });
+
+  const total = finalSessions.length + finalSubagents.length;
+  const orphan = finalOrphanSessions.length + finalOrphanSubagents.length;
+  const linked = total - orphan;
+  const coverage = total > 0 ? Number(((linked / total) * 100).toFixed(2)) : 100;
+  const report = {
+    ok: orphan === 0,
+    generatedAtMs: Date.now(),
+    total,
+    linked,
+    orphan,
+    coverage,
+    sessions: {
+      total: finalSessions.length,
+      orphan: finalOrphanSessions.length,
+    },
+    subagents: {
+      total: finalSubagents.length,
+      orphan: finalOrphanSubagents.length,
+    },
+    repaired,
+    orphanIssue: orphanIssue
+      ? {
+          identifier: orphanIssue.identifier,
+          url: orphanIssue.url || '',
+        }
+      : null,
+    byIssue: refreshed.byIssue,
+  };
+  writeJsonFile(BINDING_COVERAGE_PATH, report);
+  appendAuditEvent('binding-coverage', {
+    total,
+    linked,
+    orphan,
+    coverage,
+    repaired,
+    orphanIssue: orphanIssue ? orphanIssue.identifier : '',
+  });
+
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    return;
+  }
+  const lines = [];
+  lines.push('Binding coverage:');
+  lines.push(`- total: ${total}`);
+  lines.push(`- linked: ${linked}`);
+  lines.push(`- orphan: ${orphan}`);
+  lines.push(`- coverage: ${coverage}%`);
+  lines.push(`- repaired: ${repaired}`);
+  if (orphanIssue && orphanIssue.identifier) {
+    lines.push(`- orphan issue: ${orphanIssue.identifier}`);
+  }
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+function defaultStatusMachineRules(settings) {
+  return [
+    {
+      id: 'cron-warning',
+      reason: 'cron-warning',
+      metric: 'cronWarnings',
+      min: 1,
+      targetState: String(settings.statusMachine.stateBlocked || 'Blocked'),
+    },
+    {
+      id: 'github-merged',
+      reason: 'github-merged',
+      metric: 'githubMerged',
+      min: 1,
+      targetState: String(settings.statusMachine.stateDone || settings.github.stateDone || 'Done'),
+    },
+    {
+      id: 'github-open-pr',
+      reason: 'github-open-pr',
+      metric: 'githubOpen',
+      min: 1,
+      targetState: String(settings.statusMachine.stateInReview || settings.github.stateInReview || 'In Review'),
+    },
+    {
+      id: 'runtime-active',
+      reason: 'runtime-active',
+      metric: 'runtimeActive',
+      min: 1,
+      targetState: String(settings.statusMachine.stateInProgress || 'In Progress'),
+    },
+    {
+      id: 'autopilot-blocked',
+      reason: 'autopilot-recent',
+      metric: 'autopilotRecentBlocked',
+      min: 1,
+      targetState: String(settings.statusMachine.stateBlocked || 'Blocked'),
+    },
+    {
+      id: 'autopilot-recent',
+      reason: 'autopilot-recent',
+      metric: 'autopilotRecent',
+      min: 1,
+      targetState: String(settings.statusMachine.stateInProgress || 'In Progress'),
+    },
+  ];
+}
+
+function validateStatusMachineRules(rules) {
+  const list = Array.isArray(rules) ? rules : [];
+  const errors = [];
+  const normalized = [];
+  for (const raw of list) {
+    const rule = raw && typeof raw === 'object' ? raw : {};
+    const id = String(rule.id || '').trim();
+    const reason = String(rule.reason || id || '').trim();
+    const metric = String(rule.metric || '').trim();
+    const min = Math.max(1, Number(rule.min || 1));
+    const targetState = String(rule.targetState || '').trim();
+    if (!id) {
+      errors.push('rule id is required');
+      continue;
+    }
+    if (!metric) {
+      errors.push(`rule ${id}: metric is required`);
+      continue;
+    }
+    if (!targetState) {
+      errors.push(`rule ${id}: targetState is required`);
+      continue;
+    }
+    normalized.push({
+      id,
+      reason: reason || id,
+      metric,
+      min,
+      targetState,
+    });
+  }
+  return {
+    ok: errors.length === 0 && normalized.length > 0,
+    errors,
+    rules: normalized,
+  };
+}
+
+function statusMachineRuleMetricValue(metric, context) {
+  const key = String(metric || '').trim();
+  if (key === 'cronWarnings') {
+    return Array.isArray(context.cronWarnings) ? context.cronWarnings.length : 0;
+  }
+  if (key === 'githubMerged') {
+    return Array.isArray(context.githubMerged) ? context.githubMerged.length : 0;
+  }
+  if (key === 'githubOpen') {
+    return Array.isArray(context.githubOpen) ? context.githubOpen.length : 0;
+  }
+  if (key === 'runtimeActive') {
+    const sessions = Array.isArray(context.activeSessions) ? context.activeSessions.length : 0;
+    const subagents = Array.isArray(context.activeSubagents) ? context.activeSubagents.length : 0;
+    return sessions + subagents;
+  }
+  if (key === 'autopilotRecent') {
+    return Array.isArray(context.autopilotRecent) ? context.autopilotRecent.length : 0;
+  }
+  if (key === 'autopilotRecentBlocked') {
+    return Array.isArray(context.autopilotRecent)
+      ? context.autopilotRecent.filter((item) => String(item.status || '').toLowerCase() === 'blocked').length
+      : 0;
+  }
+  return 0;
+}
+
+function evaluateStatusRule(rule, context) {
+  const metricValue = statusMachineRuleMetricValue(rule.metric, context);
+  const min = Math.max(1, Number(rule.min || 1));
+  return metricValue >= min;
+}
+
+function resolveRuleTargetState(rule, settings) {
+  const raw = String(rule && rule.targetState ? rule.targetState : '').trim();
+  if (!raw) {
+    return '';
+  }
+  if (raw === '$stateBlocked') {
+    return String(settings.statusMachine.stateBlocked || 'Blocked');
+  }
+  if (raw === '$stateDone') {
+    return String(settings.statusMachine.stateDone || settings.github.stateDone || 'Done');
+  }
+  if (raw === '$stateInReview') {
+    return String(settings.statusMachine.stateInReview || settings.github.stateInReview || 'In Review');
+  }
+  if (raw === '$stateInProgress') {
+    return String(settings.statusMachine.stateInProgress || 'In Progress');
+  }
+  return raw;
+}
+
+function readStatusMachineVersionStore(settings) {
+  const state = readJsonFile(STATUS_MACHINE_VERSIONS_PATH, {
+    version: 1,
+    updatedAtMs: 0,
+    activeVersionId: '',
+    previousVersionId: '',
+    order: [],
+    versions: {},
+  });
+  const store = {
+    version: 1,
+    updatedAtMs: Number(state.updatedAtMs || 0),
+    activeVersionId: String(state.activeVersionId || '').trim(),
+    previousVersionId: String(state.previousVersionId || '').trim(),
+    order: Array.isArray(state.order) ? state.order.map((item) => String(item || '').trim()).filter(Boolean) : [],
+    versions: state.versions && typeof state.versions === 'object' ? state.versions : {},
+  };
+  const configRulesRaw =
+    Array.isArray(settings.statusMachine.rules) && settings.statusMachine.rules.length > 0
+      ? settings.statusMachine.rules
+      : defaultStatusMachineRules(settings);
+  const validated = validateStatusMachineRules(configRulesRaw);
+  const normalizedRules = validated.ok ? validated.rules : defaultStatusMachineRules(settings);
+  const ruleHash = hashText(JSON.stringify(normalizedRules));
+  const existingId = Object.entries(store.versions).find(([, value]) => String(value.hash || '') === ruleHash);
+  if (!existingId) {
+    const versionId = `v-${new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)}-${ruleHash.slice(0, 6)}`;
+    store.versions[versionId] = {
+      id: versionId,
+      createdAtMs: Date.now(),
+      source: Array.isArray(settings.statusMachine.rules) && settings.statusMachine.rules.length > 0 ? 'config' : 'default',
+      hash: ruleHash,
+      rules: normalizedRules,
+    };
+    store.order.push(versionId);
+    if (!store.activeVersionId || settings.statusMachine.autoActivateConfig !== false) {
+      store.previousVersionId = store.activeVersionId || '';
+      store.activeVersionId = versionId;
+    }
+    store.updatedAtMs = Date.now();
+    writeJsonFile(STATUS_MACHINE_VERSIONS_PATH, store);
+  } else if (!store.activeVersionId) {
+    store.activeVersionId = existingId[0];
+    store.updatedAtMs = Date.now();
+    writeJsonFile(STATUS_MACHINE_VERSIONS_PATH, store);
+  }
+  return store;
+}
+
+function getActiveStatusMachineRules(settings) {
+  const store = readStatusMachineVersionStore(settings);
+  const active = store.activeVersionId && store.versions[store.activeVersionId]
+    ? store.versions[store.activeVersionId]
+    : null;
+  if (active && Array.isArray(active.rules) && active.rules.length > 0) {
+    const validated = validateStatusMachineRules(active.rules);
+    if (validated.ok) {
+      return validated.rules;
+    }
+    appendAuditEvent('status-machine-rules-invalid', {
+      activeVersionId: store.activeVersionId || '',
+      errors: validated.errors,
+      fallback: 'default-rules',
+    });
+  }
+  return defaultStatusMachineRules(settings);
+}
+
+async function cmdStatusMachineRules(settings, flags) {
+  let store = readStatusMachineVersionStore(settings);
+  let mutated = false;
+  let action = 'show';
+  let approval = { required: false, approved: true, approvalId: '' };
+
+  if (flags.file || flags['from-config'] || flags.activate || flags.rollback) {
+    consumeConfirmation(flags.confirm);
+    approval = consumeApprovalIfRequired(settings, flags.approval, 'trigger', 'state-machine-rules');
+  }
+
+  if (flags.file || flags['from-config']) {
+    action = 'create-version';
+    let rawRules = null;
+    if (flags.file) {
+      const filePath = path.resolve(String(flags.file).trim());
+      rawRules = readJsonFile(filePath, null);
+      if (!rawRules) {
+        throw new Error(`unable to load status machine rules file: ${filePath}`);
+      }
+    } else {
+      rawRules = settings.statusMachine.rules;
+    }
+    const list = Array.isArray(rawRules)
+      ? rawRules
+      : rawRules && Array.isArray(rawRules.rules)
+        ? rawRules.rules
+        : [];
+    const validated = validateStatusMachineRules(list.length > 0 ? list : defaultStatusMachineRules(settings));
+    if (!validated.ok) {
+      throw new Error(`invalid status machine rules: ${validated.errors.join('; ')}`);
+    }
+    const hash = hashText(JSON.stringify(validated.rules));
+    const versionId = `v-${new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)}-${hash.slice(0, 6)}`;
+    store.versions[versionId] = {
+      id: versionId,
+      createdAtMs: Date.now(),
+      source: flags.file ? `file:${String(flags.file)}` : 'config',
+      hash,
+      rules: validated.rules,
+    };
+    store.order.push(versionId);
+    store.previousVersionId = store.activeVersionId || '';
+    store.activeVersionId = versionId;
+    mutated = true;
+  } else if (flags.activate) {
+    action = 'activate';
+    const versionId = String(flags.activate || '').trim();
+    if (!store.versions[versionId]) {
+      throw new Error(`status machine version not found: ${versionId}`);
+    }
+    if (store.activeVersionId !== versionId) {
+      store.previousVersionId = store.activeVersionId || '';
+      store.activeVersionId = versionId;
+      mutated = true;
+    }
+  } else if (flags.rollback) {
+    action = 'rollback';
+    const explicit = String(flags.rollback || '').trim();
+    const targetId = explicit && explicit !== 'true' ? explicit : store.previousVersionId;
+    if (!targetId || !store.versions[targetId]) {
+      throw new Error('no previous status-machine version available for rollback.');
+    }
+    if (store.activeVersionId !== targetId) {
+      store.previousVersionId = store.activeVersionId || '';
+      store.activeVersionId = targetId;
+      mutated = true;
+    }
+  } else if (flags.validate) {
+    action = 'validate';
+    const activeRules = getActiveStatusMachineRules(settings);
+    const validated = validateStatusMachineRules(activeRules);
+    const result = {
+      ok: validated.ok,
+      errors: validated.errors,
+      activeVersionId: store.activeVersionId || '',
+      rules: validated.rules,
+    };
+    if (flags.json) {
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      return;
+    }
+    process.stdout.write(
+      `Status machine validation: ${result.ok ? 'ok' : 'invalid'} (${result.rules.length} rules)\n`,
+    );
+    return;
+  }
+
+  if (mutated) {
+    store.updatedAtMs = Date.now();
+    const audit = appendAuditEvent('status-machine-rules-update', {
+      action,
+      activeVersionId: store.activeVersionId,
+      previousVersionId: store.previousVersionId || '',
+      approvalId: approval.approvalId || '',
+    });
+    writeJsonFileWithAudit(STATUS_MACHINE_VERSIONS_PATH, store, {
+      auditId: audit.auditId,
+      reason: action,
+    });
+  }
+
+  store = readStatusMachineVersionStore(settings);
+  const active = store.activeVersionId && store.versions[store.activeVersionId]
+    ? store.versions[store.activeVersionId]
+    : null;
+  const result = {
+    ok: true,
+    action,
+    mutated,
+    approval,
+    activeVersionId: store.activeVersionId || '',
+    previousVersionId: store.previousVersionId || '',
+    versions: store.order.map((id) => ({
+      id,
+      createdAtMs: Number(store.versions[id] && store.versions[id].createdAtMs ? store.versions[id].createdAtMs : 0),
+      source: String(store.versions[id] && store.versions[id].source ? store.versions[id].source : ''),
+      rules: Array.isArray(store.versions[id] && store.versions[id].rules) ? store.versions[id].rules.length : 0,
+    })),
+    activeRules: active && Array.isArray(active.rules) ? active.rules : [],
+  };
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+  const lines = [];
+  lines.push('Status machine rules:');
+  lines.push(`- active version: ${result.activeVersionId || '-'}`);
+  lines.push(`- previous version: ${result.previousVersionId || '-'}`);
+  lines.push(`- versions: ${result.versions.length}`);
+  lines.push(`- active rules: ${result.activeRules.length}`);
+  process.stdout.write(`${lines.join('\n')}\n`);
 }
 
 main();
