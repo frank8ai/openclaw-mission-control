@@ -48,7 +48,7 @@ High-value files:
 - Minimal loop (default):
   - `discord-intake-sync`
   - `queue-drain`
-  - `linear-autopilot`
+  - execution loop (`linear-autopilot` or `linear-engine`)
 - Full loop:
   - Includes report/watchdog/github/todoist/calendar/status/sla/reminders/briefing in addition to minimal loop.
 
@@ -59,6 +59,7 @@ cd /Users/yizhi/.openclaw/workspace/mission-control
 npm run tasks -- schedule --apply --mode minimal
 npm run tasks -- schedule --apply --mode full
 npm run tasks -- schedule --apply --mode minimal --agent auto
+npm run tasks -- schedule --apply --mode minimal --execution-loop engine --engine-max-steps 3 --agent auto
 ```
 
 Inspect installed block:
@@ -91,6 +92,12 @@ Run a bounded multi-step execution loop for one issue:
 
 ```bash
 npm run tasks -- linear-engine --issue CLAW-128 --max-steps 5 --json
+```
+
+Run a bounded multi-step execution loop with auto-picked runnable issue:
+
+```bash
+npm run tasks -- linear-engine --max-steps 3 --agent auto --json
 ```
 
 Key acceptance checks:

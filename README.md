@@ -51,7 +51,7 @@ Tracking page for ongoing OpenClaw development projects:
 - `tasks audit-rollback`: rollback auditable local JSON writes by audit id
 - `tasks sla-check`: stale issue SLA check (Blocked/In Progress) with owner mention + escalation issue
 - `tasks linear-autopilot`: pull one runnable Linear issue and let configured execution agent execute exactly one next step, then auto comment/state update (supports `--issue CLAW-123`, `--agent <id>`, `--agent auto`)
-- `tasks linear-engine`: run multiple `linear-autopilot` steps for one issue until `done/blocked/max-steps`
+- `tasks linear-engine`: run multi-step execution for a specific issue or auto-pick one runnable issue until `done/blocked/max-steps`
 - `tasks eval-replay`: export replay artifact for eval/distillation workflow
 - `tasks runbook-exec`: run SOP runbook cards in dry-run or guarded execute mode
 - `tasks trigger`: one-click run for sync/report/watchdog jobs with confirmation token
@@ -59,7 +59,7 @@ Tracking page for ongoing OpenClaw development projects:
 - `tasks run|enable|disable|kill`: control actions with one-time confirmation token
 - `tasks approve`: one-time approval token for high-risk write actions (`run/enable/disable/kill/trigger/autopr/runbook-exec`)
 - `tasks schedule`: generate/install crontab with mode switch:
-  - `minimal` (default): `discord-intake-sync` + `queue-drain` + `linear-autopilot`
+  - `minimal` (default): `discord-intake-sync` + `queue-drain` + execution loop (`linear-autopilot` by default, configurable to `linear-engine`)
   - `full`: report/watchdog/github/todoist/calendar/status/sla + reminders/briefing + minimal loop
 
 ## Quick start
@@ -227,6 +227,9 @@ npm run tasks -- linear-autopilot --issue CLAW-128 --agent auto --json
 # Execute multiple steps for one specific issue
 npm run tasks -- linear-engine --issue CLAW-128 --max-steps 5 --json
 
+# Execute multi-step engine on one auto-picked runnable issue
+npm run tasks -- linear-engine --max-steps 3 --agent auto --json
+
 # Backfill around a specific Discord message id (one-time import of historical directives)
 npm run tasks -- discord-intake-sync --around <MESSAGE_ID> --backfill --limit 60
 
@@ -359,6 +362,12 @@ Install minimal mode with auto agent selector for autopilot lane:
 
 ```bash
 npm run tasks -- schedule --apply --mode minimal --agent auto
+```
+
+Install minimal mode with multi-step execution loop:
+
+```bash
+npm run tasks -- schedule --apply --mode minimal --execution-loop engine --engine-max-steps 3 --agent auto
 ```
 
 Install with report push target:
@@ -640,13 +649,19 @@ Fields:
 - `intakeQueue.*`
 - `sla.*`
 - `runbook.*`
-- `execution.*` (including `agentId`, `agentPreferred`, `agentAllowlist`, `agentDenylist`)
+- `execution.*` (including `loopCommand`, `engineAutoPick`, `engineMaxSteps`, `agentId`, `agentPreferred`, `agentAllowlist`, `agentDenylist`)
 
 `execution.agentId` behavior:
 
 - fixed agent id (for example `codex`, `coder`, `main`)
 - `auto` / `any` / `*`: round-robin across available agents (optionally constrained by allow/deny list)
 - default: `auto` (recommended for shared execution capability across current and future agents)
+
+`execution.loopCommand` behavior:
+
+- `linear-autopilot` or `autopilot`: one-step loop per tick
+- `linear-engine` or `engine`: multi-step loop per tick (`execution.engineMaxSteps`)
+- if `execution.agentId=auto` and allowlist is empty, main agent + all discovered subagents share the same execution engine lane
 
 ## Storage files
 

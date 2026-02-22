@@ -272,6 +272,11 @@ const DEFAULTS = {
   execution: {
     enabled: true,
     pollMinutes: 5,
+    loopCommand: 'linear-autopilot',
+    engineAutoPick: true,
+    engineMaxSteps: 3,
+    engineNoProgressThreshold: 2,
+    engineStepSleepMs: 0,
     agentId: 'auto',
     agentPreferred: ['codex', 'coder', 'main'],
     agentAllowlist: [],
@@ -349,7 +354,7 @@ Integrations:
   calendar-sync                Sync Google Calendar events snapshot (browser logged-in tab)
   discord-intake-sync          Auto ingest main Discord directives into Linear Triage
   linear-autopilot             Pick one runnable Linear issue and execute one next step via configured execution agent
-  linear-engine                Multi-step execution engine for one issue (until done/blocked/max-steps)
+  linear-engine                Multi-step execution engine (specific issue or auto-pick runnable issue)
 
 Write commands (require one-time confirmation):
   confirm                      Generate one-time confirmation code
@@ -363,10 +368,10 @@ Write commands (require one-time confirmation):
   runbook-exec --card CARD [--issue CLAW-123] [--cron-id ID] --confirm CODE [--execute]
 
 Scheduling:
-  schedule [--apply] [--mode full|minimal] [--agent AGENT|auto] [--channel CH] [--target TGT]
+  schedule [--apply] [--mode full|minimal] [--execution-loop autopilot|engine] [--engine-max-steps N] [--agent AGENT|auto] [--channel CH] [--target TGT]
     Prepare (or install) crontab block:
-    - mode=full: report + watchdog + sync/governance + queue drain + linear-autopilot + reminders/briefing
-    - mode=minimal: discord-intake-sync + queue-drain + linear-autopilot
+    - mode=full: report + watchdog + sync/governance + queue drain + execution loop + reminders/briefing
+    - mode=minimal: discord-intake-sync + queue-drain + execution loop (autopilot by default)
 
 Examples:
   npm run tasks -- triage --title "Fix Discord manual model switch" --source discord --source-id discord:msg:123
@@ -377,6 +382,7 @@ Examples:
   npm run tasks -- linear-autopilot --json
   npm run tasks -- linear-autopilot --issue CLAW-128 --json
   npm run tasks -- linear-autopilot --issue CLAW-128 --agent auto --json
+  npm run tasks -- linear-engine --max-steps 3 --agent auto --json
   npm run tasks -- linear-engine --issue CLAW-128 --max-steps 5 --json
   npm run tasks -- briefing daily --send
   npm run tasks -- discord-intake-sync --channel 1468117725040742527
@@ -1625,6 +1631,13 @@ async function cmdSchedule(settings, flags) {
     throw new Error(`invalid schedule mode: ${mode}. expected full|minimal`);
   }
   const minimalMode = mode === 'minimal';
+  const executionLoopRaw = String(
+    flags['execution-loop'] || flags.executionLoop || (settings.execution && settings.execution.loopCommand) || 'linear-autopilot',
+  ).trim();
+  const executionLoop = normalizeExecutionLoopCommand(executionLoopRaw);
+  if (!executionLoop) {
+    throw new Error(`invalid execution loop: ${executionLoopRaw}. expected autopilot|engine`);
+  }
 
   const channel = String(flags.channel || settings.report.channel || '').trim();
   const target = String(flags.target || settings.report.target || '').trim();
@@ -1659,7 +1672,7 @@ async function cmdSchedule(settings, flags) {
   const statusSyncLog = path.join(DATA_DIR, 'status-sync-cron.log');
   const queueDrainLog = path.join(DATA_DIR, 'queue-drain-cron.log');
   const slaCheckLog = path.join(DATA_DIR, 'sla-check-cron.log');
-  const linearAutopilotLog = path.join(DATA_DIR, 'linear-autopilot-cron.log');
+  const linearExecutionLog = path.join(DATA_DIR, `${executionLoop}-cron.log`);
   const watchdogInterval = Number(flags['watchdog-interval'] || 5);
   const githubPollMinutes = Number(flags['github-poll-minutes'] || settings.github.pollIntervalMinutes || 15);
   const todoistPollMinutes = Number(flags['todoist-poll-minutes'] || 30);
@@ -1687,7 +1700,7 @@ async function cmdSchedule(settings, flags) {
   const queueDrainExpr =
     settings.intakeQueue.enabled === false ? '' : cronEveryMinutesExpr(queueDrainMinutes);
   const slaExpr = minimalMode || settings.sla.enabled === false ? '' : cronEveryMinutesExpr(slaPollMinutes);
-  const linearAutopilotExpr =
+  const linearExecutionExpr =
     settings.execution.enabled === false ? '' : cronEveryMinutesExpr(executionPollMinutes);
 
   ensureDir(DATA_DIR);
@@ -1710,10 +1723,49 @@ async function cmdSchedule(settings, flags) {
   const statusSyncParts = [nodeBin, scriptPath, 'status-sync'];
   const queueDrainParts = [nodeBin, scriptPath, 'queue-drain'];
   const slaCheckParts = [nodeBin, scriptPath, 'sla-check'];
-  const linearAutopilotParts = [nodeBin, scriptPath, 'linear-autopilot'];
+  const linearExecutionParts = [nodeBin, scriptPath, executionLoop];
+  if (executionLoop === 'linear-engine') {
+    const engineMaxSteps = Math.max(
+      1,
+      Number(
+        flags['engine-max-steps'] ||
+          (settings.execution && settings.execution.engineMaxSteps) ||
+          3,
+      ),
+    );
+    const engineNoProgressThreshold = Math.max(
+      2,
+      Number(
+        flags['engine-no-progress-threshold'] ||
+          (settings.execution && settings.execution.engineNoProgressThreshold) ||
+          2,
+      ),
+    );
+    const engineStepSleepMs = Math.max(
+      0,
+      Number(
+        flags['engine-step-sleep-ms'] ||
+          (settings.execution && settings.execution.engineStepSleepMs) ||
+          0,
+      ),
+    );
+    const engineAutoPick =
+      flags['engine-auto-pick'] !== undefined
+        ? isTruthyLike(flags['engine-auto-pick'])
+        : Boolean(settings.execution && settings.execution.engineAutoPick !== false);
+
+    linearExecutionParts.push('--max-steps', String(engineMaxSteps));
+    linearExecutionParts.push('--no-progress-threshold', String(engineNoProgressThreshold));
+    if (engineStepSleepMs > 0) {
+      linearExecutionParts.push('--step-sleep-ms', String(engineStepSleepMs));
+    }
+    if (engineAutoPick) {
+      linearExecutionParts.push('--auto-pick');
+    }
+  }
   const executionAgentOverride = String(flags.agent || '').trim();
   if (executionAgentOverride) {
-    linearAutopilotParts.push('--agent', executionAgentOverride);
+    linearExecutionParts.push('--agent', executionAgentOverride);
   }
   const remindDueParts = [nodeBin, scriptPath, 'remind', 'due'];
   const remindCycleParts = [nodeBin, scriptPath, 'remind', 'cycle'];
@@ -1777,9 +1829,9 @@ async function cmdSchedule(settings, flags) {
           `${slaExpr} cd ${shellQuote(ROOT_DIR)} && ${joinShell(slaCheckParts)} >> ${shellQuote(slaCheckLog)} 2>&1`,
         ]
       : []),
-    ...(linearAutopilotExpr
+    ...(linearExecutionExpr
       ? [
-          `${linearAutopilotExpr} cd ${shellQuote(ROOT_DIR)} && ${joinShell(linearAutopilotParts)} >> ${shellQuote(linearAutopilotLog)} 2>&1`,
+          `${linearExecutionExpr} cd ${shellQuote(ROOT_DIR)} && ${joinShell(linearExecutionParts)} >> ${shellQuote(linearExecutionLog)} 2>&1`,
         ]
       : []),
     ...(withReminders
@@ -1800,7 +1852,7 @@ async function cmdSchedule(settings, flags) {
   const block = blockLines.join('\n');
 
   if (!apply) {
-    process.stdout.write(`Proposed crontab block (mode=${mode}):\n`);
+    process.stdout.write(`Proposed crontab block (mode=${mode}, execution=${executionLoop}):\n`);
     process.stdout.write(`${block}\n`);
     process.stdout.write('\nRun with --apply to install this block into your user crontab.\n');
     return;
@@ -1810,7 +1862,9 @@ async function cmdSchedule(settings, flags) {
   const next = replaceCrontabBlock(current, block);
   writeCrontab(next);
 
-  process.stdout.write(`Crontab updated with OpenClaw Control Center schedule (mode=${mode}).\n`);
+  process.stdout.write(
+    `Crontab updated with OpenClaw Control Center schedule (mode=${mode}, execution=${executionLoop}).\n`,
+  );
 }
 
 async function cmdTriage(settings, flags) {
@@ -4084,18 +4138,36 @@ async function cmdLinearAutopilot(settings, flags) {
 }
 
 async function cmdLinearEngine(settings, flags) {
-  const issueIdentifier = normalizeLinearIssueId(
+  const requestedIssueIdentifier = normalizeLinearIssueId(
     flags.issue || flags['issue-id'] || flags.identifier || '',
   );
-  if (!issueIdentifier) {
-    throw new Error('linear-engine requires --issue CLAW-123.');
+  const autoPick =
+    flags['auto-pick'] !== undefined
+      ? isTruthyLike(flags['auto-pick'])
+      : !requestedIssueIdentifier && Boolean(settings.execution && settings.execution.engineAutoPick !== false);
+  if (!requestedIssueIdentifier && !autoPick) {
+    throw new Error('linear-engine requires --issue CLAW-123 (or pass --auto-pick).');
   }
 
-  const maxSteps = Math.max(1, Number(flags['max-steps'] || flags.steps || 5));
-  const stepSleepMs = Math.max(0, Number(flags['step-sleep-ms'] || 0));
+  const maxSteps = Math.max(
+    1,
+    Number(
+      flags['max-steps'] || flags.steps || (settings.execution && settings.execution.engineMaxSteps) || 5,
+    ),
+  );
+  const stepSleepMs = Math.max(
+    0,
+    Number(
+      flags['step-sleep-ms'] || (settings.execution && settings.execution.engineStepSleepMs) || 0,
+    ),
+  );
   const noProgressThreshold = Math.max(
     2,
-    Number(flags['no-progress-threshold'] || 2),
+    Number(
+      flags['no-progress-threshold'] ||
+        (settings.execution && settings.execution.engineNoProgressThreshold) ||
+        2,
+    ),
   );
   const strictFailure = isTruthyLike(flags.strict);
   const timeoutSeconds = Math.max(
@@ -4108,9 +4180,19 @@ async function cmdLinearEngine(settings, flags) {
   let stopReason = 'max-steps';
   let previousFingerprint = '';
   let consecutiveSameFingerprint = 0;
+  let activeIssueIdentifier = requestedIssueIdentifier;
+  let resolvedIssueIdentifier = requestedIssueIdentifier;
+  let autoPickAttempted = false;
 
   for (let step = 1; step <= maxSteps; step += 1) {
-    const childArgs = ['linear-autopilot', '--issue', issueIdentifier, '--json'];
+    const childArgs = ['linear-autopilot', '--json'];
+    if (activeIssueIdentifier) {
+      childArgs.push('--issue', activeIssueIdentifier);
+    } else if (autoPick) {
+      autoPickAttempted = true;
+    } else {
+      throw new Error('linear-engine internal error: missing issue identifier.');
+    }
     if (isTruthyLike(flags.force)) {
       childArgs.push('--force');
     }
@@ -4132,6 +4214,17 @@ async function cmdLinearEngine(settings, flags) {
     if (flags['retry-backoff-seconds']) {
       childArgs.push('--retry-backoff-seconds', String(flags['retry-backoff-seconds']));
     }
+    if (!activeIssueIdentifier) {
+      if (flags.all || flags['include-all']) {
+        childArgs.push('--all');
+      }
+      if (flags.states) {
+        childArgs.push('--states', String(flags.states));
+      }
+      if (flags.labels) {
+        childArgs.push('--labels', String(flags.labels));
+      }
+    }
 
     let payload = null;
     let commandError = '';
@@ -4147,6 +4240,15 @@ async function cmdLinearEngine(settings, flags) {
       payload = extractJson(output.stdout || '');
     } catch (error) {
       commandError = error instanceof Error ? error.message : String(error);
+    }
+    const payloadIssueIdentifier = normalizeLinearIssueId(
+      payload && payload.issue && payload.issue.identifier ? payload.issue.identifier : '',
+    );
+    if (!activeIssueIdentifier && payloadIssueIdentifier) {
+      activeIssueIdentifier = payloadIssueIdentifier;
+      resolvedIssueIdentifier = payloadIssueIdentifier;
+    } else if (!resolvedIssueIdentifier && payloadIssueIdentifier) {
+      resolvedIssueIdentifier = payloadIssueIdentifier;
     }
 
     const stepRun = {
@@ -4165,6 +4267,7 @@ async function cmdLinearEngine(settings, flags) {
       summary: payload ? singleLine(trimMessage(String(payload.summary || ''), 240)) : '',
       error: commandError || (payload ? String(payload.error || payload.commentError || '') : ''),
       agentUsed: payload ? String(payload.agentUsed || payload.agentId || '') : '',
+      issueIdentifier: payloadIssueIdentifier || activeIssueIdentifier || requestedIssueIdentifier || '',
     };
     runs.push(stepRun);
 
@@ -4184,6 +4287,7 @@ async function cmdLinearEngine(settings, flags) {
     }
 
     const fingerprint = [
+      String(stepRun.issueIdentifier || '-').toLowerCase(),
       normalizedStatus || '-',
       String(stepRun.nextState || '-').toLowerCase(),
       String(stepRun.transitionStatus || '-').toLowerCase(),
@@ -4206,10 +4310,15 @@ async function cmdLinearEngine(settings, flags) {
   }
 
   const finalRun = runs.length > 0 ? runs[runs.length - 1] : null;
+  const issueIdentifier =
+    resolvedIssueIdentifier || (finalRun && finalRun.issueIdentifier ? finalRun.issueIdentifier : '') || '';
   const hasError = runs.some((item) => String(item.error || '').trim().length > 0);
   const result = {
     ok: !hasError,
+    requestedIssueIdentifier,
     issueIdentifier,
+    autoPick,
+    autoPickAttempted,
     stepsPlanned: maxSteps,
     stepsExecuted: runs.length,
     stopReason,
@@ -4224,7 +4333,7 @@ async function cmdLinearEngine(settings, flags) {
   } else {
     const lines = [];
     lines.push('Linear engine result:');
-    lines.push(`- issue: ${issueIdentifier}`);
+    lines.push(`- issue: ${issueIdentifier || '-'}`);
     lines.push(`- steps: ${result.stepsExecuted}/${result.stepsPlanned}`);
     lines.push(`- stop reason: ${result.stopReason}`);
     lines.push(`- final status: ${result.finalStatus || '-'}`);
@@ -6904,6 +7013,14 @@ function buildLinearAutopilotPrompt(issue, maxPromptChars, options = {}) {
   lines.push(rawInput || '(no description)');
   lines.push('```');
   lines.push('');
+  lines.push('Status contract (strict):');
+  lines.push('- status reflects ISSUE-level progress, not just this single step result.');
+  lines.push('- Use status="done" only when the issue acceptance criteria are fully satisfied.');
+  lines.push('- If any work remains, status must be "in_progress".');
+  lines.push('- If status="done", next_action must be empty and next_state must be "Done" or "In Review".');
+  lines.push('- If status="blocked", next_state must be "Blocked".');
+  lines.push('- If status="in_progress", next_state must be "In Progress".');
+  lines.push('');
   lines.push('Return strict JSON only (no markdown):');
   lines.push(
     '{"status":"done|in_progress|blocked","summary":"what changed","next_action":"single next action","artifacts":["path or url"],"next_state":"In Progress|In Review|Blocked|Done|Triage"}',
@@ -6964,11 +7081,29 @@ function parseLinearAutopilotResponse(text) {
     .filter(Boolean)
     .slice(0, 8);
 
+  let status = normalizeAutopilotStatus(parsed.status || parsed.result || '');
+  let nextState = normalizeAutopilotStateName(parsed.next_state || parsed.nextState || '');
+  const nextAction = String(parsed.next_action || parsed.nextAction || '').trim();
+
+  // Guard against common semantic drift where "done" means "one step done".
+  if (status === 'done' && nextAction) {
+    status = 'in_progress';
+  }
+  if (status === 'done' && nextState && nextState !== 'Done' && nextState !== 'In Review') {
+    status = 'in_progress';
+  }
+  if (status === 'blocked' && nextState && nextState !== 'Blocked') {
+    status = 'in_progress';
+  }
+  if (status === 'in_progress' && nextState === 'Done') {
+    nextState = 'In Progress';
+  }
+
   return {
-    status: normalizeAutopilotStatus(parsed.status || parsed.result || ''),
+    status,
     summary: String(parsed.summary || parsed.message || '').trim(),
-    nextAction: String(parsed.next_action || parsed.nextAction || '').trim(),
-    nextState: normalizeAutopilotStateName(parsed.next_state || parsed.nextState || ''),
+    nextAction,
+    nextState,
     artifacts,
   };
 }
@@ -9843,6 +9978,26 @@ function normalizeTriggerJobId(value) {
     sla: 'sla-check',
   };
   return alias[text] || text;
+}
+
+function normalizeExecutionLoopCommand(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) {
+    return '';
+  }
+  const alias = {
+    autopilot: 'linear-autopilot',
+    'linear-autopilot': 'linear-autopilot',
+    execution: 'linear-autopilot',
+    'execution-loop': 'linear-autopilot',
+    engine: 'linear-engine',
+    'linear-engine': 'linear-engine',
+    'execution-engine': 'linear-engine',
+    'autopilot-engine': 'linear-engine',
+    multi: 'linear-engine',
+    'multi-step': 'linear-engine',
+  };
+  return alias[text] || '';
 }
 
 function buildTriggerChildArgs(jobId, settings, flags) {

@@ -39,7 +39,8 @@
       "status-sync",
       "queue-drain",
       "sla-check",
-      "linear-autopilot"
+      "linear-autopilot",
+      "linear-engine"
     ]
   },
   "linear": {
@@ -241,6 +242,11 @@
   "execution": {
     "enabled": true,
     "pollMinutes": 5,
+    "loopCommand": "linear-engine",
+    "engineAutoPick": true,
+    "engineMaxSteps": 3,
+    "engineNoProgressThreshold": 2,
+    "engineStepSleepMs": 0,
     "agentId": "auto",
     "agentPreferred": [
       "codex",
@@ -250,6 +256,11 @@
     "agentAllowlist": [],
     "agentDenylist": [],
     "timeoutSeconds": 900,
+    "agentRetries": 2,
+    "retryBackoffSeconds": 20,
+    "lockTtlSeconds": 1800,
+    "fallbackAgentSuffix": "autopilot",
+    "failOnError": false,
     "includeStates": [
       "In Progress",
       "Triage",
