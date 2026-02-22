@@ -1,11 +1,11 @@
 {
-  "timestamp": "2026-02-22T20:36:46.786Z",
+  "timestamp": "2026-02-22T21:10:59.454Z",
   "scope": "baseline-control-group",
   "agents": {
     "coder": {
       "sessionCount": 5,
-      "totalTokens": 54039,
-      "avgTokens": 10808,
+      "totalTokens": 54689,
+      "avgTokens": 10938,
       "models": [
         "gpt-5.3-codex",
         "gpt-5.2"
@@ -21,9 +21,10 @@
     },
     "gemini": {
       "sessionCount": 2,
-      "totalTokens": 421720,
-      "avgTokens": 210860,
+      "totalTokens": 170307,
+      "avgTokens": 85154,
       "models": [
+        "coder-model",
         "gemini-3-pro-preview"
       ]
     },
@@ -39,8 +40,8 @@
     },
     "main-autopilot": {
       "sessionCount": 1,
-      "totalTokens": 58728,
-      "avgTokens": 58728,
+      "totalTokens": 59330,
+      "avgTokens": 59330,
       "models": [
         "gpt-5.3-codex"
       ]
@@ -156,18 +157,33 @@
     }
   },
   "jobTokens": {
-    "CLAW-109": {
-      "totalTokens": 95278,
+    "CLAW-108": {
+      "totalTokens": 190485,
       "sessions": [
         {
           "key": "agent:coder:main",
           "agentId": "coder",
-          "tokens": 36550
+          "tokens": 37200
+        },
+        {
+          "key": "agent:codex:main",
+          "agentId": "codex",
+          "tokens": 33819
         },
         {
           "key": "agent:main-autopilot:main",
           "agentId": "main-autopilot",
-          "tokens": 58728
+          "tokens": 59330
+        },
+        {
+          "key": "agent:researcher-deep:main",
+          "agentId": "researcher-deep",
+          "tokens": 28510
+        },
+        {
+          "key": "agent:writer:main",
+          "agentId": "writer",
+          "tokens": 31626
         }
       ]
     },
@@ -196,33 +212,13 @@
         }
       ]
     },
-    "CLAW-108": {
-      "totalTokens": 93955,
-      "sessions": [
-        {
-          "key": "agent:codex:main",
-          "agentId": "codex",
-          "tokens": 33819
-        },
-        {
-          "key": "agent:researcher-deep:main",
-          "agentId": "researcher-deep",
-          "tokens": 28510
-        },
-        {
-          "key": "agent:writer:main",
-          "agentId": "writer",
-          "tokens": 31626
-        }
-      ]
-    },
     "CLAW-165": {
-      "totalTokens": 387926,
+      "totalTokens": 136513,
       "sessions": [
         {
           "key": "agent:gemini:main",
           "agentId": "gemini",
-          "tokens": 387926
+          "tokens": 136513
         }
       ]
     },
