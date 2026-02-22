@@ -32,6 +32,7 @@ const RUNBOOK_EXEC_PATH = path.join(DATA_DIR, 'runbook-exec.json');
 const DISCORD_INTAKE_STATE_PATH = path.join(DATA_DIR, 'discord-intake-state.json');
 const LINEAR_AUTOPILOT_PATH = path.join(DATA_DIR, 'linear-autopilot.json');
 const LINEAR_AUTOPILOT_LOCK_PATH = path.join(DATA_DIR, 'linear-autopilot.lock.json');
+const LINEAR_AUTOPILOT_CIRCUIT_PATH = path.join(DATA_DIR, 'linear-autopilot-circuit.json');
 let OPENCLAW_AGENT_IDS_CACHE = {
   loadedAtMs: 0,
   ids: null,
@@ -270,6 +271,15 @@ const DEFAULTS = {
     issueCooldownMinutes: 30,
     maxConsecutiveSameIssue: 2,
     preferNewTriage: true,
+    circuitBreaker: {
+      enabled: true,
+      failureThreshold: 2,
+      cooldownMinutes: 30,
+      autoLinearIssue: true,
+      issueState: 'Triage',
+      issuePriority: 2,
+      issueLabels: ['ops', 'autopilot', 'circuit-breaker'],
+    },
   },
 };
 
@@ -3297,6 +3307,35 @@ async function cmdLinearAutopilot(settings, flags) {
     throw new Error('LINEAR_API_KEY is required for linear-autopilot.');
   }
 
+  const forceRun = isTruthyLike(flags.force);
+  const circuitSettings = resolveAutopilotCircuitSettings(settings, flags);
+  const circuitState = readAutopilotCircuitState();
+  const circuitGate = evaluateAutopilotCircuitGate(circuitState, circuitSettings, forceRun);
+  if (circuitGate.open && !forceRun) {
+    const skipped = {
+      ok: true,
+      skipped: true,
+      reason: 'circuit-open',
+      circuit: {
+        status: 'open',
+        openUntilMs: circuitGate.openUntilMs,
+        openUntil: new Date(circuitGate.openUntilMs).toISOString(),
+        lastReason: circuitGate.lastReason,
+        consecutiveFailures: circuitGate.consecutiveFailures,
+        issueIdentifier: circuitState.issueIdentifier || '',
+        issueUrl: circuitState.issueUrl || '',
+      },
+    };
+    if (flags.json) {
+      process.stdout.write(`${JSON.stringify(skipped, null, 2)}\n`);
+    } else {
+      process.stdout.write(
+        `Linear autopilot skipped: circuit open until ${formatTime(circuitGate.openUntilMs, settings.timezone)}.\n`,
+      );
+    }
+    return;
+  }
+
   const t0 = Date.now();
   const traceAutopilot = Boolean(flags.trace);
   const trace = (msg) => {
@@ -3571,6 +3610,18 @@ async function cmdLinearAutopilot(settings, flags) {
     error: agentError,
   };
 
+  const circuitUpdate = await updateAutopilotCircuitState({
+    result,
+    settings,
+    flags,
+    apiKey,
+    circuitSettings,
+    previousState: circuitState,
+  });
+  if (circuitUpdate && typeof circuitUpdate === 'object') {
+    result.circuit = circuitUpdate.public;
+  }
+
   const runs = Array.isArray(historyState.runs) ? historyState.runs : [];
   runs.unshift({
     atMs: Date.now(),
@@ -3597,6 +3648,7 @@ async function cmdLinearAutopilot(settings, flags) {
     transitionStatus: result.transition && result.transition.status ? result.transition.status : '',
     agentUsed: result.agentUsed || agentId,
     commented: result.commented,
+    circuitStatus: result.circuit && result.circuit.status ? result.circuit.status : 'unknown',
     error: result.error || result.commentError || '',
   });
 
@@ -6194,6 +6246,320 @@ function parseLinearAutopilotResponse(text) {
   };
 }
 
+function resolveAutopilotCircuitSettings(settings, flags) {
+  const base = settings &&
+    settings.execution &&
+    settings.execution.circuitBreaker &&
+    typeof settings.execution.circuitBreaker === 'object'
+    ? settings.execution.circuitBreaker
+    : {};
+
+  return {
+    enabled:
+      flags['circuit-enabled'] !== undefined
+        ? isTruthyLike(flags['circuit-enabled'])
+        : base.enabled !== false,
+    failureThreshold: Math.max(
+      2,
+      Number(flags['circuit-failure-threshold'] || base.failureThreshold || 2),
+    ),
+    cooldownMinutes: Math.max(
+      1,
+      Number(flags['circuit-cooldown-minutes'] || base.cooldownMinutes || 30),
+    ),
+    autoLinearIssue:
+      flags['circuit-auto-linear'] !== undefined
+        ? isTruthyLike(flags['circuit-auto-linear'])
+        : base.autoLinearIssue !== false,
+    issueState: String(flags['circuit-issue-state'] || base.issueState || 'Triage').trim(),
+    issuePriority: normalizeLinearPriority(
+      Number(flags['circuit-issue-priority'] || base.issuePriority || 2),
+    ),
+    issueLabels: dedupeStrings(
+      normalizeLabelNames(flags['circuit-issue-labels'] || base.issueLabels || [
+        'ops',
+        'autopilot',
+        'circuit-breaker',
+      ]),
+    ),
+  };
+}
+
+function normalizeLinearPriority(value) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n)) {
+    return 3;
+  }
+  if (n <= 1) {
+    return 1;
+  }
+  if (n >= 4) {
+    return 4;
+  }
+  return Math.round(n);
+}
+
+function readAutopilotCircuitState() {
+  const raw = readJsonFile(LINEAR_AUTOPILOT_CIRCUIT_PATH, {
+    version: 1,
+    status: 'closed',
+    consecutiveFailures: 0,
+    firstFailureAtMs: 0,
+    lastFailureAtMs: 0,
+    lastFailureReason: '',
+    lastFailureMessage: '',
+    lastFailureIssueIdentifier: '',
+    openedAtMs: 0,
+    openUntilMs: 0,
+    reopenCount: 0,
+    issueId: '',
+    issueIdentifier: '',
+    issueUrl: '',
+    lastSuccessAtMs: 0,
+    updatedAtMs: 0,
+  });
+
+  return {
+    version: 1,
+    status: String(raw.status || 'closed').trim().toLowerCase() || 'closed',
+    consecutiveFailures: Math.max(0, Number(raw.consecutiveFailures || 0)),
+    firstFailureAtMs: Number(raw.firstFailureAtMs || 0),
+    lastFailureAtMs: Number(raw.lastFailureAtMs || 0),
+    lastFailureReason: String(raw.lastFailureReason || '').trim(),
+    lastFailureMessage: String(raw.lastFailureMessage || '').trim(),
+    lastFailureIssueIdentifier: String(raw.lastFailureIssueIdentifier || '').trim(),
+    openedAtMs: Number(raw.openedAtMs || 0),
+    openUntilMs: Number(raw.openUntilMs || 0),
+    reopenCount: Math.max(0, Number(raw.reopenCount || 0)),
+    issueId: String(raw.issueId || '').trim(),
+    issueIdentifier: String(raw.issueIdentifier || '').trim(),
+    issueUrl: String(raw.issueUrl || '').trim(),
+    lastSuccessAtMs: Number(raw.lastSuccessAtMs || 0),
+    updatedAtMs: Number(raw.updatedAtMs || 0),
+  };
+}
+
+function writeAutopilotCircuitState(state) {
+  const next = {
+    ...state,
+    version: 1,
+    updatedAtMs: Date.now(),
+  };
+  writeJsonFile(LINEAR_AUTOPILOT_CIRCUIT_PATH, next);
+  return next;
+}
+
+function evaluateAutopilotCircuitGate(state, circuitSettings, forceRun) {
+  const nowMs = Date.now();
+  if (!circuitSettings.enabled) {
+    return {
+      open: false,
+      openUntilMs: 0,
+      consecutiveFailures: Number(state.consecutiveFailures || 0),
+      lastReason: String(state.lastFailureReason || ''),
+    };
+  }
+
+  if (state.status === 'open' && Number(state.openUntilMs || 0) <= nowMs) {
+    const reopened = writeAutopilotCircuitState({
+      ...state,
+      status: 'half-open',
+      openUntilMs: 0,
+    });
+    return {
+      open: false,
+      openUntilMs: 0,
+      consecutiveFailures: Number(reopened.consecutiveFailures || 0),
+      lastReason: String(reopened.lastFailureReason || ''),
+    };
+  }
+
+  if (!forceRun && state.status === 'open' && Number(state.openUntilMs || 0) > nowMs) {
+    return {
+      open: true,
+      openUntilMs: Number(state.openUntilMs || 0),
+      consecutiveFailures: Number(state.consecutiveFailures || 0),
+      lastReason: String(state.lastFailureReason || ''),
+    };
+  }
+
+  return {
+    open: false,
+    openUntilMs: 0,
+    consecutiveFailures: Number(state.consecutiveFailures || 0),
+    lastReason: String(state.lastFailureReason || ''),
+  };
+}
+
+function classifyAutopilotFailure(result) {
+  const errorText = String(result && result.error ? result.error : '').trim();
+  if (!errorText) {
+    return { failed: false, reason: '', message: '' };
+  }
+
+  const lower = errorText.toLowerCase();
+  let reason = 'error';
+  if (
+    lower.includes('etimedout') ||
+    lower.includes('timed out') ||
+    /timeout\s+\d+ms/i.test(errorText) ||
+    lower.includes('timeoutexpired')
+  ) {
+    reason = 'timeout';
+  } else if (lower.includes('rate limit') || lower.includes('cooldown')) {
+    reason = 'rate_limit';
+  } else if (lower.includes('session file locked') || lower.includes('already-running')) {
+    reason = 'session_lock';
+  } else if (lower.includes('gateway closed') || lower.includes('service restart')) {
+    reason = 'gateway_restart';
+  }
+
+  return {
+    failed: true,
+    reason,
+    message: singleLine(trimMessage(errorText, 500)),
+  };
+}
+
+async function updateAutopilotCircuitState(input) {
+  const result = input && input.result ? input.result : {};
+  const settings = input && input.settings ? input.settings : {};
+  const flags = input && input.flags ? input.flags : {};
+  const apiKey = String(input && input.apiKey ? input.apiKey : '').trim();
+  const circuitSettings = input && input.circuitSettings ? input.circuitSettings : { enabled: false };
+  let state = input && input.previousState ? { ...input.previousState } : readAutopilotCircuitState();
+
+  if (!circuitSettings.enabled) {
+    return {
+      public: {
+        status: 'disabled',
+        consecutiveFailures: Number(state.consecutiveFailures || 0),
+        threshold: Number(circuitSettings.failureThreshold || 0),
+      },
+    };
+  }
+
+  const failure = classifyAutopilotFailure(result);
+  const nowMs = Date.now();
+  let openedIssue = null;
+
+  if (failure.failed) {
+    const wasOpen = state.status === 'open' && Number(state.openUntilMs || 0) > nowMs;
+    state.status = 'closed';
+    state.consecutiveFailures = Number(state.consecutiveFailures || 0) + 1;
+    state.firstFailureAtMs = state.firstFailureAtMs > 0 ? state.firstFailureAtMs : nowMs;
+    state.lastFailureAtMs = nowMs;
+    state.lastFailureReason = failure.reason;
+    state.lastFailureMessage = failure.message;
+    state.lastFailureIssueIdentifier =
+      result && result.issue && result.issue.identifier ? String(result.issue.identifier) : '';
+
+    if (state.consecutiveFailures >= Number(circuitSettings.failureThreshold || 2)) {
+      state.status = 'open';
+      state.openedAtMs = nowMs;
+      state.openUntilMs = nowMs + Number(circuitSettings.cooldownMinutes || 30) * 60 * 1000;
+      state.reopenCount = Number(state.reopenCount || 0) + (wasOpen ? 0 : 1);
+
+      if (
+        circuitSettings.autoLinearIssue &&
+        settings.linear &&
+        settings.linear.enabled !== false &&
+        apiKey &&
+        !state.issueIdentifier
+      ) {
+        const issueInput = {
+          title: `[ops] linear-autopilot circuit open (${state.consecutiveFailures} consecutive failures)`,
+          source: 'mission-control',
+          sourceId: `ops:linear-autopilot-circuit:${state.openedAtMs}`,
+          state: circuitSettings.issueState || 'Triage',
+          priority: normalizeLinearPriority(circuitSettings.issuePriority || 2),
+          labels: dedupeStrings([
+            ...normalizeLabelNames(circuitSettings.issueLabels || []),
+            'ops',
+            'autopilot',
+          ]),
+          description: [
+            `Autopilot circuit opened after ${state.consecutiveFailures} consecutive failures.`,
+            '',
+            '## Failure Summary',
+            `- reason: ${failure.reason || 'error'}`,
+            `- message: ${failure.message || '-'}`,
+            `- issue: ${(result.issue && result.issue.identifier) || '-'}`,
+            `- runId: ${result.runId || '-'}`,
+            `- openUntil: ${new Date(state.openUntilMs).toISOString()}`,
+            '',
+            '## Suggested Actions',
+            '1. Inspect mission-control/data/control-center/linear-autopilot-cron.log',
+            '2. Validate openclaw agent health and session lock conditions',
+            '3. Resume after cooldown or force one manual run with --force',
+          ].join('\n'),
+          rawText: failure.message || 'linear-autopilot consecutive failure',
+        };
+
+        try {
+          openedIssue = await createTriageIssueFromInput(issueInput, settings);
+          state.issueId = openedIssue && openedIssue.id ? String(openedIssue.id) : '';
+          state.issueIdentifier =
+            openedIssue && openedIssue.identifier ? String(openedIssue.identifier) : '';
+          state.issueUrl = openedIssue && openedIssue.url ? String(openedIssue.url) : '';
+        } catch (error) {
+          appendAuditEvent('linear-autopilot-circuit-issue-error', {
+            error: error instanceof Error ? error.message : String(error),
+            reason: failure.reason,
+            consecutiveFailures: state.consecutiveFailures,
+          });
+        }
+      }
+
+      appendAuditEvent('linear-autopilot-circuit-open', {
+        consecutiveFailures: state.consecutiveFailures,
+        reason: failure.reason,
+        issueIdentifier: state.issueIdentifier || '',
+        openUntilMs: state.openUntilMs,
+      });
+    }
+  } else {
+    const wasOpen = state.status === 'open' || state.status === 'half-open';
+    const hadFailures = Number(state.consecutiveFailures || 0) > 0;
+    if (wasOpen || hadFailures) {
+      appendAuditEvent('linear-autopilot-circuit-recovered', {
+        consecutiveFailures: Number(state.consecutiveFailures || 0),
+        previousIssueIdentifier: state.issueIdentifier || '',
+      });
+    }
+    state.status = 'closed';
+    state.consecutiveFailures = 0;
+    state.firstFailureAtMs = 0;
+    state.lastFailureAtMs = 0;
+    state.lastFailureReason = '';
+    state.lastFailureMessage = '';
+    state.lastFailureIssueIdentifier = '';
+    state.openedAtMs = 0;
+    state.openUntilMs = 0;
+    state.issueId = '';
+    state.issueIdentifier = '';
+    state.issueUrl = '';
+    state.lastSuccessAtMs = nowMs;
+  }
+
+  state = writeAutopilotCircuitState(state);
+
+  return {
+    openedIssue,
+    public: {
+      status: state.status || 'closed',
+      consecutiveFailures: Number(state.consecutiveFailures || 0),
+      threshold: Number(circuitSettings.failureThreshold || 2),
+      openUntilMs: Number(state.openUntilMs || 0),
+      openUntil: state.openUntilMs ? new Date(state.openUntilMs).toISOString() : '',
+      lastFailureReason: String(state.lastFailureReason || ''),
+      issueIdentifier: String(state.issueIdentifier || ''),
+      issueUrl: String(state.issueUrl || ''),
+      forceRun: isTruthyLike(flags.force),
+    },
+  };
+}
+
 async function runLinearAutopilotAgent(options) {
   const prompt = String(options && options.prompt ? options.prompt : '').trim();
   const primaryAgentId = String(options && options.primaryAgentId ? options.primaryAgentId : 'main').trim();
@@ -7371,6 +7737,23 @@ function analyzeCron(jobs, nowMs, settings) {
         detectedAtMs: nowMs,
       });
     }
+  }
+
+  const circuitState = readAutopilotCircuitState();
+  if (circuitState.status === 'open' && Number(circuitState.openUntilMs || 0) > nowMs) {
+    anomalies.push({
+      scope: 'cron',
+      type: 'cron-circuit-open',
+      reason: 'circuit-open',
+      key: 'linear-autopilot:circuit-open',
+      severity: 97,
+      title: 'linear-autopilot circuit is open',
+      detail: `consecutiveFailures=${Number(circuitState.consecutiveFailures || 0)} until=${formatTime(circuitState.openUntilMs, settings.timezone)}`,
+      manualAction:
+        'Inspect mission-control/data/control-center/linear-autopilot-cron.log and clear root cause before forcing a run.',
+      jobId: 'linear-autopilot',
+      detectedAtMs: nowMs,
+    });
   }
 
   return { anomalies };
