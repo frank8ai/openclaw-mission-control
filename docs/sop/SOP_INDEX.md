@@ -20,3 +20,5 @@ This index lists project-level SOPs for OpenClaw Mission Control automation.
   - Purpose: generate/send daily-weekly briefing from runtime + cycle + SLA signals.
 - `SOP_MC_Triage_Signature_Dedupe_v1.md`
   - Purpose: suppress repeated intake issues via repo/error signature fingerprint.
+- `SOP_MC_Intake_Reliability_v2.md`
+  - Purpose: unify queue fallback and queue observability across webhook + non-webhook intake paths.

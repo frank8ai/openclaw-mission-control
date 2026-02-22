@@ -38,6 +38,7 @@ Tracking page for ongoing OpenClaw development projects:
 - `tasks calendar-sync`: capture Google Calendar events from logged-in browser tab
 - `tasks status-sync`: auto status machine (`Triage -> In Progress -> In Review -> Done/Blocked`) for linked runtime issues
 - `tasks queue-drain`: retry ingest queue and move exhausted items to DLQ
+- `tasks queue-stats`: inspect queue/DLQ health, retry buckets, and top sources
 - `tasks sla-check`: stale issue SLA check (Blocked/In Progress) with owner mention + escalation issue
 - `tasks linear-autopilot`: pull one runnable Linear issue and let main agent execute exactly one next step, then auto comment/state update
 - `tasks eval-replay`: export replay artifact for eval/distillation workflow
@@ -178,6 +179,9 @@ npm run tasks -- status-sync
 
 # Retry queued ingest items
 npm run tasks -- queue-drain
+
+# Queue/DLQ health snapshot
+npm run tasks -- queue-stats --json
 
 # Stale SLA checks + escalation
 npm run tasks -- sla-check
@@ -415,6 +419,8 @@ The pair is indexed at:
 
 If the same `source + sourceId` arrives again, Mission Control returns the existing issue instead of creating a duplicate.
 
+If `source` exists but `sourceId` is missing, Mission Control now derives a deterministic fallback sourceId from payload fingerprint (title/text/description/sourceUrl/author), then applies the same dedupe logic.
+
 Additional dedupe layer:
 
 - `data/control-center/triage-signature-index.json`
@@ -423,7 +429,7 @@ This suppresses repeats with the same intake signature (especially repeated repo
 
 ### Ingest queue + DLQ
 
-When webhook triage intake fails (e.g. Linear transient error), payload is queued automatically.
+When triage creation fails (e.g. Linear transient error), payload is queued automatically. This now covers webhook and non-webhook intake paths (`discord-intake-sync`, `todoist-sync`, `calendar-sync`, `memo-save`, `sla-check` escalation, and circuit-ops issue open).
 
 Files:
 
@@ -434,6 +440,9 @@ Manual retry:
 
 ```bash
 npm run tasks -- queue-drain
+
+# inspect queue / dlq distribution
+npm run tasks -- queue-stats
 ```
 
 Queue behavior:
@@ -441,6 +450,7 @@ Queue behavior:
 - exponential backoff
 - max retries configurable via `intakeQueue.maxRetries`
 - exceeds max retries -> moved to DLQ
+- queue dedupe by `source:sourceId` to prevent duplicate pending entries
 
 ### SLA automation
 

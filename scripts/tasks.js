@@ -24,6 +24,7 @@ const STATUS_SYNC_PATH = path.join(DATA_DIR, 'status-sync.json');
 const ISSUE_LINKS_PATH = path.join(DATA_DIR, 'runtime-issue-links.json');
 const SOURCE_ID_INDEX_PATH = path.join(DATA_DIR, 'triage-source-index.json');
 const TRIAGE_SIGNATURE_INDEX_PATH = path.join(DATA_DIR, 'triage-signature-index.json');
+const TRIAGE_CREATE_LOCK_PATH = path.join(DATA_DIR, 'triage-create.lock.json');
 const INGEST_QUEUE_PATH = path.join(DATA_DIR, 'ingest-queue.json');
 const INGEST_DLQ_PATH = path.join(DATA_DIR, 'ingest-dlq.json');
 const AUDIT_LOG_PATH = path.join(DATA_DIR, 'audit.jsonl');
@@ -301,6 +302,7 @@ Read commands:
   remind [due|cycle|all]       Send reminders from Linear (due soon/current cycle)
   status-sync [--json]         Auto state machine + comment trail for linked runtime issues
   queue-drain [--json]         Retry ingest queue and move failed payloads to DLQ
+  queue-stats [--json]         Show ingest queue/DLQ health, retries, and source distribution
   sla-check [--json]           Stale/blocked SLA checks with owner mention + escalation issue
   eval-replay [--json]         Build replay artifact for evaluation/distillation workflow
 
@@ -401,6 +403,10 @@ async function main() {
       case 'queue-drain':
       case 'retry-queue':
         await cmdQueueDrain(settings, flags);
+        return;
+      case 'queue-stats':
+      case 'ingest-stats':
+        await cmdQueueStats(settings, flags);
         return;
       case 'sla-check':
       case 'sla':
@@ -1680,7 +1686,7 @@ async function cmdTriage(settings, flags) {
   const dueDate = String(flags['due-date'] || '').trim();
   const priority = Number(flags.priority || 3);
 
-  const issue = await createTriageIssueFromInput(
+  const delivery = await createTriageIssueWithFallback(
     {
       title,
       rawText,
@@ -1695,7 +1701,29 @@ async function cmdTriage(settings, flags) {
       priority: Number.isFinite(priority) ? priority : 3,
     },
     settings,
+    { context: 'triage-cli' },
   );
+  if (delivery.queued) {
+    const queuedResult = {
+      ok: true,
+      queued: true,
+      queueId: delivery.queueId,
+      error: delivery.error,
+      source,
+      sourceId: sourceId ? normalizeSourceId(sourceId) : deriveAutoSourceId({ source, title, rawText, description }),
+    };
+    if (flags.json) {
+      process.stdout.write(`${JSON.stringify(queuedResult, null, 2)}\n`);
+      return;
+    }
+    const lines = [];
+    lines.push('Triage intake queued:');
+    lines.push(`- queueId: ${delivery.queueId}`);
+    lines.push(`- error: ${singleLine(delivery.error)}`);
+    process.stdout.write(`${lines.join('\n')}\n`);
+    return;
+  }
+  const issue = delivery.issue;
 
   if (flags.json) {
     process.stdout.write(`${JSON.stringify(issue, null, 2)}\n`);
@@ -2076,8 +2104,9 @@ async function cmdMemoSave(settings, flags) {
   const memo = await buildDiscordMemo({ channelId, messageId, title, labels }, settings);
 
   let triageIssue = null;
+  let triageQueued = null;
   if (createLinear) {
-    triageIssue = await createTriageIssueFromInput(
+    const delivery = await createTriageIssueWithFallback(
       {
         title: memo.title,
         rawText: memo.tldr,
@@ -2092,9 +2121,17 @@ async function cmdMemoSave(settings, flags) {
         priority: 3,
       },
       settings,
+      { context: 'memo-save' },
     );
-
-    memo.linearUrl = triageIssue && triageIssue.url ? triageIssue.url : '';
+    if (delivery.queued) {
+      triageQueued = {
+        queueId: delivery.queueId,
+        error: delivery.error,
+      };
+    } else {
+      triageIssue = delivery.issue;
+      memo.linearUrl = triageIssue && triageIssue.url ? triageIssue.url : '';
+    }
   }
 
   const saved = saveObsidianMemo(memo, settings);
@@ -2132,6 +2169,7 @@ async function cmdMemoSave(settings, flags) {
           stateName: triageIssue.stateName,
         }
       : null,
+    queued: triageQueued,
   };
 
   if (flags.json) {
@@ -2147,6 +2185,10 @@ async function cmdMemoSave(settings, flags) {
       if (triageIssue.url) {
         lines.push(`  - url: ${triageIssue.url}`);
       }
+    }
+    if (triageQueued) {
+      lines.push(`- queued: ${triageQueued.queueId}`);
+      lines.push(`- queue error: ${singleLine(triageQueued.error)}`);
     }
     process.stdout.write(`${lines.join('\n')}\n`);
   }
@@ -2287,6 +2329,81 @@ async function cmdQueueDrain(settings, flags) {
   process.stdout.write(`${lines.join('\n')}\n`);
 }
 
+async function cmdQueueStats(settings, flags) {
+  const queueState = readJsonFile(INGEST_QUEUE_PATH, { version: 1, items: [], updatedAtMs: 0 });
+  const dlqState = readJsonFile(INGEST_DLQ_PATH, { version: 1, items: [], updatedAtMs: 0 });
+  const queueItems = Array.isArray(queueState.items) ? queueState.items : [];
+  const dlqItems = Array.isArray(dlqState.items) ? dlqState.items : [];
+
+  const retryBuckets = {
+    attempts0: 0,
+    attempts1: 0,
+    attempts2: 0,
+    attempts3Plus: 0,
+  };
+
+  const queueBySource = {};
+  const dlqBySource = {};
+  const bumpSource = (target, source) => {
+    const key = String(source || 'unknown').trim().toLowerCase() || 'unknown';
+    target[key] = Number(target[key] || 0) + 1;
+  };
+
+  for (const item of queueItems) {
+    const attempts = Math.max(0, Number(item.attempts || 0));
+    if (attempts <= 0) {
+      retryBuckets.attempts0 += 1;
+    } else if (attempts === 1) {
+      retryBuckets.attempts1 += 1;
+    } else if (attempts === 2) {
+      retryBuckets.attempts2 += 1;
+    } else {
+      retryBuckets.attempts3Plus += 1;
+    }
+    bumpSource(queueBySource, item && item.payload ? item.payload.source : '');
+  }
+  for (const item of dlqItems) {
+    bumpSource(dlqBySource, item && item.payload ? item.payload.source : '');
+  }
+
+  const topN = (obj, n) =>
+    Object.entries(obj)
+      .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
+      .slice(0, n)
+      .map(([source, count]) => ({ source, count: Number(count || 0) }));
+
+  const result = {
+    ok: true,
+    queued: queueItems.length,
+    dlq: dlqItems.length,
+    queueUpdatedAtMs: Number(queueState.updatedAtMs || 0),
+    dlqUpdatedAtMs: Number(dlqState.updatedAtMs || 0),
+    retryBuckets,
+    topQueueSources: topN(queueBySource, 8),
+    topDlqSources: topN(dlqBySource, 8),
+  };
+
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+
+  const lines = [];
+  lines.push('Ingest queue stats:');
+  lines.push(`- queue: ${result.queued}`);
+  lines.push(`- dlq: ${result.dlq}`);
+  lines.push(
+    `- retries: a0=${retryBuckets.attempts0}, a1=${retryBuckets.attempts1}, a2=${retryBuckets.attempts2}, a3+=${retryBuckets.attempts3Plus}`,
+  );
+  if (result.topQueueSources.length > 0) {
+    lines.push(`- queue top sources: ${result.topQueueSources.map((item) => `${item.source}:${item.count}`).join(', ')}`);
+  }
+  if (result.topDlqSources.length > 0) {
+    lines.push(`- dlq top sources: ${result.topDlqSources.map((item) => `${item.source}:${item.count}`).join(', ')}`);
+  }
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
 async function cmdSlaCheck(settings, flags) {
   if (settings.sla.enabled === false) {
     throw new Error('sla is disabled in config.');
@@ -2360,6 +2477,7 @@ async function cmdSlaCheck(settings, flags) {
 
     let commented = false;
     let escalation = null;
+    let escalationQueueId = '';
     if (shouldComment) {
       const commentBody = renderSlaComment(issue, slaType, ageHours, thresholdHours, settings);
       await createLinearIssueComment(apiKey, issue.id, commentBody);
@@ -2375,7 +2493,7 @@ async function cmdSlaCheck(settings, flags) {
     }
 
     if (escalateEnabled && slaType === 'blocked') {
-      escalation = await createTriageIssueFromInput(
+      const escalationDelivery = await createTriageIssueWithFallback(
         {
           title: `[SLA][Blocked] ${issue.identifier} stale ${Math.floor(ageHours)}h`,
           description: [
@@ -2395,11 +2513,22 @@ async function cmdSlaCheck(settings, flags) {
           priority: 2,
         },
         settings,
+        { context: 'sla-check' },
       );
-      appendAuditEvent('sla-escalation', {
-        identifier: issue.identifier,
-        escalationIdentifier: escalation.identifier,
-      });
+      if (escalationDelivery.queued) {
+        escalationQueueId = escalationDelivery.queueId || '';
+        appendAuditEvent('sla-escalation-queued', {
+          identifier: issue.identifier,
+          queueId: escalationQueueId,
+          error: escalationDelivery.error,
+        });
+      } else {
+        escalation = escalationDelivery.issue;
+        appendAuditEvent('sla-escalation', {
+          identifier: issue.identifier,
+          escalationIdentifier: escalation.identifier,
+        });
+      }
     }
 
     record.lastSeenAtMs = nowMs;
@@ -2416,6 +2545,7 @@ async function cmdSlaCheck(settings, flags) {
       commented,
       escalationIdentifier: escalation ? escalation.identifier : '',
       escalationDeduped: Boolean(escalation && escalation.deduped),
+      escalationQueueId,
     });
   }
 
@@ -2823,20 +2953,16 @@ async function cmdIngestServer(settings, flags) {
           priority: Number(body.priority || 3),
         };
 
-        try {
-          const issue = await createTriageIssueFromInput(input, settings);
-          sendJson(res, 200, { ok: true, issue });
-        } catch (error) {
-          if (settings.intakeQueue.enabled === false) {
-            throw error;
-          }
-          const queued = enqueueIngestItem('triage', input, error, settings);
+        const delivery = await createTriageIssueWithFallback(input, settings, { context: 'ingest-server-triage' });
+        if (delivery.queued) {
           sendJson(res, 202, {
             ok: true,
             queued: true,
-            queueId: queued.id,
-            error: error instanceof Error ? error.message : String(error),
+            queueId: delivery.queueId,
+            error: delivery.error,
           });
+        } else {
+          sendJson(res, 200, { ok: true, issue: delivery.issue });
         }
         return;
       }
@@ -2852,21 +2978,17 @@ async function cmdIngestServer(settings, flags) {
 
         const body = await readJsonBody(req, maxBodyBytes);
         const input = buildDiscordTriageInput(body);
-        try {
-          const issue = await createTriageIssueFromInput(input, settings);
-          sendJson(res, 200, { ok: true, issue, source: 'discord' });
-        } catch (error) {
-          if (settings.intakeQueue.enabled === false) {
-            throw error;
-          }
-          const queued = enqueueIngestItem('triage', input, error, settings);
+        const delivery = await createTriageIssueWithFallback(input, settings, { context: 'ingest-server-discord' });
+        if (delivery.queued) {
           sendJson(res, 202, {
             ok: true,
             source: 'discord',
             queued: true,
-            queueId: queued.id,
-            error: error instanceof Error ? error.message : String(error),
+            queueId: delivery.queueId,
+            error: delivery.error,
           });
+        } else {
+          sendJson(res, 200, { ok: true, issue: delivery.issue, source: 'discord' });
         }
         return;
       }
@@ -3125,6 +3247,7 @@ async function cmdDiscordIntakeSync(settings, flags) {
       lastSeenTsMs: latestTsMs,
       inspected: ordered.length,
       created: [],
+      queued: [],
       deduped: [],
       skipped: [],
       note: 'state initialized; next run will ingest new directives only',
@@ -3140,6 +3263,7 @@ async function cmdDiscordIntakeSync(settings, flags) {
   }
 
   const created = [];
+  const queued = [];
   const deduped = [];
   const skipped = [];
   let processed = 0;
@@ -3217,9 +3341,18 @@ async function cmdDiscordIntakeSync(settings, flags) {
       'discord',
     ]);
 
-    const issue = await createTriageIssueFromInput(input, settings);
+    const delivery = await createTriageIssueWithFallback(input, settings, { context: 'discord-intake-sync' });
     state.items[sourceId] = tsMs || Date.now();
     processed += 1;
+    if (delivery.queued) {
+      queued.push({
+        messageId,
+        queueId: delivery.queueId,
+        error: delivery.error,
+      });
+      continue;
+    }
+    const issue = delivery.issue;
 
     if (issue && issue.deduped) {
       deduped.push({
@@ -3268,6 +3401,7 @@ async function cmdDiscordIntakeSync(settings, flags) {
     inspected: ordered.length,
     processed,
     created,
+    queued,
     deduped,
     skipped,
     lastSeenTsMs: state.lastSeenTsMs,
@@ -3284,6 +3418,7 @@ async function cmdDiscordIntakeSync(settings, flags) {
   lines.push(`- inspected: ${ordered.length}`);
   lines.push(`- processed directives: ${processed}`);
   lines.push(`- created Linear issues: ${created.length}`);
+  lines.push(`- queued for retry: ${queued.length}`);
   lines.push(`- deduped: ${deduped.length}`);
   lines.push(`- skipped: ${skipped.length}`);
   for (const item of created.slice(0, 8)) {
@@ -3709,6 +3844,7 @@ async function cmdTodoistSync(settings, flags) {
   const mapping = readJsonFile(TODOIST_SYNC_PATH, { version: 1, items: {} });
   const items = mapping.items || {};
   const created = [];
+  const queued = [];
   const skipped = [];
 
   for (const task of selectedTasks) {
@@ -3736,7 +3872,7 @@ async function cmdTodoistSync(settings, flags) {
       continue;
     }
 
-    const issue = await createTriageIssueFromInput(
+    const delivery = await createTriageIssueWithFallback(
       {
         title: `[Todoist] ${singleLine(String(task.content || 'Untitled task'))}`,
         description: [
@@ -3756,7 +3892,28 @@ async function cmdTodoistSync(settings, flags) {
         priority: mapTodoistPriorityToLinear(task.priority),
       },
       settings,
+      { context: 'todoist-sync' },
     );
+    if (delivery.queued) {
+      items[key] = {
+        todoistId: key,
+        content: task.content || '',
+        updatedAt: task.updated_at || '',
+        syncedAtMs: Date.now(),
+        linearIssueId: '',
+        linearIdentifier: '',
+        pendingQueueId: delivery.queueId,
+        pendingQueueError: delivery.error,
+      };
+      queued.push({
+        todoistId: key,
+        content: task.content || '',
+        queueId: delivery.queueId,
+        error: delivery.error,
+      });
+      continue;
+    }
+    const issue = delivery.issue;
 
     items[key] = {
       todoistId: key,
@@ -3766,6 +3923,8 @@ async function cmdTodoistSync(settings, flags) {
       linearIssueId: issue.id,
       linearIdentifier: issue.identifier,
       linearUrl: issue.url || '',
+      pendingQueueId: '',
+      pendingQueueError: '',
     };
     created.push({
       todoistId: key,
@@ -3783,7 +3942,7 @@ async function cmdTodoistSync(settings, flags) {
 
   if (flags.json) {
     process.stdout.write(
-      `${JSON.stringify({ ok: true, totalTasks: Array.isArray(tasks) ? tasks.length : 0, processed: selectedTasks.length, created, skipped }, null, 2)}\n`,
+      `${JSON.stringify({ ok: true, totalTasks: Array.isArray(tasks) ? tasks.length : 0, processed: selectedTasks.length, created, queued, skipped }, null, 2)}\n`,
     );
     return;
   }
@@ -3793,6 +3952,7 @@ async function cmdTodoistSync(settings, flags) {
   lines.push(`- fetched: ${Array.isArray(tasks) ? tasks.length : 0}`);
   lines.push(`- processed: ${selectedTasks.length}`);
   lines.push(`- created Linear issues: ${created.length}`);
+  lines.push(`- queued for retry: ${queued.length}`);
   lines.push(`- skipped: ${skipped.length}`);
   for (const item of created.slice(0, 10)) {
     lines.push(`- ${item.todoistId} -> ${item.linearIdentifier}`);
@@ -3978,6 +4138,7 @@ async function cmdCalendarSync(settings, flags) {
 
   const toLinear = Boolean(flags['to-linear'] || settings.calendar.syncToLinear);
   const created = [];
+  const queued = [];
   const updated = [];
   const updateErrors = [];
   if (toLinear) {
@@ -4017,7 +4178,7 @@ async function cmdCalendarSync(settings, flags) {
         }
         continue;
       }
-      const issue = await createTriageIssueFromInput(
+      const delivery = await createTriageIssueWithFallback(
         {
           title: `[Calendar] ${trimMessage(event.text, 120)}`,
           description: `Google Calendar event snapshot\nid: ${event.id}\nsource: ${tab.url}`,
@@ -4028,12 +4189,33 @@ async function cmdCalendarSync(settings, flags) {
           priority: 3,
         },
         settings,
+        { context: 'calendar-sync' },
       );
+      if (delivery.queued) {
+        items[key] = {
+          id: key,
+          text: event.text,
+          linearIssueId: '',
+          linearIdentifier: '',
+          pendingQueueId: delivery.queueId,
+          pendingQueueError: delivery.error,
+          syncedAtMs: Date.now(),
+        };
+        queued.push({
+          id: key,
+          queueId: delivery.queueId,
+          error: delivery.error,
+        });
+        continue;
+      }
+      const issue = delivery.issue;
       items[key] = {
         id: key,
         text: event.text,
         linearIssueId: issue.id,
         linearIdentifier: issue.identifier,
+        pendingQueueId: '',
+        pendingQueueError: '',
         syncedAtMs: Date.now(),
       };
       created.push({ id: key, linearIdentifier: issue.identifier });
@@ -4042,7 +4224,7 @@ async function cmdCalendarSync(settings, flags) {
   }
 
   if (flags.json) {
-    process.stdout.write(`${JSON.stringify({ ok: true, snapshot, created, updated, updateErrors }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({ ok: true, snapshot, created, queued, updated, updateErrors }, null, 2)}\n`);
     return;
   }
 
@@ -4052,6 +4234,7 @@ async function cmdCalendarSync(settings, flags) {
   lines.push(`- tab: ${tab.url}`);
   lines.push(`- events captured: ${events.length}`);
   lines.push(`- toLinear created: ${created.length}`);
+  lines.push(`- toLinear queued: ${queued.length}`);
   lines.push(`- toLinear updated: ${updated.length}`);
   lines.push(`- toLinear update errors: ${updateErrors.length}`);
   for (const item of updateErrors.slice(0, 5)) {
@@ -4177,142 +4360,206 @@ async function createTriageIssueFromInput(input, settings) {
 
   const source = String(input.source || '').trim().toLowerCase();
   const sourceIdRaw = String(input.sourceId || '').trim();
-  const sourceId = sourceIdRaw ? normalizeSourceId(sourceIdRaw) : '';
+  let sourceId = sourceIdRaw ? normalizeSourceId(sourceIdRaw) : '';
+  let sourceIdDerived = false;
+  if (!sourceId && source) {
+    sourceId = deriveAutoSourceId(input);
+    sourceIdDerived = Boolean(sourceId);
+  }
   const dedupeKey = source && sourceId ? `${source}:${sourceId}` : '';
-  if (dedupeKey) {
-    const index = readJsonFile(SOURCE_ID_INDEX_PATH, { version: 1, items: {} });
-    const existing = index.items && typeof index.items === 'object' ? index.items[dedupeKey] : null;
-    if (existing && existing.identifier) {
-      return {
-        id: existing.issueId || '',
-        identifier: String(existing.identifier),
-        title: String(existing.title || existing.identifier),
-        url: String(existing.url || ''),
-        stateName: String(existing.stateName || ''),
-        labels: [],
-        deduped: true,
-        dedupeKey,
-      };
-    }
-  }
-
   const signature = buildTriageSignatureCandidate(input, settings);
-  if (signature && signature.signature) {
-    const existingBySignature = findTriageSignatureDuplicate(signature.signature, settings);
-    if (existingBySignature && existingBySignature.identifier) {
-      return {
-        id: existingBySignature.issueId || '',
-        identifier: String(existingBySignature.identifier),
-        title: String(existingBySignature.title || existingBySignature.identifier),
-        url: String(existingBySignature.url || ''),
-        stateName: String(existingBySignature.stateName || ''),
-        labels: [],
-        deduped: true,
-        dedupeKey: `signature:${signature.signature}`,
-      };
-    }
-  }
-
-  const teamId = settings.linear.teamId || (await resolveLinearTeamId(apiKey, settings.linear.teamKey));
-  if (!teamId) {
-    throw new Error('Unable to resolve Linear team id for triage.');
-  }
-
-  const routedInput = applyTriageRouting(input, settings);
-  if (signature && signature.signature) {
-    routedInput.intakeSignature = signature.signature;
-    routedInput.intakeSignatureRepo = signature.repoHint;
-    routedInput.intakeSignatureSignal = signature.errorSignal;
-  }
-  const stateName = String(routedInput.state || 'Triage').trim();
-  const stateId = await resolveLinearStateId(apiKey, teamId, stateName);
-  if (!stateId) {
-    throw new Error(`Linear state not found: ${stateName}`);
-  }
-
-  const title = buildTriageTitle(routedInput);
-  if (!title) {
-    throw new Error('triage requires --title or --text.');
-  }
-
-  const description = buildTriageDescription(routedInput);
-  const labelIds = await resolveLinearLabelIds(
-    apiKey,
-    teamId,
-    Array.isArray(routedInput.labels) ? routedInput.labels : [],
-    true,
-  );
-  const assigneeId = routedInput.assigneeEmail
-    ? await resolveLinearUserIdByEmail(apiKey, routedInput.assigneeEmail)
-    : '';
-
-  const payload = await linearRequest(
-    apiKey,
-    `mutation CreateIssue($input: IssueCreateInput!) {
-      issueCreate(input: $input) {
-        success
-        issue {
-          id
-          identifier
-          title
-          url
-          state { id name }
-          labels { nodes { id name } }
+  return withTaskLock(
+    TRIAGE_CREATE_LOCK_PATH,
+    {
+      staleMs: 60_000,
+      waitMs: 80,
+      timeoutMs: 15_000,
+    },
+    async () => {
+      if (dedupeKey) {
+        const index = readJsonFile(SOURCE_ID_INDEX_PATH, { version: 1, items: {} });
+        const existing = index.items && typeof index.items === 'object' ? index.items[dedupeKey] : null;
+        if (existing && existing.identifier) {
+          return {
+            id: existing.issueId || '',
+            identifier: String(existing.identifier),
+            title: String(existing.title || existing.identifier),
+            url: String(existing.url || ''),
+            stateName: String(existing.stateName || ''),
+            labels: Array.isArray(existing.labels) ? existing.labels.map((item) => String(item)) : [],
+            source,
+            sourceId,
+            sourceIdDerived,
+            deduped: true,
+            dedupeKey,
+          };
         }
       }
-    }`,
-    {
-      input: {
+
+      if (signature && signature.signature) {
+        const existingBySignature = findTriageSignatureDuplicate(signature.signature, settings);
+        if (existingBySignature && existingBySignature.identifier) {
+          return {
+            id: existingBySignature.issueId || '',
+            identifier: String(existingBySignature.identifier),
+            title: String(existingBySignature.title || existingBySignature.identifier),
+            url: String(existingBySignature.url || ''),
+            stateName: String(existingBySignature.stateName || ''),
+            labels: [],
+            source,
+            sourceId,
+            sourceIdDerived,
+            deduped: true,
+            dedupeKey: `signature:${signature.signature}`,
+          };
+        }
+      }
+
+      const teamId = settings.linear.teamId || (await resolveLinearTeamId(apiKey, settings.linear.teamKey));
+      if (!teamId) {
+        throw new Error('Unable to resolve Linear team id for triage.');
+      }
+
+      const routedInput = applyTriageRouting(input, settings);
+      if (signature && signature.signature) {
+        routedInput.intakeSignature = signature.signature;
+        routedInput.intakeSignatureRepo = signature.repoHint;
+        routedInput.intakeSignatureSignal = signature.errorSignal;
+      }
+      const stateName = String(routedInput.state || 'Triage').trim();
+      const stateId = await resolveLinearStateId(apiKey, teamId, stateName);
+      if (!stateId) {
+        throw new Error(`Linear state not found: ${stateName}`);
+      }
+
+      const title = buildTriageTitle(routedInput);
+      if (!title) {
+        throw new Error('triage requires --title or --text.');
+      }
+
+      const description = buildTriageDescription(routedInput);
+      const labelIds = await resolveLinearLabelIds(
+        apiKey,
         teamId,
-        stateId,
-        title,
-        description,
-        priority: Number.isFinite(Number(routedInput.priority)) ? Number(routedInput.priority) : 3,
-        labelIds: labelIds.length > 0 ? labelIds : undefined,
-        assigneeId: assigneeId || undefined,
-        projectId: settings.linear.projectId || undefined,
-        dueDate: routedInput.dueDate || undefined,
-      },
+        Array.isArray(routedInput.labels) ? routedInput.labels : [],
+        true,
+      );
+      const assigneeId = routedInput.assigneeEmail
+        ? await resolveLinearUserIdByEmail(apiKey, routedInput.assigneeEmail)
+        : '';
+
+      const payload = await linearRequest(
+        apiKey,
+        `mutation CreateIssue($input: IssueCreateInput!) {
+          issueCreate(input: $input) {
+            success
+            issue {
+              id
+              identifier
+              title
+              url
+              state { id name }
+              labels { nodes { id name } }
+            }
+          }
+        }`,
+        {
+          input: {
+            teamId,
+            stateId,
+            title,
+            description,
+            priority: Number.isFinite(Number(routedInput.priority)) ? Number(routedInput.priority) : 3,
+            labelIds: labelIds.length > 0 ? labelIds : undefined,
+            assigneeId: assigneeId || undefined,
+            projectId: settings.linear.projectId || undefined,
+            dueDate: routedInput.dueDate || undefined,
+          },
+        },
+      );
+
+      const issue = payload && payload.issueCreate ? payload.issueCreate.issue : null;
+      if (!issue) {
+        throw new Error('Linear issueCreate returned no issue.');
+      }
+
+      if (dedupeKey) {
+        const index = readJsonFile(SOURCE_ID_INDEX_PATH, { version: 1, items: {} });
+        if (!index.items || typeof index.items !== 'object') {
+          index.items = {};
+        }
+        index.items[dedupeKey] = {
+          identifier: issue.identifier,
+          issueId: issue.id,
+          title: issue.title,
+          url: issue.url || '',
+          stateName: issue.state && issue.state.name ? String(issue.state.name) : '',
+          labels: (((issue.labels || {}).nodes || []).map((item) => item.name)).filter(Boolean),
+          source,
+          sourceId,
+          createdAtMs: Date.now(),
+        };
+        writeJsonFile(SOURCE_ID_INDEX_PATH, index);
+      }
+      if (signature && signature.signature) {
+        storeTriageSignatureMapping(signature, issue, input, settings);
+      }
+
+      return {
+        id: issue.id,
+        identifier: issue.identifier,
+        title: issue.title,
+        url: issue.url,
+        stateName: issue.state ? issue.state.name : '',
+        labels: (((issue.labels || {}).nodes || []).map((item) => item.name)).filter(Boolean),
+        assigneeId: assigneeId || '',
+        routeHits: Array.isArray(routedInput.routeHits) ? routedInput.routeHits : [],
+        source,
+        sourceId,
+        sourceIdDerived,
+        deduped: false,
+        dedupeKey: dedupeKey || (signature && signature.signature ? `signature:${signature.signature}` : ''),
+      };
     },
   );
+}
 
-  const issue = payload && payload.issueCreate ? payload.issueCreate.issue : null;
-  if (!issue) {
-    throw new Error('Linear issueCreate returned no issue.');
-  }
-
-  if (dedupeKey) {
-    const index = readJsonFile(SOURCE_ID_INDEX_PATH, { version: 1, items: {} });
-    if (!index.items || typeof index.items !== 'object') {
-      index.items = {};
-    }
-    index.items[dedupeKey] = {
-      identifier: issue.identifier,
-      issueId: issue.id,
-      title: issue.title,
-      url: issue.url || '',
-      source,
-      sourceId,
-      createdAtMs: Date.now(),
+async function createTriageIssueWithFallback(input, settings, options = {}) {
+  try {
+    const issue = await createTriageIssueFromInput(input, settings);
+    return {
+      ok: true,
+      queued: false,
+      queueId: '',
+      error: '',
+      issue,
     };
-    writeJsonFile(SOURCE_ID_INDEX_PATH, index);
+  } catch (error) {
+    if (settings.intakeQueue && settings.intakeQueue.enabled === false) {
+      throw error;
+    }
+    if (options.queueOnError === false) {
+      throw error;
+    }
+    const queued = enqueueIngestItem('triage', input, error, settings);
+    const message = error instanceof Error ? error.message : String(error);
+    appendAuditEvent('triage-create-queued-fallback', {
+      context: String(options.context || 'unknown'),
+      source: String(input && input.source ? input.source : ''),
+      sourceId: String(input && input.sourceId ? input.sourceId : ''),
+      queueId: queued.id,
+      dedupe: Boolean(queued.reused),
+      error: message,
+    });
+    return {
+      ok: true,
+      queued: true,
+      queueId: queued.id,
+      queueDeduped: Boolean(queued.reused),
+      error: message,
+      issue: null,
+    };
   }
-  if (signature && signature.signature) {
-    storeTriageSignatureMapping(signature, issue, input, settings);
-  }
-
-  return {
-    id: issue.id,
-    identifier: issue.identifier,
-    title: issue.title,
-    url: issue.url,
-    stateName: issue.state ? issue.state.name : '',
-    labels: (((issue.labels || {}).nodes || []).map((item) => item.name)).filter(Boolean),
-    assigneeId: assigneeId || '',
-    routeHits: Array.isArray(routedInput.routeHits) ? routedInput.routeHits : [],
-    deduped: false,
-    dedupeKey: dedupeKey || (signature && signature.signature ? `signature:${signature.signature}` : ''),
-  };
 }
 
 function buildTriageTitle(input) {
@@ -5698,6 +5945,31 @@ function normalizeSourceId(value) {
   return `h:${hashText(text)}`;
 }
 
+function deriveAutoSourceId(input) {
+  const source = String(input && input.source ? input.source : '')
+    .trim()
+    .toLowerCase();
+  if (!source) {
+    return '';
+  }
+  const fingerprintBase = [
+    String(input && input.title ? input.title : ''),
+    String(input && input.rawText ? input.rawText : ''),
+    String(input && input.description ? input.description : ''),
+    String(input && input.sourceUrl ? input.sourceUrl : ''),
+    String(input && input.author ? input.author : ''),
+    String(input && input.dueDate ? input.dueDate : ''),
+    String(input && input.state ? input.state : ''),
+  ]
+    .map((item) => singleLine(item).toLowerCase())
+    .join('|')
+    .trim();
+  if (!fingerprintBase) {
+    return '';
+  }
+  return normalizeSourceId(`auto:${source}:${hashText(fingerprintBase).slice(0, 24)}`);
+}
+
 function buildTriageSignatureCandidate(input, settings) {
   const config =
     settings &&
@@ -6498,11 +6770,22 @@ async function updateAutopilotCircuitState(input) {
         };
 
         try {
-          openedIssue = await createTriageIssueFromInput(issueInput, settings);
-          state.issueId = openedIssue && openedIssue.id ? String(openedIssue.id) : '';
-          state.issueIdentifier =
-            openedIssue && openedIssue.identifier ? String(openedIssue.identifier) : '';
-          state.issueUrl = openedIssue && openedIssue.url ? String(openedIssue.url) : '';
+          const delivery = await createTriageIssueWithFallback(issueInput, settings, {
+            context: 'linear-autopilot-circuit',
+          });
+          if (delivery.queued) {
+            appendAuditEvent('linear-autopilot-circuit-issue-queued', {
+              queueId: delivery.queueId,
+              reason: failure.reason,
+              consecutiveFailures: state.consecutiveFailures,
+            });
+          } else {
+            openedIssue = delivery.issue;
+            state.issueId = openedIssue && openedIssue.id ? String(openedIssue.id) : '';
+            state.issueIdentifier =
+              openedIssue && openedIssue.identifier ? String(openedIssue.identifier) : '';
+            state.issueUrl = openedIssue && openedIssue.url ? String(openedIssue.url) : '';
+          }
         } catch (error) {
           appendAuditEvent('linear-autopilot-circuit-issue-error', {
             error: error instanceof Error ? error.message : String(error),
@@ -7415,11 +7698,37 @@ async function fetchDiscordMessagesViaOpenClaw(channelId, messageId, contextLimi
 function enqueueIngestItem(kind, payload, error, settings) {
   const queue = readJsonFile(INGEST_QUEUE_PATH, { version: 1, items: [] });
   const items = Array.isArray(queue.items) ? queue.items : [];
+  const dedupeKey = buildIngestQueueDedupeKey(payload);
+  if (dedupeKey) {
+    const existing = items.find((entry) => String(entry.dedupeKey || '') === dedupeKey);
+    if (existing) {
+      existing.updatedAtMs = Date.now();
+      existing.lastError = error instanceof Error ? error.message : String(error);
+      writeJsonFile(INGEST_QUEUE_PATH, {
+        ...queue,
+        version: 1,
+        updatedAtMs: existing.updatedAtMs,
+        items,
+      });
+      appendAuditEvent('ingest-queue-dedupe-hit', {
+        queueId: existing.id,
+        kind,
+        dedupeKey,
+        source: payload && payload.source ? payload.source : '',
+        sourceId: payload && payload.sourceId ? payload.sourceId : '',
+      });
+      return {
+        ...existing,
+        reused: true,
+      };
+    }
+  }
   const nowMs = Date.now();
   const item = {
     id: crypto.randomUUID(),
     kind,
     payload,
+    dedupeKey,
     attempts: 0,
     createdAtMs: nowMs,
     updatedAtMs: nowMs,
@@ -7436,10 +7745,23 @@ function enqueueIngestItem(kind, payload, error, settings) {
     kind,
     source: payload && payload.source ? payload.source : '',
     sourceId: payload && payload.sourceId ? payload.sourceId : '',
+    dedupeKey,
     error: item.lastError,
     enabled: settings.intakeQueue.enabled !== false,
   });
   return item;
+}
+
+function buildIngestQueueDedupeKey(payload) {
+  const source = String(payload && payload.source ? payload.source : '')
+    .trim()
+    .toLowerCase();
+  const sourceIdRaw = String(payload && payload.sourceId ? payload.sourceId : '').trim();
+  const sourceId = sourceIdRaw ? normalizeSourceId(sourceIdRaw) : '';
+  if (!source || !sourceId) {
+    return '';
+  }
+  return `${source}:${sourceId}`;
 }
 
 async function processQueuedIngestItem(item, settings) {
@@ -9174,6 +9496,42 @@ function generateCode(size) {
     output += alphabet[idx];
   }
   return output;
+}
+
+async function withTaskLock(lockPath, options, fn) {
+  const staleMs = Math.max(30_000, Number(options && options.staleMs ? options.staleMs : 30 * 60 * 1000));
+  const waitMs = Math.max(25, Number(options && options.waitMs ? options.waitMs : 120));
+  const timeoutMs = Math.max(waitMs, Number(options && options.timeoutMs ? options.timeoutMs : 10_000));
+  const startedAtMs = Date.now();
+  let lock = null;
+
+  while (Date.now() - startedAtMs <= timeoutMs) {
+    lock = acquireTaskLock(lockPath, staleMs);
+    if (lock.acquired) {
+      break;
+    }
+    if (lock.reason !== 'already-running') {
+      throw new Error(lock.message || `failed to acquire lock: ${lockPath}`);
+    }
+    await delay(waitMs);
+  }
+
+  if (!lock || !lock.acquired) {
+    const detail = lock && lock.message ? ` (${lock.message})` : '';
+    throw new Error(`timed out acquiring lock: ${lockPath}${detail}`);
+  }
+
+  try {
+    return await fn();
+  } finally {
+    releaseTaskLock(lock);
+  }
+}
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, Math.max(0, Number(ms || 0)));
+  });
 }
 
 function acquireTaskLock(lockPath, staleMs) {
