@@ -1,12 +1,11 @@
-#!/usr/local/bin/node
 /**
  * CLAW-109: Baseline Token Telemetry Script
  * Generates a snapshot of token usage by agent, job, and result.
  */
 
-const fs = require('fs');
-const path = require('path');
-const { execSync } = require('child_process');
+import fs from 'fs';
+import path from 'path';
+import { execSync } from 'child_process';
 
 const WORKSPACE_ROOT = '/Users/yizhi/.openclaw/workspace/mission-control';
 const TELEMETRY_DIR = path.join(WORKSPACE_ROOT, 'data', 'telemetry');
@@ -15,7 +14,7 @@ const SNAPSHOT_PATH = path.join(TELEMETRY_DIR, `token-baseline-${new Date().toIS
 function runCommand(cmd) {
   try {
     return execSync(cmd, { encoding: 'utf8', cwd: WORKSPACE_ROOT });
-  } catch (error) {
+  } catch (_error) {
     return null;
   }
 }
@@ -30,26 +29,29 @@ async function main() {
   const sessions = (status && status.sessions && status.sessions.recent) || [];
   const agentBaseline = {};
 
-  sessions.forEach(session => {
+  sessions.forEach((session) => {
     const agentId = session.agentId || 'unknown';
     if (!agentBaseline[agentId]) {
       agentBaseline[agentId] = {
         sessionCount: 0,
         totalTokens: 0,
         avgTokens: 0,
-        models: new Set()
+        models: []
       };
     }
-    agentBaseline[agentId].sessionCount++;
-    agentBaseline[agentId].totalTokens += (session.totalTokens || 0);
-    if (session.model) agentBaseline[agentId].models.add(session.model);
+    const currentAgent = agentBaseline[agentId];
+    currentAgent.sessionCount++;
+    currentAgent.totalTokens += (session.totalTokens || 0);
+    if (session.model && !currentAgent.models.includes(session.model)) {
+      currentAgent.models.push(session.model);
+    }
   });
 
-  // Convert Set to Array for JSON
-  Object.keys(agentBaseline).forEach(agentId => {
-    agentBaseline[agentId].models = Array.from(agentBaseline[agentId].models);
-    agentBaseline[agentId].avgTokens = agentBaseline[agentId].sessionCount > 0 
-      ? Math.round(agentBaseline[agentId].totalTokens / agentBaseline[agentId].sessionCount) 
+  // Calculate averages
+  Object.keys(agentBaseline).forEach((agentId) => {
+    const currentAgent = agentBaseline[agentId];
+    currentAgent.avgTokens = currentAgent.sessionCount > 0 
+      ? Math.round(currentAgent.totalTokens / currentAgent.sessionCount) 
       : 0;
   });
 
@@ -66,9 +68,11 @@ async function main() {
     in_progress: { count: 0 }
   };
 
-  autopilotHistory.runs.forEach(run => {
+  autopilotHistory.runs.forEach((run) => {
     const category = run.status || 'unknown';
-    if (!jobStats[category]) jobStats[category] = { count: 0 };
+    if (!jobStats[category]) {
+      jobStats[category] = { count: 0 };
+    }
     jobStats[category].count++;
   });
 
@@ -87,7 +91,7 @@ async function main() {
   console.log(`[CLAW-109] Baseline snapshot saved to: ${SNAPSHOT_PATH}`);
 }
 
-main().catch(err => {
+main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
