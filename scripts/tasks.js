@@ -3463,6 +3463,10 @@ async function cmdTelemetry(settings, flags) {
   const agentBaseline = {};
   const jobTokenBaseline = {};
 
+  const hardTokenThreshold = 60000;
+  const hardTurnThreshold = 30;
+  const shardViolations = [];
+
   for (const session of sessions) {
     const agentId = session.agentId || 'unknown';
     if (!agentBaseline[agentId]) {
@@ -3476,6 +3480,7 @@ async function cmdTelemetry(settings, flags) {
     const currentAgent = agentBaseline[agentId];
     currentAgent.sessionCount += 1;
     const totalTokens = Number(session.totalTokens || 0);
+    const turnCount = Number(session.turnCount || 0);
     currentAgent.totalTokens += totalTokens;
     if (session.model && !currentAgent.models.includes(session.model)) {
       currentAgent.models.push(session.model);
@@ -3491,13 +3496,24 @@ async function cmdTelemetry(settings, flags) {
         key: session.key,
         agentId: session.agentId,
         tokens: totalTokens,
+        turns: turnCount,
       });
+
+      if (totalTokens >= hardTokenThreshold || turnCount >= hardTurnThreshold) {
+        shardViolations.push({
+          issueId,
+          sessionKey: session.key,
+          tokens: totalTokens,
+          turns: turnCount,
+        });
+      }
     }
   }
 
   for (const agentId of Object.keys(agentBaseline)) {
     const currentAgent = agentBaseline[agentId];
-    currentAgent.avgTokens = currentAgent.sessionCount > 0 ? Math.round(currentAgent.totalTokens / currentAgent.sessionCount) : 0;
+    currentAgent.avgTokens =
+      currentAgent.sessionCount > 0 ? Math.round(currentAgent.totalTokens / currentAgent.sessionCount) : 0;
   }
 
   const jobStats = { success: { count: 0 }, failure: { count: 0 }, in_progress: { count: 0 } };
@@ -3515,6 +3531,13 @@ async function cmdTelemetry(settings, flags) {
     agents: agentBaseline,
     jobs: jobStats,
     jobTokens: jobTokenBaseline,
+    sharding: {
+      thresholds: {
+        tokens: hardTokenThreshold,
+        turns: hardTurnThreshold,
+      },
+      violations: shardViolations,
+    },
     meta: {
       totalSessions: sessions.length,
       totalAutopilotRuns: autopilotHistory.runs.length,
@@ -3529,7 +3552,153 @@ async function cmdTelemetry(settings, flags) {
     process.stdout.write(`Telemetry snapshot saved to: ${snapshotPath}\n`);
     process.stdout.write(`- Total sessions: ${finalSnapshot.meta.totalSessions}\n`);
     process.stdout.write(`- Total autopilot runs: ${finalSnapshot.meta.totalAutopilotRuns}\n`);
+    process.stdout.write(`- Shard violations: ${shardViolations.length}\n`);
   }
+}
+
+// Session Sharding and Handoff Policy for CLAW-108
+// Hard thresholds: >=60k tokens or >=30 turns
+
+const SESSION_SHARDING_CONFIG = {
+  tokenThreshold: 60000, // 60k tokens
+  turnThreshold: 30, // 30 turns/messages
+  enabled: true,
+};
+
+function countSessionTurns(sessionKey, agentId, settings) {
+  const sessionPath = path.join(
+    settings.openclawHome,
+    'agents',
+    agentId,
+    'sessions',
+    `${sessionKey}.jsonl`,
+  );
+
+  if (!fs.existsSync(sessionPath)) {
+    return 0;
+  }
+
+  const content = fs.readFileSync(sessionPath, 'utf8');
+  const lines = content.split('\n').filter((line) => line.trim());
+  return lines.length;
+}
+
+function checkSessionShardingThreshold(sessionKey, agentId, settings, config = SESSION_SHARDING_CONFIG) {
+  if (!config.enabled) {
+    return {
+      shouldShard: false,
+      reason: 'sharding-disabled',
+      metrics: { tokens: 0, turns: 0 },
+    };
+  }
+
+  const sessions = loadSessions(settings);
+  const session = sessions.find((s) => s.key === sessionKey && s.agentId === agentId);
+
+  if (!session) {
+    return {
+      shouldShard: false,
+      reason: 'session-not-found',
+      metrics: { tokens: 0, turns: 0 },
+    };
+  }
+
+  const tokens = session.totalTokens || 0;
+  const turns = countSessionTurns(sessionKey, agentId, settings);
+
+  const shouldShard = tokens >= config.tokenThreshold || turns >= config.turnThreshold;
+  const reason = shouldShard
+    ? tokens >= config.tokenThreshold
+      ? `token-threshold-exceeded (${tokens}/${config.tokenThreshold})`
+      : `turn-threshold-exceeded (${turns}/${config.turnThreshold})`
+    : 'within-thresholds';
+
+  return {
+    shouldShard,
+    reason,
+    metrics: { tokens, turns },
+    thresholds: {
+      tokenThreshold: config.tokenThreshold,
+      turnThreshold: config.turnThreshold,
+    },
+  };
+}
+
+function createHandoffPackage(issueIdentifier, sessionKey, agentId, settings) {
+  const sessions = loadSessions(settings);
+  const session = sessions.find((s) => s.key === sessionKey && s.agentId === agentId);
+
+  const issueLinks = readJsonFile(ISSUE_LINKS_PATH, { bySessionId: {}, bySessionKey: {} });
+  const autopilotHistory = readJsonFile(LINEAR_AUTOPILOT_PATH, { runs: [] });
+
+  const relatedRuns = autopilotHistory.runs.filter(
+    (run) => run.issueIdentifier === issueIdentifier,
+  );
+
+  const handoffPackage = {
+    issueIdentifier,
+    sourceSession: {
+      sessionKey,
+      agentId,
+      totalTokens: session ? session.totalTokens : 0,
+      contextTokens: session ? session.contextTokens : 0,
+      model: session ? session.model : '',
+      updatedAt: session ? session.updatedAt : 0,
+    },
+    metrics: {
+      tokens: session ? session.totalTokens : 0,
+      turns: session ? countSessionTurns(sessionKey, agentId, settings) : 0,
+    },
+    recentRuns: relatedRuns.slice(0, 10).map((run) => ({
+      runId: run.runId,
+      status: run.status,
+      summary: run.error || 'completed',
+      atMs: run.atMs,
+    })),
+    context: {
+      repositoryRoot: ROOT_DIR,
+      sopPath: 'docs/sop/linear-codex-dev-sop.md',
+    },
+    handoffReason: 'session-sharding-threshold-exceeded',
+    timestamp: new Date().toISOString(),
+  };
+
+  const handoffDir = path.join(DATA_DIR, 'handoffs');
+  if (!fs.existsSync(handoffDir)) {
+    fs.mkdirSync(handoffDir, { recursive: true });
+  }
+
+  const handoffFile = path.join(
+    handoffDir,
+    `${issueIdentifier}-${Date.now()}-handoff.json`,
+  );
+  fs.writeFileSync(handoffFile, JSON.stringify(handoffPackage, null, 2));
+
+  return {
+    package: handoffPackage,
+    filePath: handoffFile,
+  };
+}
+
+function enforceSessionHandoff(issueIdentifier, sessionKey, agentId, settings, checkResult) {
+  const handoff = createHandoffPackage(issueIdentifier, sessionKey, agentId, settings);
+
+  const handoffSummary = [
+    `Session handoff enforced for ${issueIdentifier}`,
+    `Reason: ${checkResult.reason}`,
+    `Metrics: ${checkResult.metrics.tokens} tokens, ${checkResult.metrics.turns} turns`,
+    `Thresholds: ${checkResult.thresholds.tokenThreshold} tokens, ${checkResult.thresholds.turnThreshold} turns`,
+    `Handoff package saved to: ${handoff.filePath}`,
+    `Source session: ${agentId}/${sessionKey}`,
+  ].join('\n');
+
+  return {
+    enforced: true,
+    summary: handoffSummary,
+    handoffPackage: handoff.package,
+    handoffFilePath: handoff.filePath,
+    newSessionRequired: true,
+  };
 }
 
 async function cmdSlaCheck(settings, flags) {
@@ -4977,6 +5146,31 @@ async function cmdLinearAutopilot(settings, flags) {
         });
       }
       trace('openclaw agent: done');
+
+      // CLAW-108: Check session sharding thresholds after agent execution
+      const shardingCheck = checkSessionShardingThreshold(agentSessionKey, agentUsed, settings);
+      trace(`session sharding check: ${shardingCheck.reason}`);
+
+      if (shardingCheck.shouldShard) {
+        const handoff = enforceSessionHandoff(
+          candidate.identifier,
+          agentSessionKey,
+          agentUsed,
+          settings,
+          shardingCheck,
+        );
+        trace('session handoff enforced');
+        appendAuditEvent('session-handoff-enforced', {
+          issueIdentifier: candidate.identifier,
+          sessionKey: agentSessionKey,
+          agentId: agentUsed,
+          reason: shardingCheck.reason,
+          metrics: shardingCheck.metrics,
+          handoffFilePath: handoff.handoffFilePath,
+        });
+        // Include handoff info in agentText for downstream processing
+        agentText = `${agentText}\n\n[Session Handoff Enforced]\n${handoff.summary}`;
+      }
     }
   } finally {
     releaseTaskLock(lock);

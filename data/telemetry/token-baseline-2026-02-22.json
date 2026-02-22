@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-02-22T21:10:59.454Z",
+  "timestamp": "2026-02-22T21:18:32.718Z",
   "scope": "baseline-control-group",
   "agents": {
     "coder": {
@@ -13,18 +13,18 @@
     },
     "codex": {
       "sessionCount": 2,
-      "totalTokens": 33819,
-      "avgTokens": 16910,
+      "totalTokens": 34458,
+      "avgTokens": 17229,
       "models": [
         "gpt-5.3-codex"
       ]
     },
     "gemini": {
       "sessionCount": 2,
-      "totalTokens": 170307,
-      "avgTokens": 85154,
+      "totalTokens": 75693,
+      "avgTokens": 37847,
       "models": [
-        "coder-model",
+        "gemini-3-flash-preview",
         "gemini-3-pro-preview"
       ]
     },
@@ -66,8 +66,8 @@
     },
     "researcher-deep": {
       "sessionCount": 2,
-      "totalTokens": 75200,
-      "avgTokens": 37600,
+      "totalTokens": 75798,
+      "avgTokens": 37899,
       "models": [
         "gpt-5.3-codex",
         "gpt-5.2"
@@ -131,8 +131,8 @@
     },
     "writer": {
       "sessionCount": 2,
-      "totalTokens": 44983,
-      "avgTokens": 22492,
+      "totalTokens": 45611,
+      "avgTokens": 22806,
       "models": [
         "gpt-5.2",
         "gpt-5.3-codex"
@@ -158,32 +158,25 @@
   },
   "jobTokens": {
     "CLAW-108": {
-      "totalTokens": 190485,
+      "totalTokens": 138429,
       "sessions": [
         {
           "key": "agent:coder:main",
           "agentId": "coder",
-          "tokens": 37200
+          "tokens": 37200,
+          "turns": 0
         },
         {
-          "key": "agent:codex:main",
-          "agentId": "codex",
-          "tokens": 33819
+          "key": "agent:gemini:main",
+          "agentId": "gemini",
+          "tokens": 41899,
+          "turns": 0
         },
         {
           "key": "agent:main-autopilot:main",
           "agentId": "main-autopilot",
-          "tokens": 59330
-        },
-        {
-          "key": "agent:researcher-deep:main",
-          "agentId": "researcher-deep",
-          "tokens": 28510
-        },
-        {
-          "key": "agent:writer:main",
-          "agentId": "writer",
-          "tokens": 31626
+          "tokens": 59330,
+          "turns": 0
         }
       ]
     },
@@ -193,32 +186,49 @@
         {
           "key": "agent:coder:discord:channel:1473594263202959543",
           "agentId": "coder",
-          "tokens": 0
+          "tokens": 0,
+          "turns": 0
         },
         {
           "key": "agent:openclaw-dev:main",
           "agentId": "openclaw-dev",
-          "tokens": 18930
+          "tokens": 18930,
+          "turns": 0
         },
         {
           "key": "agent:researcher:discord:channel:1473662489077088277",
           "agentId": "researcher",
-          "tokens": 46567
+          "tokens": 46567,
+          "turns": 0
         },
         {
           "key": "agent:researcher:main",
           "agentId": "researcher",
-          "tokens": 24670
+          "tokens": 24670,
+          "turns": 0
         }
       ]
     },
-    "CLAW-165": {
-      "totalTokens": 136513,
+    "CLAW-109": {
+      "totalTokens": 95820,
       "sessions": [
         {
-          "key": "agent:gemini:main",
-          "agentId": "gemini",
-          "tokens": 136513
+          "key": "agent:codex:main",
+          "agentId": "codex",
+          "tokens": 34458,
+          "turns": 0
+        },
+        {
+          "key": "agent:researcher-deep:main",
+          "agentId": "researcher-deep",
+          "tokens": 29108,
+          "turns": 0
+        },
+        {
+          "key": "agent:writer:main",
+          "agentId": "writer",
+          "tokens": 32254,
+          "turns": 0
         }
       ]
     },
@@ -228,10 +238,18 @@
         {
           "key": "agent:main:main",
           "agentId": "main",
-          "tokens": 45322
+          "tokens": 45322,
+          "turns": 0
         }
       ]
     }
+  },
+  "sharding": {
+    "thresholds": {
+      "tokens": 60000,
+      "turns": 30
+    },
+    "violations": []
   },
   "meta": {
     "totalSessions": 44,
