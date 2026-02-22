@@ -30,7 +30,8 @@
     "tasks:runbook-exec": "node ./scripts/tasks.js runbook-exec",
     "tasks:trigger": "node ./scripts/tasks.js trigger",
     "tasks:autopr": "node ./scripts/tasks.js autopr",
-    "tasks:eval-replay": "node ./scripts/tasks.js eval-replay"
+    "tasks:eval-replay": "node ./scripts/tasks.js eval-replay",
+    "tasks:telemetry": "node ./scripts/tasks.js telemetry"
   },
   "dependencies": {
     "next": "16.1.6",

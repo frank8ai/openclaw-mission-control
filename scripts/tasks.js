@@ -33,6 +33,7 @@ const WEBHOOK_REPLAY_INDEX_PATH = path.join(DATA_DIR, 'webhook-replay-index.json
 const AUDIT_LOG_PATH = path.join(DATA_DIR, 'audit.jsonl');
 const APPROVALS_PATH = path.join(DATA_DIR, 'approvals.json');
 const ROLLBACK_JOURNAL_PATH = path.join(DATA_DIR, 'rollback-journal.json');
+const TELEMETRY_DIR = path.join(ROOT_DIR, 'data', 'telemetry');
 const SLA_STATE_PATH = path.join(DATA_DIR, 'sla-check.json');
 const EXECUTOR_STABILITY_PATH = path.join(DATA_DIR, 'executor-stability.json');
 const BINDING_COVERAGE_PATH = path.join(DATA_DIR, 'binding-coverage.json');
@@ -365,6 +366,7 @@ Read commands:
   audit-rollback --audit-id ID Roll back auditable local writes by audit id
   eval-replay [--json]         Build replay artifact for evaluation/distillation workflow
   distill-export [--json]      Export local training dataset from replay + OpenClaw/Codex session logs + audit
+  telemetry [--json]           Build baseline token telemetry by agent/job
 
 Integrations:
   triage --title ...           Create a Triage issue quickly (supports --source/--source-id/--labels)
@@ -520,6 +522,10 @@ async function main() {
       case 'dataset-export':
       case 'distill-dataset':
         await cmdDistillExport(settings, flags);
+        return;
+      case 'telemetry':
+      case 'token-stats':
+        await cmdTelemetry(settings, flags);
         return;
       case 'runbook-exec':
       case 'runbook':
@@ -3439,6 +3445,91 @@ async function cmdQueueStats(settings, flags) {
     lines.push(`- dlq top sources: ${result.topDlqSources.map((item) => `${item.source}:${item.count}`).join(', ')}`);
   }
   process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+async function cmdTelemetry(settings, flags) {
+  const now = new Date();
+  const dateStr = now.toISOString().split('T')[0];
+  const snapshotPath = path.join(TELEMETRY_DIR, `token-baseline-${dateStr}.json`);
+
+  if (!fs.existsSync(TELEMETRY_DIR)) {
+    fs.mkdirSync(TELEMETRY_DIR, { recursive: true });
+  }
+
+  const sessions = loadSessions(settings);
+  const issueLinks = readJsonFile(ISSUE_LINKS_PATH, { bySessionId: {}, bySessionKey: {} });
+  const autopilotHistory = readJsonFile(LINEAR_AUTOPILOT_PATH, { runs: [] });
+
+  const agentBaseline = {};
+  const jobTokenBaseline = {};
+
+  for (const session of sessions) {
+    const agentId = session.agentId || 'unknown';
+    if (!agentBaseline[agentId]) {
+      agentBaseline[agentId] = {
+        sessionCount: 0,
+        totalTokens: 0,
+        avgTokens: 0,
+        models: [],
+      };
+    }
+    const currentAgent = agentBaseline[agentId];
+    currentAgent.sessionCount += 1;
+    const totalTokens = Number(session.totalTokens || 0);
+    currentAgent.totalTokens += totalTokens;
+    if (session.model && !currentAgent.models.includes(session.model)) {
+      currentAgent.models.push(session.model);
+    }
+
+    const issueId = issueLinks.bySessionId[session.sessionId] || issueLinks.bySessionKey[session.key];
+    if (issueId) {
+      if (!jobTokenBaseline[issueId]) {
+        jobTokenBaseline[issueId] = { totalTokens: 0, sessions: [] };
+      }
+      jobTokenBaseline[issueId].totalTokens += totalTokens;
+      jobTokenBaseline[issueId].sessions.push({
+        key: session.key,
+        agentId: session.agentId,
+        tokens: totalTokens,
+      });
+    }
+  }
+
+  for (const agentId of Object.keys(agentBaseline)) {
+    const currentAgent = agentBaseline[agentId];
+    currentAgent.avgTokens = currentAgent.sessionCount > 0 ? Math.round(currentAgent.totalTokens / currentAgent.sessionCount) : 0;
+  }
+
+  const jobStats = { success: { count: 0 }, failure: { count: 0 }, in_progress: { count: 0 } };
+  for (const run of autopilotHistory.runs) {
+    const category = run.status || 'unknown';
+    if (!jobStats[category]) {
+      jobStats[category] = { count: 0 };
+    }
+    jobStats[category].count += 1;
+  }
+
+  const finalSnapshot = {
+    timestamp: now.toISOString(),
+    scope: 'baseline-control-group',
+    agents: agentBaseline,
+    jobs: jobStats,
+    jobTokens: jobTokenBaseline,
+    meta: {
+      totalSessions: sessions.length,
+      totalAutopilotRuns: autopilotHistory.runs.length,
+    },
+  };
+
+  fs.writeFileSync(snapshotPath, JSON.stringify(finalSnapshot, null, 2));
+
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(finalSnapshot, null, 2)}\n`);
+  } else {
+    process.stdout.write(`Telemetry snapshot saved to: ${snapshotPath}\n`);
+    process.stdout.write(`- Total sessions: ${finalSnapshot.meta.totalSessions}\n`);
+    process.stdout.write(`- Total autopilot runs: ${finalSnapshot.meta.totalAutopilotRuns}\n`);
+  }
 }
 
 async function cmdSlaCheck(settings, flags) {
