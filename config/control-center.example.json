@@ -260,7 +260,7 @@
   },
   "execution": {
     "enabled": true,
-    "pollMinutes": 5,
+    "pollMinutes": 15,
     "loopCommand": "linear-engine",
     "engineAutoPick": true,
     "engineMaxSteps": 3,
@@ -296,6 +296,14 @@
     "issueCooldownMinutes": 30,
     "maxConsecutiveSameIssue": 2,
     "preferNewTriage": true,
+    "noProgressEscalation": {
+      "enabled": true,
+      "thresholdRuns": 3,
+      "cooldownMinutes": 180,
+      "autoBlock": true,
+      "notifyReportTarget": true,
+      "commentOnIssue": true
+    },
     "backoffByFailureClass": {
       "timeout": 1.2,
       "rate_limit": 1.6,

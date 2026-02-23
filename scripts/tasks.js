@@ -44,6 +44,7 @@ const LINEAR_AUTOPILOT_PATH = path.join(DATA_DIR, 'linear-autopilot.json');
 const LINEAR_AUTOPILOT_LOCK_PATH = path.join(DATA_DIR, 'linear-autopilot.lock.json');
 const LINEAR_AUTOPILOT_CIRCUIT_PATH = path.join(DATA_DIR, 'linear-autopilot-circuit.json');
 const LINEAR_AUTOPILOT_AGENT_CURSOR_PATH = path.join(DATA_DIR, 'linear-autopilot-agent-cursor.json');
+const LINEAR_ENGINE_NO_PROGRESS_PATH = path.join(DATA_DIR, 'linear-engine-no-progress.json');
 let OPENCLAW_AGENT_IDS_CACHE = {
   loadedAtMs: 0,
   ids: null,
@@ -98,6 +99,11 @@ const DEFAULTS = {
       'linear-autopilot',
       'linear-engine',
     ],
+  },
+  modelRouting: {
+    medium: 'minimax-m2.5',
+    xHigh: 'gpt-5.3-codex-x-high',
+    escalationLabels: ['blocked', 'fix-complexity'],
   },
   linear: {
     enabled: true,
@@ -324,6 +330,14 @@ const DEFAULTS = {
     issueCooldownMinutes: 30,
     maxConsecutiveSameIssue: 2,
     preferNewTriage: true,
+    noProgressEscalation: {
+      enabled: true,
+      thresholdRuns: 3,
+      cooldownMinutes: 180,
+      autoBlock: true,
+      notifyReportTarget: true,
+      commentOnIssue: true,
+    },
     circuitBreaker: {
       enabled: true,
       failureThreshold: 2,
@@ -379,7 +393,7 @@ Integrations:
   calendar-sync                Sync Google Calendar events snapshot (browser logged-in tab)
   discord-intake-sync          Auto ingest main Discord directives into Linear Triage
   linear-autopilot             Pick one runnable Linear issue and execute one next step via configured execution agent
-  linear-engine                Multi-step execution engine (specific issue or auto-pick runnable issue)
+  linear-engine                Multi-step execution engine (specific issue or auto-pick runnable issue; supports --drain)
 
 Write commands (require one-time confirmation):
   confirm                      Generate one-time confirmation code
@@ -393,7 +407,7 @@ Write commands (require one-time confirmation):
   runbook-exec --card CARD [--issue CLAW-123] [--cron-id ID] --confirm CODE [--execute]
 
 Scheduling:
-  schedule [--apply] [--mode full|minimal] [--execution-loop autopilot|engine] [--engine-max-steps N] [--agent AGENT|auto] [--channel CH] [--target TGT]
+  schedule [--apply] [--mode full|minimal] [--execution-loop autopilot|engine] [--engine-max-steps N] [--engine-drain true|false] [--engine-drain-max-issues N] [--agent AGENT|auto] [--channel CH] [--target TGT]
     Prepare (or install) crontab block:
     - mode=full: report + watchdog + workspace-guard + sync/governance + queue drain + execution loop + reminders/briefing
     - mode=minimal: discord-intake-sync + queue-drain + workspace-guard + execution loop (autopilot by default)
@@ -407,7 +421,8 @@ Examples:
   npm run tasks -- linear-autopilot --json
   npm run tasks -- linear-autopilot --issue CLAW-128 --json
   npm run tasks -- linear-autopilot --issue CLAW-128 --agent auto --json
-  npm run tasks -- linear-engine --max-steps 3 --agent auto --json
+  npm run tasks -- linear-engine --max-steps 5 --agent auto --json
+  npm run tasks -- linear-engine --drain --drain-max-issues 8 --max-steps 5 --auto-pick --json
   npm run tasks -- linear-engine --issue CLAW-128 --max-steps 5 --json
   npm run tasks -- distill-export --agent codex --json
   npm run tasks -- briefing daily --send
@@ -2533,7 +2548,7 @@ async function cmdSchedule(settings, flags) {
     process.stdout.write(
       [
         'Usage:',
-        '  schedule [--apply] [--mode full|minimal] [--execution-loop autopilot|engine] [--engine-max-steps N] [--agent AGENT|auto] [--channel CH] [--target TGT]',
+        '  schedule [--apply] [--mode full|minimal] [--execution-loop autopilot|engine] [--engine-max-steps N] [--engine-drain true|false] [--engine-drain-max-issues N] [--agent AGENT|auto] [--channel CH] [--target TGT]',
         '',
         'Behavior:',
         '  - Without --apply: print proposed crontab block only.',
@@ -2679,9 +2694,24 @@ async function cmdSchedule(settings, flags) {
       flags['engine-auto-pick'] !== undefined
         ? isTruthyLike(flags['engine-auto-pick'])
         : Boolean(settings.execution && settings.execution.engineAutoPick !== false);
+    const engineDrain =
+      flags['engine-drain'] !== undefined
+        ? isTruthyLike(flags['engine-drain'])
+        : Boolean(settings.execution && settings.execution.engineDrain === true);
+    const engineDrainMaxIssues = Math.max(
+      1,
+      Number(
+        flags['engine-drain-max-issues'] ||
+          (settings.execution && settings.execution.engineDrainMaxIssues) ||
+          8,
+      ),
+    );
 
     linearExecutionParts.push('--max-steps', String(engineMaxSteps));
     linearExecutionParts.push('--no-progress-threshold', String(engineNoProgressThreshold));
+    if (engineDrain) {
+      linearExecutionParts.push('--drain', '--drain-max-issues', String(engineDrainMaxIssues));
+    }
     if (engineStepSleepMs > 0) {
       linearExecutionParts.push('--step-sleep-ms', String(engineStepSleepMs));
     }
@@ -2692,6 +2722,10 @@ async function cmdSchedule(settings, flags) {
   const executionAgentOverride = String(flags.agent || '').trim();
   if (executionAgentOverride) {
     linearExecutionParts.push('--agent', executionAgentOverride);
+  }
+  const executionTierOverride = String(flags.tier || '').trim();
+  if (executionTierOverride) {
+    linearExecutionParts.push('--tier', executionTierOverride);
   }
   const remindDueParts = [nodeBin, scriptPath, 'remind', 'due'];
   const remindCycleParts = [nodeBin, scriptPath, 'remind', 'cycle'];
@@ -3583,8 +3617,9 @@ function countSessionTurns(sessionKey, agentId, settings) {
   return lines.length;
 }
 
-function checkSessionShardingThreshold(sessionKey, agentId, settings, config = SESSION_SHARDING_CONFIG) {
-  if (!config.enabled) {
+function checkSessionShardingThreshold(sessionKey, agentId, settings, config) {
+  const shardingConfig = config && typeof config === 'object' ? config : SESSION_SHARDING_CONFIG;
+  if (!shardingConfig.enabled) {
     return {
       shouldShard: false,
       reason: 'sharding-disabled',
@@ -3606,11 +3641,11 @@ function checkSessionShardingThreshold(sessionKey, agentId, settings, config = S
   const tokens = session.totalTokens || 0;
   const turns = countSessionTurns(sessionKey, agentId, settings);
 
-  const shouldShard = tokens >= config.tokenThreshold || turns >= config.turnThreshold;
+  const shouldShard = tokens >= shardingConfig.tokenThreshold || turns >= shardingConfig.turnThreshold;
   const reason = shouldShard
-    ? tokens >= config.tokenThreshold
-      ? `token-threshold-exceeded (${tokens}/${config.tokenThreshold})`
-      : `turn-threshold-exceeded (${turns}/${config.turnThreshold})`
+    ? tokens >= shardingConfig.tokenThreshold
+      ? `token-threshold-exceeded (${tokens}/${shardingConfig.tokenThreshold})`
+      : `turn-threshold-exceeded (${turns}/${shardingConfig.turnThreshold})`
     : 'within-thresholds';
 
   return {
@@ -3618,13 +3653,13 @@ function checkSessionShardingThreshold(sessionKey, agentId, settings, config = S
     reason,
     metrics: { tokens, turns },
     thresholds: {
-      tokenThreshold: config.tokenThreshold,
-      turnThreshold: config.turnThreshold,
+      tokenThreshold: shardingConfig.tokenThreshold,
+      turnThreshold: shardingConfig.turnThreshold,
     },
   };
 }
 
-function createHandoffPackage(issueIdentifier, sessionKey, agentId, settings) {
+function createHandoffPackage(issueIdentifier, sessionKey, agentId, settings, lastAgentText = '') {
   const sessions = loadSessions(settings);
   const session = sessions.find((s) => s.key === sessionKey && s.agentId === agentId);
 
@@ -3634,6 +3669,27 @@ function createHandoffPackage(issueIdentifier, sessionKey, agentId, settings) {
   const relatedRuns = autopilotHistory.runs.filter(
     (run) => run.issueIdentifier === issueIdentifier,
   );
+
+  // Load recent messages for context
+  let recentTurns = [];
+  const sessionPath = path.join(
+    settings.openclawHome,
+    'agents',
+    agentId,
+    'sessions',
+    `${sessionKey}.jsonl`,
+  );
+  if (fs.existsSync(sessionPath)) {
+    try {
+      const content = fs.readFileSync(sessionPath, 'utf8');
+      const lines = content.split('\n').filter((line) => line.trim());
+      recentTurns = lines.slice(-10).map(line => {
+        try { return JSON.parse(line); } catch { return { raw: line }; }
+      });
+    } catch (err) {
+      recentTurns = [{ error: `failed to read session turns: ${err.message}` }];
+    }
+  }
 
   const handoffPackage = {
     issueIdentifier,
@@ -3655,6 +3711,13 @@ function createHandoffPackage(issueIdentifier, sessionKey, agentId, settings) {
       summary: run.error || 'completed',
       atMs: run.atMs,
     })),
+    recentTurns,
+    decisionCard: {
+      summary: lastAgentText || (relatedRuns.length > 0 ? relatedRuns[0].error : 'No summary available'),
+      keyDecisions: [], // Placeholder for future automated extraction
+      remainingBlockers: [],
+      nextRecommendedSteps: [],
+    },
     context: {
       repositoryRoot: ROOT_DIR,
       sopPath: 'docs/sop/linear-codex-dev-sop.md',
@@ -3680,8 +3743,8 @@ function createHandoffPackage(issueIdentifier, sessionKey, agentId, settings) {
   };
 }
 
-function enforceSessionHandoff(issueIdentifier, sessionKey, agentId, settings, checkResult) {
-  const handoff = createHandoffPackage(issueIdentifier, sessionKey, agentId, settings);
+function enforceSessionHandoff(issueIdentifier, sessionKey, agentId, settings, checkResult, lastAgentText = '') {
+  const handoff = createHandoffPackage(issueIdentifier, sessionKey, agentId, settings, lastAgentText);
 
   const handoffSummary = [
     `Session handoff enforced for ${issueIdentifier}`,
@@ -5007,6 +5070,13 @@ async function cmdLinearAutopilot(settings, flags) {
   const requestedAgentId = String(
     flags.agent || (settings.execution && settings.execution.agentId) || 'main',
   ).trim();
+
+  // CLAW-111: Model tier routing based on issue labels
+  const modelRouting = settings.execution && settings.execution.modelRouting ? settings.execution.modelRouting : DEFAULTS.modelRouting;
+  const issueLabels = (((candidate || {}).labels || {}).nodes || []).map(l => String(l && l.name ? l.name : '').toLowerCase());
+  const needsEscalation = modelRouting.escalationLabels.some(l => issueLabels.includes(l.toLowerCase()));
+  const targetTier = String(flags.tier || (needsEscalation ? 'x-high' : 'medium')).toLowerCase();
+
   let agentId = requestedAgentId;
   let agentSelection = {
     mode: 'fixed',
@@ -5015,8 +5085,26 @@ async function cmdLinearAutopilot(settings, flags) {
     candidates: [requestedAgentId || 'main'],
   };
   if (isAutoAgentSelector(requestedAgentId)) {
-    const dynamicCandidates = resolveAutopilotDynamicAgentCandidates(settings, flags);
-    const selected = pickRoundRobinAutopilotAgent(dynamicCandidates);
+    trace(`model routing: target tier=${targetTier} (escalation=${needsEscalation})`);
+    const dynamicCandidates = resolveAutopilotDynamicAgentCandidates(settings, flags, { tier: targetTier });
+    
+    // CLAW-108: Check if current issue has an active binding that should be avoided due to sharding
+    const bindings = readJsonFile(ISSUE_LINKS_PATH, { byIssue: {} });
+    const issueBinding = bindings.byIssue && bindings.byIssue[candidate.identifier] ? bindings.byIssue[candidate.identifier] : null;
+    let filteredCandidates = dynamicCandidates;
+    
+    if (issueBinding && Array.isArray(issueBinding.sessionKeys) && issueBinding.sessionKeys.length > 0) {
+      const activeSessionKey = issueBinding.sessionKeys[issueBinding.sessionKeys.length - 1];
+      const activeAgentId = String(activeSessionKey.split(':')[1] || '').trim().toLowerCase();
+      
+      const shardingCheck = checkSessionShardingThreshold(activeSessionKey, activeAgentId, settings, circuitSettings.sharding);
+      if (shardingCheck.shouldShard && dynamicCandidates.length > 1) {
+        filteredCandidates = dynamicCandidates.filter(c => c.toLowerCase() !== activeAgentId);
+        trace(`sharding: avoid agent ${activeAgentId} due to threshold breach, pool size ${dynamicCandidates.length} -> ${filteredCandidates.length}`);
+      }
+    }
+
+    const selected = pickRoundRobinAutopilotAgent(filteredCandidates.length > 0 ? filteredCandidates : dynamicCandidates);
     if (!selected) {
       const skipped = {
         ok: true,
@@ -5068,8 +5156,25 @@ async function cmdLinearAutopilot(settings, flags) {
       ? isTruthyLike(flags.strict)
       : Boolean(settings.execution && settings.execution.failOnError === true);
   trace(`candidate selected: ${candidate.identifier}`);
+
+  // CLAW-108: Check for handoff package from previous threshold breach
+  let handoffPackage = null;
+  const handoffDir = path.join(DATA_DIR, 'handoffs');
+  if (fs.existsSync(handoffDir)) {
+    const handoffFiles = fs.readdirSync(handoffDir)
+      .filter(f => f.startsWith(`${candidate.identifier}-`) && f.endsWith('-handoff.json'))
+      .sort((a, b) => b.localeCompare(a)); // Get latest
+    if (handoffFiles.length > 0) {
+      const latestHandoff = readJsonFile(path.join(handoffDir, handoffFiles[0]), null);
+      if (latestHandoff && latestHandoff.issueIdentifier === candidate.identifier) {
+        handoffPackage = latestHandoff;
+      }
+    }
+  }
+
   const prompt = buildLinearAutopilotPrompt(candidate, maxPromptChars, {
     workdir: ROOT_DIR,
+    handoff: handoffPackage,
   });
   trace('build prompt: done');
 
@@ -5148,7 +5253,7 @@ async function cmdLinearAutopilot(settings, flags) {
       trace('openclaw agent: done');
 
       // CLAW-108: Check session sharding thresholds after agent execution
-      const shardingCheck = checkSessionShardingThreshold(agentSessionKey, agentUsed, settings);
+      const shardingCheck = checkSessionShardingThreshold(agentSessionKey, agentUsed, settings, circuitSettings.sharding);
       trace(`session sharding check: ${shardingCheck.reason}`);
 
       if (shardingCheck.shouldShard) {
@@ -5158,6 +5263,7 @@ async function cmdLinearAutopilot(settings, flags) {
           agentUsed,
           settings,
           shardingCheck,
+          agentText,
         );
         trace('session handoff enforced');
         appendAuditEvent('session-handoff-enforced', {
@@ -5200,6 +5306,7 @@ async function cmdLinearAutopilot(settings, flags) {
       parsed,
       agentText,
       agentError,
+      modelTier: targetTier,
       runId,
       transition,
       settings,
@@ -5348,6 +5455,15 @@ async function cmdLinearAutopilot(settings, flags) {
 }
 
 async function cmdLinearEngine(settings, flags) {
+  const drainMode =
+    flags.drain !== undefined
+      ? isTruthyLike(flags.drain)
+      : Boolean(settings.execution && settings.execution.engineDrain === true);
+  if (drainMode) {
+    await cmdLinearEngineDrain(settings, flags);
+    return;
+  }
+
   const requestedIssueIdentifier = normalizeLinearIssueId(
     flags.issue || flags['issue-id'] || flags.identifier || '',
   );
@@ -5559,6 +5675,551 @@ async function cmdLinearEngine(settings, flags) {
 
   if (strictFailure && hasError) {
     throw new Error(`linear-engine failed: ${finalRun ? finalRun.error : 'unknown error'}`);
+  }
+}
+
+function resolveLinearEngineNoProgressEscalationSettings(settings, flags) {
+  const base =
+    settings &&
+    settings.execution &&
+    settings.execution.noProgressEscalation &&
+    typeof settings.execution.noProgressEscalation === 'object'
+      ? settings.execution.noProgressEscalation
+      : {};
+
+  return {
+    enabled:
+      flags['no-progress-escalation-enabled'] !== undefined
+        ? isTruthyLike(flags['no-progress-escalation-enabled'])
+        : base.enabled !== false,
+    thresholdRuns: Math.max(
+      2,
+      Number(
+        flags['no-progress-escalation-threshold'] || base.thresholdRuns || 3,
+      ),
+    ),
+    cooldownMinutes: Math.max(
+      5,
+      Number(
+        flags['no-progress-escalation-cooldown-minutes'] || base.cooldownMinutes || 180,
+      ),
+    ),
+    autoBlock:
+      flags['no-progress-auto-block'] !== undefined
+        ? isTruthyLike(flags['no-progress-auto-block'])
+        : base.autoBlock !== false,
+    notifyReportTarget:
+      flags['no-progress-notify-report-target'] !== undefined
+        ? isTruthyLike(flags['no-progress-notify-report-target'])
+        : base.notifyReportTarget !== false,
+    commentOnIssue:
+      flags['no-progress-comment-on-issue'] !== undefined
+        ? isTruthyLike(flags['no-progress-comment-on-issue'])
+        : base.commentOnIssue !== false,
+  };
+}
+
+function readLinearEngineNoProgressState() {
+  const raw = readJsonFile(LINEAR_ENGINE_NO_PROGRESS_PATH, {
+    version: 1,
+    updatedAtMs: 0,
+    byIssue: {},
+  });
+  const byIssue = raw && raw.byIssue && typeof raw.byIssue === 'object' ? raw.byIssue : {};
+  return {
+    version: 1,
+    updatedAtMs: Number(raw && raw.updatedAtMs ? raw.updatedAtMs : 0),
+    byIssue,
+  };
+}
+
+function pruneLinearEngineNoProgressState(state, nowMs) {
+  const byIssue = state && state.byIssue && typeof state.byIssue === 'object' ? state.byIssue : {};
+  const maxIdleMs = 14 * 24 * 60 * 60 * 1000;
+  const nextByIssue = {};
+
+  for (const [issueIdentifier, rawEntry] of Object.entries(byIssue)) {
+    const entry = rawEntry && typeof rawEntry === 'object' ? rawEntry : {};
+    const lastTouchedMs = Math.max(
+      Number(entry.lastSeenAtMs || 0),
+      Number(entry.lastNoProgressAtMs || 0),
+      Number(entry.lastEscalatedAtMs || 0),
+      Number(entry.lastEscalationAttemptAtMs || 0),
+    );
+    const activeStreak = Number(entry.consecutiveNoProgress || 0) > 0;
+    if (activeStreak || (lastTouchedMs > 0 && nowMs - lastTouchedMs <= maxIdleMs)) {
+      nextByIssue[issueIdentifier] = entry;
+    }
+  }
+
+  state.byIssue = nextByIssue;
+}
+
+function writeLinearEngineNoProgressState(state) {
+  const nowMs = Date.now();
+  const next = {
+    version: 1,
+    updatedAtMs: nowMs,
+    byIssue: state && state.byIssue && typeof state.byIssue === 'object' ? state.byIssue : {},
+  };
+  pruneLinearEngineNoProgressState(next, nowMs);
+  writeJsonFile(LINEAR_ENGINE_NO_PROGRESS_PATH, next);
+}
+
+async function escalateLinearEngineNoProgressIssue(options) {
+  const settings = options && options.settings ? options.settings : {};
+  const policy = options && options.policy ? options.policy : {};
+  const issueIdentifier = normalizeLinearIssueId(options && options.issueIdentifier ? options.issueIdentifier : '');
+  const consecutiveNoProgress = Math.max(0, Number(options && options.consecutiveNoProgress ? options.consecutiveNoProgress : 0));
+  const round = options && options.round ? options.round : {};
+
+  const result = {
+    triggered: false,
+    issueIdentifier,
+    consecutiveNoProgress,
+    commented: false,
+    commentError: '',
+    autoBlocked: false,
+    autoBlockStatus: '',
+    autoBlockError: '',
+    notified: false,
+    notifyError: '',
+  };
+
+  if (!issueIdentifier) {
+    result.notifyError = 'missing issue identifier';
+    return result;
+  }
+
+  const apiKey = String(settings.linear && settings.linear.apiKey ? settings.linear.apiKey : '').trim();
+  if (!apiKey) {
+    result.notifyError = 'LINEAR_API_KEY missing';
+    return result;
+  }
+
+  let issue = null;
+  try {
+    issue = await resolveLinearIssueByIdentifier(
+      apiKey,
+      issueIdentifier,
+      settings.linear && settings.linear.teamKey ? settings.linear.teamKey : '',
+    );
+  } catch (error) {
+    result.commentError = error instanceof Error ? error.message : String(error);
+  }
+  const issueId = issue && issue.id ? String(issue.id) : '';
+
+  if (policy.commentOnIssue !== false && issueId) {
+    const commentLines = [
+      '### Autopilot No-Progress Escalation',
+      `Detected ${consecutiveNoProgress} consecutive linear-engine rounds with \`stopReason=no-progress\` on this issue.`,
+      '',
+      'Latest engine snapshot:',
+      `- stopReason: ${String(round.stopReason || '-').trim() || '-'}`,
+      `- finalStatus: ${String(round.finalStatus || '-').trim() || '-'}`,
+      `- finalNextState: ${String(round.finalNextState || '-').trim() || '-'}`,
+      `- runId: ${String(round.finalRunId || '-').trim() || '-'}`,
+      `- stepsExecuted: ${Number(round.stepsExecuted || 0)}`,
+      '',
+      'Automatic handling:',
+      `- auto-block requested: ${policy.autoBlock !== false ? 'yes' : 'no'}`,
+      `- report notification requested: ${policy.notifyReportTarget !== false ? 'yes' : 'no'}`,
+      '',
+      'Suggested unblock actions:',
+      '1. Add exact blocker details and owner.',
+      '2. Split oversized scope into smaller child issues.',
+      '3. Re-run linear-engine after unblock evidence is added.',
+    ];
+    try {
+      await createLinearIssueComment(apiKey, issueId, commentLines.join('\n'));
+      result.commented = true;
+    } catch (error) {
+      result.commentError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  if (policy.autoBlock !== false) {
+    try {
+      const transition = await transitionIssueByIdentifier(issueIdentifier, 'Blocked', settings);
+      result.autoBlockStatus = String(transition && transition.status ? transition.status : '');
+      result.autoBlocked = ['moved', 'unchanged', 'skipped_closed'].includes(result.autoBlockStatus);
+    } catch (error) {
+      result.autoBlockError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  if (policy.notifyReportTarget !== false) {
+    const channel = String(settings.report && settings.report.channel ? settings.report.channel : '').trim();
+    const target = String(settings.report && settings.report.target ? settings.report.target : '').trim();
+    if (channel && target) {
+      const maxLength = Number(settings.report && settings.report.maxSendLength ? settings.report.maxSendLength : 3000);
+      const alertText = trimMessage(
+        [
+          `[#autopilot] no-progress escalation`,
+          `issue=${issueIdentifier}`,
+          `streak=${consecutiveNoProgress}`,
+          `stopReason=${String(round.stopReason || '-')}`,
+          `finalStatus=${String(round.finalStatus || '-')}`,
+          `action=comment+blocked`,
+        ].join('\n'),
+        maxLength,
+      );
+      try {
+        runCommand('openclaw', [
+          'message',
+          'send',
+          '--channel',
+          channel,
+          '--target',
+          target,
+          '--message',
+          alertText,
+        ]);
+        result.notified = true;
+      } catch (error) {
+        result.notifyError = error instanceof Error ? error.message : String(error);
+      }
+    } else {
+      result.notifyError = 'report channel/target not configured';
+    }
+  }
+
+  result.triggered = result.commented || result.autoBlocked || result.notified;
+
+  appendAuditEvent('linear-engine-no-progress-escalation', {
+    issueIdentifier,
+    consecutiveNoProgress,
+    stopReason: String(round.stopReason || ''),
+    finalStatus: String(round.finalStatus || ''),
+    finalNextState: String(round.finalNextState || ''),
+    finalRunId: String(round.finalRunId || ''),
+    commented: result.commented,
+    autoBlocked: result.autoBlocked,
+    autoBlockStatus: result.autoBlockStatus || '',
+    notified: result.notified,
+    error: [result.commentError, result.autoBlockError, result.notifyError].filter(Boolean).join(' | '),
+  });
+
+  return result;
+}
+
+async function updateLinearEngineNoProgressState(input) {
+  const state = input && input.state ? input.state : readLinearEngineNoProgressState();
+  const settings = input && input.settings ? input.settings : {};
+  const policy = input && input.policy ? input.policy : resolveLinearEngineNoProgressEscalationSettings(settings, {});
+  const round = input && input.round ? input.round : {};
+  const nowMs = Date.now();
+  const issueIdentifier = normalizeLinearIssueId(round.issueIdentifier || '');
+
+  if (!policy.enabled || !issueIdentifier) {
+    return null;
+  }
+
+  if (!state.byIssue || typeof state.byIssue !== 'object') {
+    state.byIssue = {};
+  }
+
+  const reasonLower = String(round.stopReason || '').trim().toLowerCase();
+  const entry = state.byIssue[issueIdentifier] && typeof state.byIssue[issueIdentifier] === 'object'
+    ? state.byIssue[issueIdentifier]
+    : {
+        consecutiveNoProgress: 0,
+        lastNoProgressAtMs: 0,
+        lastEscalatedAtMs: 0,
+        lastEscalationAttemptAtMs: 0,
+        escalationCount: 0,
+        lastStopReason: '',
+        lastSeenAtMs: 0,
+      };
+
+  entry.lastSeenAtMs = nowMs;
+  entry.lastStopReason = String(round.stopReason || '');
+  if (reasonLower === 'no-progress') {
+    entry.consecutiveNoProgress = Math.max(0, Number(entry.consecutiveNoProgress || 0)) + 1;
+    entry.lastNoProgressAtMs = nowMs;
+  } else {
+    entry.consecutiveNoProgress = 0;
+  }
+
+  let escalation = null;
+  const cooldownMs = Math.max(5, Number(policy.cooldownMinutes || 180)) * 60 * 1000;
+  const threshold = Math.max(2, Number(policy.thresholdRuns || 3));
+  const lastEscalationAttemptAtMs = Math.max(0, Number(entry.lastEscalationAttemptAtMs || 0));
+  const cooldownReady = !lastEscalationAttemptAtMs || nowMs - lastEscalationAttemptAtMs >= cooldownMs;
+  if (reasonLower === 'no-progress' && entry.consecutiveNoProgress >= threshold && cooldownReady) {
+    entry.lastEscalationAttemptAtMs = nowMs;
+    try {
+      escalation = await escalateLinearEngineNoProgressIssue({
+        settings,
+        policy,
+        issueIdentifier,
+        consecutiveNoProgress: entry.consecutiveNoProgress,
+        round,
+      });
+    } catch (error) {
+      escalation = {
+        triggered: false,
+        issueIdentifier,
+        consecutiveNoProgress: entry.consecutiveNoProgress,
+        commentError: error instanceof Error ? error.message : String(error),
+      };
+      appendAuditEvent('linear-engine-no-progress-escalation-error', {
+        issueIdentifier,
+        consecutiveNoProgress: entry.consecutiveNoProgress,
+        error: String(escalation.commentError || ''),
+      });
+    }
+    if (escalation && escalation.triggered) {
+      entry.lastEscalatedAtMs = nowMs;
+      entry.escalationCount = Math.max(0, Number(entry.escalationCount || 0)) + 1;
+      // Require a fresh streak before next escalation notification.
+      entry.consecutiveNoProgress = 0;
+    }
+  }
+
+  state.byIssue[issueIdentifier] = entry;
+  return {
+    issueIdentifier,
+    consecutiveNoProgress: Number(entry.consecutiveNoProgress || 0),
+    thresholdRuns: threshold,
+    cooldownMinutes: Number(policy.cooldownMinutes || 180),
+    escalatedAtMs: Number(entry.lastEscalatedAtMs || 0),
+    escalation,
+  };
+}
+
+async function cmdLinearEngineDrain(settings, flags) {
+  const requestedIssueIdentifier = normalizeLinearIssueId(
+    flags.issue || flags['issue-id'] || flags.identifier || '',
+  );
+  const maxIssues = Math.max(
+    1,
+    Number(
+      flags['drain-max-issues'] ||
+        flags['max-issues'] ||
+        (settings.execution && settings.execution.engineDrainMaxIssues) ||
+        8,
+    ),
+  );
+  const pauseMs = Math.max(
+    0,
+    Number(
+      flags['drain-sleep-ms'] ||
+        (settings.execution && settings.execution.engineDrainSleepMs) ||
+        0,
+    ),
+  );
+  const strictFailure = isTruthyLike(flags.strict);
+  const perIssueTimeoutMs = Math.max(
+    120_000,
+    Math.ceil(
+      Number(flags['timeout-seconds'] || (settings.execution && settings.execution.timeoutSeconds) || 900) *
+        1000 *
+        1.4,
+    ),
+  );
+  const noProgressPolicy = resolveLinearEngineNoProgressEscalationSettings(settings, flags);
+  const noProgressState = readLinearEngineNoProgressState();
+
+  const rounds = [];
+  let stopReason = 'max-issues';
+  let hasError = false;
+  const escalatedIssues = [];
+
+  for (let index = 1; index <= maxIssues; index += 1) {
+    const childArgs = ['linear-engine', '--json', '--drain', 'false'];
+
+    if (requestedIssueIdentifier) {
+      childArgs.push('--issue', requestedIssueIdentifier);
+    } else {
+      childArgs.push('--auto-pick');
+    }
+    if (flags.agent) {
+      childArgs.push('--agent', String(flags.agent));
+    }
+    if (flags['max-steps']) {
+      childArgs.push('--max-steps', String(flags['max-steps']));
+    }
+    if (flags.steps) {
+      childArgs.push('--steps', String(flags.steps));
+    }
+    if (flags['no-progress-threshold']) {
+      childArgs.push('--no-progress-threshold', String(flags['no-progress-threshold']));
+    }
+    if (flags['step-sleep-ms']) {
+      childArgs.push('--step-sleep-ms', String(flags['step-sleep-ms']));
+    }
+    if (flags['timeout-seconds']) {
+      childArgs.push('--timeout-seconds', String(flags['timeout-seconds']));
+    }
+    if (flags['agent-retries']) {
+      childArgs.push('--agent-retries', String(flags['agent-retries']));
+    }
+    if (flags['retry-backoff-seconds']) {
+      childArgs.push('--retry-backoff-seconds', String(flags['retry-backoff-seconds']));
+    }
+    if (flags['max-prompt-chars']) {
+      childArgs.push('--max-prompt-chars', String(flags['max-prompt-chars']));
+    }
+    if (flags.force !== undefined) {
+      childArgs.push('--force', String(flags.force));
+    }
+    if (flags.trace !== undefined) {
+      childArgs.push('--trace', String(flags.trace));
+    }
+    if (flags.labels) {
+      childArgs.push('--labels', String(flags.labels));
+    }
+    if (flags.states) {
+      childArgs.push('--states', String(flags.states));
+    }
+    if (flags.all) {
+      childArgs.push('--all');
+    }
+
+    let payload = null;
+    let commandError = '';
+    try {
+      const output = runCommand(
+        process.execPath,
+        [path.join(ROOT_DIR, 'scripts', 'tasks.js'), ...childArgs],
+        {
+          timeoutMs: perIssueTimeoutMs,
+          label: `linear-engine drain issue ${index}`,
+        },
+      );
+      payload = extractJson(output.stdout || '');
+    } catch (error) {
+      commandError = error instanceof Error ? error.message : String(error);
+    }
+
+    const reason = payload ? String(payload.stopReason || '') : '';
+    const issueIdentifier = payload ? String(payload.issueIdentifier || payload.requestedIssueIdentifier || '') : '';
+    const stepsExecuted = payload ? Number(payload.stepsExecuted || 0) : 0;
+    const round = {
+      index,
+      ok: payload ? payload.ok !== false : false,
+      issueIdentifier,
+      stepsExecuted,
+      stopReason: reason,
+      finalStatus: payload ? String(payload.finalStatus || '') : '',
+      finalNextState: payload ? String(payload.finalNextState || '') : '',
+      finalRunId: payload ? String(payload.finalRunId || '') : '',
+      error:
+        commandError ||
+        (payload && Array.isArray(payload.runs) && payload.runs.length > 0
+          ? String(payload.runs[payload.runs.length - 1].error || '')
+          : ''),
+    };
+    rounds.push(round);
+
+    const noProgressUpdate = await updateLinearEngineNoProgressState({
+      state: noProgressState,
+      settings,
+      policy: noProgressPolicy,
+      round,
+    });
+    if (noProgressUpdate) {
+      round.noProgress = {
+        consecutiveNoProgress: noProgressUpdate.consecutiveNoProgress,
+        thresholdRuns: noProgressUpdate.thresholdRuns,
+      };
+      if (noProgressUpdate.escalation) {
+        round.noProgress.escalation = noProgressUpdate.escalation;
+        if (noProgressUpdate.escalation.triggered) {
+          escalatedIssues.push(issueIdentifier);
+        }
+      }
+    }
+
+    if (round.error) {
+      hasError = true;
+      stopReason = 'error';
+      break;
+    }
+
+    const reasonLower = reason.toLowerCase();
+    if (reasonLower.includes('no-runnable-issue')) {
+      stopReason = 'queue-empty';
+      break;
+    }
+    if (reasonLower.startsWith('skipped:circuit-open')) {
+      stopReason = 'circuit-open';
+      break;
+    }
+    if (reasonLower.startsWith('skipped:already-running')) {
+      stopReason = 'already-running';
+      break;
+    }
+    if (reasonLower.startsWith('error')) {
+      hasError = true;
+      stopReason = reason || 'error';
+      break;
+    }
+
+    // Specific issue mode keeps original single-issue behavior.
+    if (requestedIssueIdentifier) {
+      stopReason = reason || 'single-issue';
+      break;
+    }
+
+    if (index < maxIssues && pauseMs > 0) {
+      await sleepMs(pauseMs);
+    }
+  }
+
+  writeLinearEngineNoProgressState(noProgressState);
+
+  const totalSteps = rounds.reduce((sum, item) => sum + Number(item.stepsExecuted || 0), 0);
+  const processedIssueIds = dedupeStrings(
+    rounds
+      .map((item) => String(item.issueIdentifier || '').trim())
+      .filter(Boolean),
+  );
+  const result = {
+    ok: !hasError,
+    drain: true,
+    maxIssues,
+    roundsExecuted: rounds.length,
+    totalSteps,
+    issuesProcessed: processedIssueIds.length,
+    noProgressEscalations: {
+      enabled: noProgressPolicy.enabled,
+      thresholdRuns: noProgressPolicy.thresholdRuns,
+      cooldownMinutes: noProgressPolicy.cooldownMinutes,
+      issueIdentifiers: dedupeStrings(escalatedIssues),
+    },
+    stopReason,
+    rounds,
+  };
+
+  if (flags.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  } else {
+    const lines = [];
+    lines.push('Linear engine drain result:');
+    lines.push(`- rounds: ${result.roundsExecuted}/${result.maxIssues}`);
+    lines.push(`- issues processed: ${result.issuesProcessed}`);
+    lines.push(`- total steps: ${result.totalSteps}`);
+    lines.push(`- stop reason: ${result.stopReason}`);
+    if (result.noProgressEscalations.issueIdentifiers.length > 0) {
+      lines.push(
+        `- no-progress escalated issues: ${result.noProgressEscalations.issueIdentifiers.join(', ')}`,
+      );
+    }
+    if (processedIssueIds.length > 0) {
+      lines.push(`- issue identifiers: ${processedIssueIds.join(', ')}`);
+    }
+    const last = rounds.length > 0 ? rounds[rounds.length - 1] : null;
+    if (last && last.error) {
+      lines.push(`- error: ${singleLine(trimMessage(String(last.error || ''), 320))}`);
+    }
+    process.stdout.write(`${lines.join('\n')}\n`);
+  }
+
+  if (strictFailure && hasError) {
+    const last = rounds.length > 0 ? rounds[rounds.length - 1] : null;
+    throw new Error(`linear-engine drain failed: ${last ? last.error || last.stopReason : 'unknown error'}`);
   }
 }
 
@@ -8194,6 +8855,7 @@ function buildLinearAutopilotPrompt(issue, maxPromptChars, options = {}) {
   const cycle = issue && issue.cycle && issue.cycle.name ? String(issue.cycle.name) : '';
   const rawInput = extractLinearIssueRawInput(issue && issue.description ? issue.description : '', maxPromptChars);
   const workdir = String(options && options.workdir ? options.workdir : ROOT_DIR).trim();
+  const handoff = options && options.handoff ? options.handoff : null;
 
   const lines = [];
   lines.push('You are OpenClaw execution autopilot.');
@@ -8205,6 +8867,21 @@ function buildLinearAutopilotPrompt(issue, maxPromptChars, options = {}) {
     lines.push('Run all local commands and file operations under this repository root.');
   }
   lines.push('');
+  if (handoff) {
+    lines.push('### SESSION HANDOFF CONTEXT');
+    lines.push(`Source Session: ${handoff.sourceSession ? handoff.sourceSession.agentId : 'unknown'}/${handoff.sourceSession ? handoff.sourceSession.sessionKey : 'unknown'}`);
+    lines.push(`Handoff Reason: ${handoff.handoffReason || 'threshold-breach'}`);
+    lines.push(`Handoff Metrics: ${handoff.metrics ? handoff.metrics.tokens : 0} tokens, ${handoff.metrics ? handoff.metrics.turns : 0} turns`);
+    lines.push(`Handoff Timestamp: ${handoff.timestamp || 'unknown'}`);
+    lines.push('');
+    if (handoff.recentRuns && handoff.recentRuns.length > 0) {
+      lines.push('Recent attempt summaries:');
+      for (const run of handoff.recentRuns.slice(0, 3)) {
+        lines.push(`- [${new Date(run.atMs).toISOString()}] status=${run.status} summary=${run.summary}`);
+      }
+      lines.push('');
+    }
+  }
   lines.push(`Issue: ${issue.identifier} ${singleLine(issue.title || '')}`);
   lines.push(`URL: ${issue.url || '-'}`);
   lines.push(`State: ${stateName || '-'}`);
@@ -8327,6 +9004,13 @@ function resolveAutopilotCircuitSettings(settings, flags) {
     ? settings.execution.circuitBreaker
     : {};
 
+  const shardingBase = settings &&
+    settings.execution &&
+    settings.execution.sessionSharding &&
+    typeof settings.execution.sessionSharding === 'object'
+    ? settings.execution.sessionSharding
+    : {};
+
   return {
     enabled:
       flags['circuit-enabled'] !== undefined
@@ -8355,6 +9039,20 @@ function resolveAutopilotCircuitSettings(settings, flags) {
         'circuit-breaker',
       ]),
     ),
+    sharding: {
+      enabled:
+        flags['sharding-enabled'] !== undefined
+          ? isTruthyLike(flags['sharding-enabled'])
+          : shardingBase.enabled !== false,
+      tokenThreshold: Math.max(
+        1000,
+        Number(flags['sharding-token-threshold'] || shardingBase.tokenThreshold || 60000),
+      ),
+      turnThreshold: Math.max(
+        1,
+        Number(flags['sharding-turn-threshold'] || shardingBase.turnThreshold || 30),
+      ),
+    },
   };
 }
 
@@ -8808,7 +9506,8 @@ function getOpenclawAgentIds() {
   }
 }
 
-function resolveAutopilotDynamicAgentCandidates(settings, flags) {
+function resolveAutopilotDynamicAgentCandidates(settings, flags, options = {}) {
+  const targetTier = String(options.tier || '').trim().toLowerCase();
   const knownAgentIds = getOpenclawAgentIds();
   let candidates = knownAgentIds && knownAgentIds.size > 0 ? Array.from(knownAgentIds) : ['main'];
   candidates = dedupeStrings(candidates.map((item) => String(item || '').trim()).filter(Boolean));
@@ -8835,21 +9534,34 @@ function resolveAutopilotDynamicAgentCandidates(settings, flags) {
     candidates = candidates.filter((item) => !denylist.has(item.toLowerCase()));
   }
 
+  // CLAW-111: Model tier routing
+  const modelRouting = settings.execution && settings.execution.modelRouting ? settings.execution.modelRouting : DEFAULTS.modelRouting;
+  const mediumAgents = ['researcher', 'writer', 'researcher-deep', 'openclaw-dev', 'main-autopilot'];
+  const xHighAgents = ['codex', 'coder'];
+
   const preferredRaw = normalizeAgentIds(
     flags['agent-preferred'] ||
       (settings.execution && settings.execution.agentPreferred) ||
-      ['codex', 'coder', 'main'],
+      (targetTier === 'x-high' ? xHighAgents : targetTier === 'medium' ? mediumAgents : ['codex', 'coder', 'main']),
   );
   const preferred = preferredRaw.map((item) => String(item || '').trim().toLowerCase());
+  const rank = new Map(preferred.map((item, index) => [item, index]));
 
-  const rank = new Map();
-  preferred.forEach((item, index) => {
-    if (!rank.has(item)) {
-      rank.set(item, index);
-    }
-  });
-
+  // Order candidates by tier preference (fallback/downgrade logic)
+  const tierOrder = targetTier === 'x-high' ? [...xHighAgents, ...mediumAgents] : [...mediumAgents, ...xHighAgents];
+  
   candidates.sort((a, b) => {
+    const tierA = tierOrder.indexOf(a.toLowerCase());
+    const tierB = tierOrder.indexOf(b.toLowerCase());
+    
+    if (tierA !== -1 && tierB !== -1) {
+      if (tierA !== tierB) return tierA - tierB;
+    } else if (tierA !== -1) {
+      return -1;
+    } else if (tierB !== -1) {
+      return 1;
+    }
+
     const ar = rank.has(a.toLowerCase()) ? rank.get(a.toLowerCase()) : Number.MAX_SAFE_INTEGER;
     const br = rank.has(b.toLowerCase()) ? rank.get(b.toLowerCase()) : Number.MAX_SAFE_INTEGER;
     if (ar !== br) {
@@ -9093,12 +9805,16 @@ function renderLinearAutopilotComment(input) {
   const runId = String(input && input.runId ? input.runId : '').trim();
   const agentText = String(input && input.agentText ? input.agentText : '').trim();
   const agentError = String(input && input.agentError ? input.agentError : '').trim();
+  const modelTier = String(input && input.modelTier ? input.modelTier : '').trim();
   const settings = input && input.settings ? input.settings : { timezone: 'UTC' };
 
   const lines = [];
   lines.push('### Mission Control Linear Autopilot');
   lines.push(`- issue: ${candidate.identifier || '-'}`);
   lines.push(`- status: ${parsed.status || (agentError ? 'error' : 'in_progress')}`);
+  if (modelTier) {
+    lines.push(`- model tier: ${modelTier}`);
+  }
   if (parsed.nextState) {
     lines.push(`- requested next state: ${parsed.nextState}`);
   }
@@ -9128,6 +9844,16 @@ function renderLinearAutopilotComment(input) {
     lines.push('');
     lines.push('#### Next Action');
     lines.push(`- ${singleLine(parsed.nextAction)}`);
+  }
+
+  if (input && input.agentText && input.agentText.includes('[Session Handoff Enforced]')) {
+    const handoffLines = input.agentText.split('\n');
+    const handoffIndex = handoffLines.findIndex(l => l.includes('[Session Handoff Enforced]'));
+    if (handoffIndex !== -1) {
+      lines.push('');
+      lines.push('#### Session Handoff');
+      lines.push(handoffLines.slice(handoffIndex + 1).join('\n'));
+    }
   }
 
   if (Array.isArray(parsed.artifacts) && parsed.artifacts.length > 0) {
@@ -11059,10 +11785,23 @@ function runOpenclawJson(args) {
 function runCommand(bin, args, opts = {}) {
   const timeoutMs = Number(opts.timeoutMs || 0);
   const label = String(opts.label || '').trim();
+
+  const mergedEnv = {
+    ...process.env,
+    ...(opts.env && typeof opts.env === 'object' ? opts.env : {}),
+  };
+
+  if (!mergedEnv.NEXUS_VECTOR_DB) {
+    mergedEnv.NEXUS_VECTOR_DB = '/Users/yizhi/.openclaw/workspace/memory/.vector_db_restored';
+  }
+  if (!mergedEnv.NEXUS_COLLECTION) {
+    mergedEnv.NEXUS_COLLECTION = 'deepsea_nexus_restored';
+  }
+
   const result = spawnSync(bin, args, {
     cwd: ROOT_DIR,
     encoding: 'utf8',
-    env: process.env,
+    env: mergedEnv,
     maxBuffer: 10 * 1024 * 1024,
     timeout: timeoutMs > 0 ? timeoutMs : undefined,
   });
@@ -11311,11 +12050,23 @@ function buildTriggerChildArgs(jobId, settings, flags) {
       if (flags.issue) {
         args.push('--issue', String(flags.issue));
       }
+      if (flags['auto-pick'] !== undefined) {
+        args.push('--auto-pick', String(flags['auto-pick']));
+      }
       if (flags.agent) {
         args.push('--agent', String(flags.agent));
       }
       if (flags['max-steps']) {
         args.push('--max-steps', String(flags['max-steps']));
+      }
+      if (flags['no-progress-threshold']) {
+        args.push('--no-progress-threshold', String(flags['no-progress-threshold']));
+      }
+      if (flags.drain !== undefined) {
+        args.push('--drain', String(flags.drain));
+      }
+      if (flags['drain-max-issues']) {
+        args.push('--drain-max-issues', String(flags['drain-max-issues']));
       }
       break;
     default:
