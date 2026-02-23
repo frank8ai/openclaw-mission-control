@@ -45,6 +45,23 @@ const LINEAR_AUTOPILOT_LOCK_PATH = path.join(DATA_DIR, 'linear-autopilot.lock.js
 const LINEAR_AUTOPILOT_CIRCUIT_PATH = path.join(DATA_DIR, 'linear-autopilot-circuit.json');
 const LINEAR_AUTOPILOT_AGENT_CURSOR_PATH = path.join(DATA_DIR, 'linear-autopilot-agent-cursor.json');
 const LINEAR_ENGINE_NO_PROGRESS_PATH = path.join(DATA_DIR, 'linear-engine-no-progress.json');
+const TOKEN_BUDGET_PATH = path.join(DATA_DIR, 'token-budget.json');
+const LOW_VALUE_AUTOMATIONS = [
+  'github-sync',
+  'todoist-sync',
+  'calendar-sync',
+  'report',
+  'briefing',
+  'remind',
+  'status-sync',
+  'queue-drain',
+  'sla-check',
+  'watchdog',
+  'workspace-guard',
+  'binding-coverage',
+  'distill-export',
+  'telemetry',
+];
 let OPENCLAW_AGENT_IDS_CACHE = {
   loadedAtMs: 0,
   ids: null,
@@ -101,11 +118,23 @@ const DEFAULTS = {
     ],
   },
   modelRouting: {
-    medium: 'minimax-m2.5',
+    // Default to a low-cost model for medium-complexity agents (not code-heavy).
+    // Individual tasks can still escalate to xHigh when needed.
+    medium: 'gemini-flash',
     xHigh: 'gpt-5.3-codex-x-high',
     escalationLabels: ['blocked', 'fix-complexity'],
     mediumAgents: ['researcher', 'writer', 'researcher-deep', 'openclaw-dev', 'main-autopilot', 'gemini', 'main'],
     xHighAgents: ['codex', 'coder'],
+  },
+  tokenBudget: {
+    enabled: true,
+    dailyGlobalLimit: 500000,
+    dailyAgentLimit: 100000,
+    throttleThresholds: {
+      downgrade: 0.8,
+      highPriorityOnly: 0.9,
+      freeze: 0.95,
+    },
   },
   linear: {
     enabled: true,
@@ -438,6 +467,8 @@ async function main() {
   const { command, flags } = parseArgv(process.argv.slice(2));
   const settings = loadSettings();
 
+  checkBudgetGuard(command, settings, flags);
+
   try {
     switch (command) {
       case 'help':
@@ -632,6 +663,36 @@ async function main() {
   }
 }
 
+function checkBudgetGuard(command, settings, flags) {
+  if (isTruthyLike(flags.force)) return;
+  if (!command) return;
+
+  const isLowValue = LOW_VALUE_AUTOMATIONS.includes(command);
+  const isExecution = ['linear-autopilot', 'linear-engine'].includes(command);
+
+  // Execution commands (autopilot/engine) handle their own priority-based throttling 
+  // after picking an issue.
+  if (isExecution) return;
+
+  const priority = isLowValue ? 4 : 3;
+
+  const gate = evaluateTokenBudgetGate(settings, null, priority);
+  if (gate.status === 'freeze') {
+    throw new Error(`Command "${command}" frozen: global token budget exhausted (${Math.round(gate.ratio * 100)}%).`);
+  }
+
+  if (gate.status === 'throttle') {
+    throw new Error(`Command "${command}" throttled: high-priority runs only (${Math.round(gate.ratio * 100)}%).`);
+  }
+
+  if (gate.status === 'downgrade' && isLowValue) {
+    // 80% Gate: Downgrade frequency (skip 50% of low-value runs)
+    if (Math.random() < 0.5) {
+      throw new Error(`Command "${command}" frequency downgraded (budget=${Math.round(gate.ratio * 100)}%).`);
+    }
+  }
+}
+
 function parseArgv(argv) {
   const flags = { _: [] };
   let command = '';
@@ -712,6 +773,17 @@ function loadSettings() {
   }
   if (!merged.todoist.apiToken && process.env.TODOIST_API_TOKEN) {
     merged.todoist.apiToken = process.env.TODOIST_API_TOKEN;
+  }
+
+  // Fail-fast guard for NEXUS (Second Brain) prerequisites
+  const nexusChecks = [
+    { key: 'NEXUS_VECTOR_DB', env: process.env.NEXUS_VECTOR_DB || '/Users/yizhi/.openclaw/workspace/memory/.vector_db_restored' },
+    { key: 'NEXUS_PYTHON_PATH', env: process.env.NEXUS_PYTHON_PATH || '/Users/yizhi/miniconda3/envs/openclaw-nexus/bin/python' },
+  ];
+  for (const check of nexusChecks) {
+    if (!fs.existsSync(check.env)) {
+      throw new Error(`CRITICAL: NEXUS prerequisite [${check.key}] path not found: ${check.env}. Please check your environment or Second Brain installation.`);
+    }
   }
 
   if (process.env.CONTROL_CENTER_KILL_WHITELIST) {
@@ -2900,6 +2972,7 @@ async function cmdTriage(settings, flags) {
     lines.push(`- deduped: yes (${issue.dedupeKey || '-'})`);
   }
   lines.push(`- state: ${issue.stateName || '-'}`);
+  lines.push(`- priority: ${issue.priority || '-'}`);
   if (issue.url) {
     lines.push(`- url: ${issue.url}`);
   }
@@ -3642,7 +3715,11 @@ function countSessionTurns(session, agentId, settings) {
 
 function checkSessionShardingThreshold(sessionKey, agentId, settings, config) {
   const shardingConfig = config && typeof config === 'object' ? config : SESSION_SHARDING_CONFIG;
-  if (!shardingConfig.enabled) {
+  const tokenThreshold = shardingConfig.maxTokens || shardingConfig.tokenThreshold || 60000;
+  const turnThreshold = shardingConfig.maxTurns || shardingConfig.turnThreshold || 30;
+  const enabled = shardingConfig.enabled !== false;
+
+  if (!enabled) {
     return {
       shouldShard: false,
       reason: 'sharding-disabled',
@@ -3664,11 +3741,11 @@ function checkSessionShardingThreshold(sessionKey, agentId, settings, config) {
   const tokens = session.totalTokens || 0;
   const turns = countSessionTurns(session, agentId, settings);
 
-  const shouldShard = tokens >= shardingConfig.tokenThreshold || turns >= shardingConfig.turnThreshold;
+  const shouldShard = tokens >= tokenThreshold || turns >= turnThreshold;
   const reason = shouldShard
-    ? tokens >= shardingConfig.tokenThreshold
-      ? `token-threshold-exceeded (${tokens}/${shardingConfig.tokenThreshold})`
-      : `turn-threshold-exceeded (${turns}/${shardingConfig.turnThreshold})`
+    ? tokens >= tokenThreshold
+      ? `token-threshold-exceeded (${tokens}/${tokenThreshold})`
+      : `turn-threshold-exceeded (${turns}/${turnThreshold})`
     : 'within-thresholds';
 
   return {
@@ -3676,8 +3753,8 @@ function checkSessionShardingThreshold(sessionKey, agentId, settings, config) {
     reason,
     metrics: { tokens, turns },
     thresholds: {
-      tokenThreshold: shardingConfig.tokenThreshold,
-      turnThreshold: shardingConfig.turnThreshold,
+      tokenThreshold: tokenThreshold,
+      turnThreshold: turnThreshold,
     },
   };
 }
@@ -4978,6 +5055,18 @@ async function cmdLinearAutopilot(settings, flags) {
     return;
   }
 
+  // CLAW-112: Daily Token Budget Governor (Global check)
+  const budgetGate = evaluateTokenBudgetGate(settings, null, 0);
+  if (budgetGate.status === 'freeze' && !forceRun) {
+    const skipped = { ok: true, skipped: true, reason: 'budget-freeze', ratio: budgetGate.ratio };
+    if (flags.json) {
+      process.stdout.write(`${JSON.stringify(skipped, null, 2)}\n`);
+    } else {
+      process.stdout.write(`Linear autopilot skipped: global daily token budget exhausted (${Math.round(budgetGate.ratio * 100)}%).\n`);
+    }
+    return;
+  }
+
   const t0 = Date.now();
   const traceAutopilot = Boolean(flags.trace);
   const trace = (msg) => {
@@ -5101,7 +5190,36 @@ async function cmdLinearAutopilot(settings, flags) {
   const modelRouting = settings.execution && settings.execution.modelRouting ? settings.execution.modelRouting : DEFAULTS.modelRouting;
   const issueLabels = (((candidate || {}).labels || {}).nodes || []).map(l => String(l && l.name ? l.name : '').toLowerCase());
   const needsEscalation = modelRouting.escalationLabels.some(l => issueLabels.includes(l.toLowerCase()));
-  const targetTier = String(flags.tier || (needsEscalation ? 'x-high' : 'medium')).toLowerCase();
+  let targetTier = String(flags.tier || (needsEscalation ? 'x-high' : 'medium')).toLowerCase();
+
+  // CLAW-112: Daily Token Budget Governor (Per-agent/Priority gate) - Preliminary check
+  const preBudgetGate = evaluateTokenBudgetGate(settings, requestedAgentId === 'auto' ? null : requestedAgentId, candidate.priority);
+  if (preBudgetGate.status === 'freeze' && !forceRun) {
+    const skipped = { ok: true, skipped: true, reason: 'budget-freeze', ratio: preBudgetGate.ratio };
+    if (flags.json) {
+      process.stdout.write(`${JSON.stringify(skipped, null, 2)}\n`);
+    } else {
+      process.stdout.write(`Linear autopilot skipped: token budget exhausted (${Math.round(preBudgetGate.ratio * 100)}%).\n`);
+    }
+    return;
+  }
+  if (preBudgetGate.status === 'throttle' && !forceRun) {
+    const skipped = { ok: true, skipped: true, reason: 'budget-throttle', ratio: preBudgetGate.ratio };
+    if (flags.json) {
+      process.stdout.write(`${JSON.stringify(skipped, null, 2)}\n`);
+    } else {
+      process.stdout.write(`Linear autopilot skipped: budget throttle (high-priority only).\n`);
+    }
+    return;
+  }
+
+  // Apply budget downgrade action
+  if (preBudgetGate.status === 'downgrade') {
+    if (targetTier === 'x-high') {
+      trace(`token budget downgrade: forcing medium tier instead of x-high (ratio=${Math.round(preBudgetGate.ratio * 100)}%)`);
+      targetTier = 'medium';
+    }
+  }
 
   let agentId = requestedAgentId;
   let agentSelection = {
@@ -5154,6 +5272,31 @@ async function cmdLinearAutopilot(settings, flags) {
       candidates: dynamicCandidates,
     };
   }
+
+  // CLAW-108: Resolve 1-issue-1-session sessionId
+  let targetSessionId = '';
+  const bindings = readJsonFile(ISSUE_LINKS_PATH, { byIssue: {} });
+  const issueBinding = bindings.byIssue && bindings.byIssue[candidate.identifier] ? bindings.byIssue[candidate.identifier] : null;
+  if (issueBinding && Array.isArray(issueBinding.sessionKeys) && issueBinding.sessionKeys.length > 0) {
+    // Try to find a session linked to the selected agentId that hasn't hit threshold
+    for (let i = issueBinding.sessionKeys.length - 1; i >= 0; i--) {
+      const key = issueBinding.sessionKeys[i];
+      const [sid, aid] = key.split(':');
+      if (aid && aid.toLowerCase() === agentId.toLowerCase()) {
+        const shardingCheck = checkSessionShardingThreshold(key, aid, settings, circuitSettings.sharding);
+        if (!shardingCheck.shouldShard) {
+          targetSessionId = sid;
+          trace(`sharding: reuse session ${sid} for agent ${aid}`);
+          break;
+        }
+      }
+    }
+  }
+  if (!targetSessionId) {
+    targetSessionId = `issue-${candidate.identifier}-${Date.now().toString().slice(-6)}`;
+    trace(`sharding: starting fresh session ${targetSessionId} for issue ${candidate.identifier}`);
+  }
+
   const timeoutSeconds = Math.max(
     60,
     Number(flags['timeout-seconds'] || (settings.execution && settings.execution.timeoutSeconds) || 900),
@@ -5249,10 +5392,20 @@ async function cmdLinearAutopilot(settings, flags) {
   let agentSessionKey = '';
   let agentAttempts = [];
   try {
+    // CLAW-112: Daily Token Budget Governor (Per-agent/Priority gate)
+    const agentBudgetGate = evaluateTokenBudgetGate(settings, agentId, candidate.priority);
+    if (agentBudgetGate.status === 'freeze' && !forceRun) {
+      throw new Error(`Token budget frozen for agent ${agentId} (${Math.round(agentBudgetGate.ratio * 100)}%)`);
+    }
+    if (agentBudgetGate.status === 'throttle' && !forceRun) {
+      throw new Error(`Token budget throttled: high-priority runs only (${Math.round(agentBudgetGate.ratio * 100)}%)`);
+    }
+
     trace('openclaw agent: start');
     const execution = await runLinearAutopilotAgent({
       prompt,
       primaryAgentId: agentId,
+      sessionId: targetSessionId,
       timeoutSeconds,
       retries: agentRetries,
       retryBackoffSeconds,
@@ -5270,6 +5423,14 @@ async function cmdLinearAutopilot(settings, flags) {
       agentText = String(execution.text || '').trim();
       agentSessionId = String(execution.sessionId || '').trim();
       agentSessionKey = String(execution.sessionKey || '').trim();
+
+      // CLAW-112: Update Token Budget Usage
+      const tokensUsed = Number(execution.totalTokens || 0);
+      if (tokensUsed > 0) {
+        updateTokenBudgetUsage(agentUsed, tokensUsed);
+        trace(`token budget updated: +${tokensUsed} for ${agentUsed}`);
+      }
+
       const linkUpsert = upsertRuntimeIssueBindings(candidate.identifier, {
         sessionId: agentSessionId,
         sessionKey: agentSessionKey,
@@ -6971,6 +7132,7 @@ async function createTriageIssueFromInput(input, settings) {
         title: issue.title,
         url: issue.url,
         stateName: issue.state ? issue.state.name : '',
+        priority: issue.priority || Number(routedInput.priority) || 3,
         labels: (((issue.labels || {}).nodes || []).map((item) => item.name)).filter(Boolean),
         assigneeId: assigneeId || '',
         routeHits: Array.isArray(routedInput.routeHits) ? routedInput.routeHits : [],
@@ -7865,10 +8027,28 @@ function collectLinkedIssueSignals(settings, flags) {
         githubOpen: [],
         githubMerged: [],
         autopilotRecent: [],
+        blockerEvidence: [],
       });
     }
     return byIssue.get(normalized);
   };
+
+  const files = fs.readdirSync(DATA_DIR);
+  for (const file of files) {
+    if (file.startsWith('evidence-') && file.endsWith('-blocker.json')) {
+      try {
+        const content = readJsonFile(path.join(DATA_DIR, file), null);
+        if (content && content.issue) {
+          const context = ensureContext(content.issue);
+          if (context) {
+            context.blockerEvidence.push(content);
+          }
+        }
+      } catch (err) {
+        // ignore
+      }
+    }
+  }
 
   const sessions = loadSessions(settings)
     .filter((session) => Number(session.ageMs || Number.POSITIVE_INFINITY) <= activeWindowMs)
@@ -8961,6 +9141,22 @@ function buildLinearAutopilotPrompt(issue, maxPromptChars, options = {}) {
       }
       lines.push('');
     }
+    if (handoff.decisionCard && handoff.decisionCard.summary) {
+      lines.push('### LAST AGENT SUMMARY');
+      lines.push(handoff.decisionCard.summary);
+      lines.push('');
+    }
+    if (handoff.recentTurns && handoff.recentTurns.length > 0) {
+      lines.push('### RECENT SESSION TURNS');
+      for (const turn of handoff.recentTurns) {
+        const role = turn.role || 'unknown';
+        const content = turn.text || turn.message || turn.content || (turn.raw ? turn.raw.substring(0, 100) : '');
+        if (content) {
+          lines.push(`${role.toUpperCase()}: ${content.toString().substring(0, 400)}${content.toString().length > 400 ? '...' : ''}`);
+        }
+      }
+      lines.push('');
+    }
   }
   lines.push(`Issue: ${issue.identifier} ${singleLine(issue.title || '')}`);
   lines.push(`URL: ${issue.url || '-'}`);
@@ -9126,12 +9322,16 @@ function resolveAutopilotCircuitSettings(settings, flags) {
           : shardingBase.enabled !== false,
       tokenThreshold: Math.max(
         1000,
-        Number(flags['sharding-token-threshold'] || shardingBase.tokenThreshold || 60000),
+        Number(flags['sharding-token-threshold'] || shardingBase.maxTokens || shardingBase.tokenThreshold || 60000),
       ),
       turnThreshold: Math.max(
         1,
-        Number(flags['sharding-turn-threshold'] || shardingBase.turnThreshold || 30),
+        Number(flags['sharding-turn-threshold'] || shardingBase.maxTurns || shardingBase.turnThreshold || 30),
       ),
+      enforceHandoffPackage:
+        flags['sharding-enforce-handoff'] !== undefined
+          ? isTruthyLike(flags['sharding-enforce-handoff'])
+          : shardingBase.enforceHandoffPackage !== false,
     },
   };
 }
@@ -9198,6 +9398,105 @@ function writeAutopilotCircuitState(state) {
   };
   writeJsonFile(LINEAR_AUTOPILOT_CIRCUIT_PATH, next);
   return next;
+}
+
+function readTokenBudgetState() {
+  const now = new Date();
+  const dateStr = now.toISOString().split('T')[0];
+  const raw = readJsonFile(TOKEN_BUDGET_PATH, {
+    version: 1,
+    updatedAtMs: 0,
+    daily: {},
+  });
+
+  if (!raw.daily[dateStr]) {
+    raw.daily[dateStr] = {
+      globalTokens: 0,
+      agents: {},
+    };
+  }
+
+  return {
+    ...raw,
+    today: raw.daily[dateStr],
+    dateStr,
+  };
+}
+
+function updateTokenBudgetUsage(agentId, tokens) {
+  const state = readTokenBudgetState();
+  const n = Number(tokens || 0);
+  if (n <= 0) return state;
+
+  state.today.globalTokens += n;
+  if (agentId) {
+    state.today.agents[agentId] = (state.today.agents[agentId] || 0) + n;
+  }
+  state.updatedAtMs = Date.now();
+
+  // Cleanup old dates (keep last 7 days)
+  const dateKeys = Object.keys(state.daily).sort();
+  if (dateKeys.length > 7) {
+    for (const k of dateKeys.slice(0, dateKeys.length - 7)) {
+      delete state.daily[k];
+    }
+  }
+
+  const { today, dateStr, ...toPersist } = state;
+  writeJsonFile(TOKEN_BUDGET_PATH, toPersist);
+  return state;
+}
+
+function evaluateTokenBudgetGate(settings, agentId, issuePriority) {
+  const cfg = (settings.execution && settings.execution.tokenBudget) || DEFAULTS.tokenBudget;
+  if (!cfg.enabled) {
+    return { status: 'ok', ratio: 0 };
+  }
+
+  const state = readTokenBudgetState();
+  const globalLimit = Number(cfg.dailyGlobalLimit || 500000);
+  const agentLimit = Number(cfg.dailyAgentLimit || 100000);
+
+  const globalRatio = state.today.globalTokens / globalLimit;
+  const agentTokens = agentId ? (state.today.agents[agentId] || 0) : 0;
+  const agentRatio = agentId ? agentTokens / agentLimit : 0;
+
+  const maxRatio = Math.max(globalRatio, agentRatio);
+  const thresholds = cfg.throttleThresholds || DEFAULTS.tokenBudget.throttleThresholds;
+  const priority = Number(issuePriority || 3);
+
+  let result = { status: 'ok', ratio: maxRatio };
+
+  if (maxRatio >= thresholds.freeze) {
+    // 95% Gate: Freeze low-value automations. Keep high-priority (P1) if ratio < 1.0
+    if (priority > 1 || maxRatio >= 1.0) {
+      result = { status: 'freeze', ratio: maxRatio, reason: 'budget_exhausted' };
+    }
+  } else if (maxRatio >= thresholds.highPriorityOnly) {
+    // 90% Gate: Keep only high-priority runs (P1)
+    if (priority > 1) {
+      result = { status: 'throttle', ratio: maxRatio, reason: 'high_priority_only' };
+    }
+  } else if (maxRatio >= thresholds.downgrade) {
+    // 80% Gate: Downgrade frequency/model. Skip P3 (low value)
+    if (priority > 2) {
+      result = { status: 'throttle', ratio: maxRatio, reason: 'frequency_downgrade' };
+    } else {
+      result = { status: 'downgrade', ratio: maxRatio, reason: 'cost_downgrade' };
+    }
+  }
+
+  // Proactive notification for significant gates
+  if (result.status === 'freeze' || result.status === 'throttle') {
+    const channel = String(settings.report.channel || '').trim();
+    const target = String(settings.report.target || '').trim();
+    if (channel && target) {
+      const msg = `[TokenBudgetGate] ${result.status.toUpperCase()} trigger (ratio: ${(maxRatio * 100).toFixed(1)}%, reason: ${result.reason}, priority: P${priority}, agent: ${agentId || 'global'})`;
+      runCommand('openclaw', ['message', 'send', '--channel', channel, '--target', target, '--message', msg]);
+    }
+  }
+
+  return result;
 }
 
 function evaluateAutopilotCircuitGate(state, circuitSettings, forceRun) {
@@ -9411,6 +9710,7 @@ async function updateAutopilotCircuitState(input) {
 async function runLinearAutopilotAgent(options) {
   const prompt = String(options && options.prompt ? options.prompt : '').trim();
   const primaryAgentId = String(options && options.primaryAgentId ? options.primaryAgentId : 'main').trim();
+  const sessionId = String(options && options.sessionId ? options.sessionId : '').trim();
   const timeoutSeconds = Math.max(30, Number(options && options.timeoutSeconds ? options.timeoutSeconds : 900));
   const retries = Math.max(0, Number(options && options.retries ? options.retries : 0));
   const retryBackoffSeconds = Math.max(
@@ -9433,20 +9733,24 @@ async function runLinearAutopilotAgent(options) {
       ? candidateAgents[1]
       : candidateAgents[Math.min(index, candidateAgents.length - 1)];
 
-    trace(`openclaw agent: attempt ${attemptNo}/${totalAttempts} agent=${agentForAttempt}`);
+    trace(`openclaw agent: attempt ${attemptNo}/${totalAttempts} agent=${agentForAttempt} session=${sessionId || 'auto'}`);
     try {
+      const args = [
+        'agent',
+        '--agent',
+        agentForAttempt,
+        '--message',
+        prompt,
+        '--timeout',
+        String(timeoutSeconds),
+        '--json',
+      ];
+      if (sessionId) {
+        args.push('--session-id', sessionId);
+      }
       const output = runCommand(
         'openclaw',
-        [
-          'agent',
-          '--agent',
-          agentForAttempt,
-          '--message',
-          prompt,
-          '--timeout',
-          String(timeoutSeconds),
-          '--json',
-        ],
+        args,
         {
           timeoutMs: Math.max(45_000, Math.ceil(timeoutSeconds * 1000 * 1.2)),
           label: `openclaw agent(${agentForAttempt})`,
@@ -9472,6 +9776,7 @@ async function runLinearAutopilotAgent(options) {
         text,
         sessionId: meta.sessionId || '',
         sessionKey: meta.sessionKey || '',
+        totalTokens: meta.totalTokens || 0,
         attempts,
       };
     } catch (error) {
@@ -9684,6 +9989,7 @@ function extractAgentRuntimeMeta(agentPayload) {
   return {
     sessionId: String(agentMeta && agentMeta.sessionId ? agentMeta.sessionId : report.sessionId || '').trim(),
     sessionKey: String(report && report.sessionKey ? report.sessionKey : '').trim(),
+    totalTokens: Number(agentMeta.totalTokens || report.totalTokens || 0),
   };
 }
 
@@ -10670,60 +10976,60 @@ function installLinearGitHooks(repoPath, teamKey) {
 
   const prepareScript = `#!/bin/sh
 set -eu
-MSG_FILE="$1"
-if [ -z "\${MSG_FILE:-}" ] || [ ! -f "$MSG_FILE" ]; then
+MSG_FILE="\x241"
+if [ -z "\x24{MSG_FILE:-}" ] || [ ! -f "\x24MSG_FILE" ]; then
   exit 0
 fi
-BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
-if [ -z "$BRANCH" ]; then
+BRANCH="\x24(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+if [ -z "\x24BRANCH" ]; then
   exit 0
 fi
-ISSUE="$(printf '%s' "$BRANCH" | grep -Eo '[A-Z][A-Z0-9]+-[0-9]+' | head -n1 || true)"
-if [ -z "$ISSUE" ]; then
+ISSUE="\x24(printf '%s' "\x24BRANCH" | grep -Eo '[A-Z][A-Z0-9]+-[0-9]+' | head -n1 || true)"
+if [ -z "\x24ISSUE" ]; then
   exit 0
 fi
-if grep -Eq "\\b$ISSUE\\b" "$MSG_FILE"; then
+if grep -Eq "\\b\x24ISSUE\\b" "\x24MSG_FILE"; then
   exit 0
 fi
-TMP_FILE="$(mktemp)"
+TMP_FILE="\x24(mktemp)"
 {
   IFS= read -r FIRST_LINE || true
-  if [ -n "$FIRST_LINE" ]; then
-    printf '%s %s\\n' "$ISSUE" "$FIRST_LINE"
+  if [ -n "\x24FIRST_LINE" ]; then
+    printf '%s %s\\n' "\x24ISSUE" "\x24FIRST_LINE"
   else
-    printf '%s\\n' "$ISSUE"
+    printf '%s\\n' "\x24ISSUE"
   fi
   cat
-} < "$MSG_FILE" > "$TMP_FILE"
-mv "$TMP_FILE" "$MSG_FILE"
+} < "\x24MSG_FILE" > "\x24TMP_FILE"
+mv "\x24TMP_FILE" "\x24MSG_FILE"
 `;
 
   const commitScript = `#!/bin/sh
 set -eu
-MSG_FILE="$1"
-if [ -z "\${MSG_FILE:-}" ] || [ ! -f "$MSG_FILE" ]; then
+MSG_FILE="\x241"
+if [ -z "\x24{MSG_FILE:-}" ] || [ ! -f "\x24MSG_FILE" ]; then
   exit 0
 fi
-BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
-case "$BRANCH" in
+BRANCH="\x24(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+case "\x24BRANCH" in
   ""|main|master)
     exit 0
     ;;
 esac
-BRANCH_ISSUE="$(printf '%s' "$BRANCH" | grep -Eo '\\b${teamKey}-[0-9]+\\b' | head -n1 || true)"
-if [ -z "$BRANCH_ISSUE" ]; then
-  BRANCH_ISSUE="$(printf '%s' "$BRANCH" | grep -Eo '\\b[A-Z][A-Z0-9]+-[0-9]+\\b' | head -n1 || true)"
+BRANCH_ISSUE="\x24(printf '%s' "\x24BRANCH" | grep -Eo '\\b${teamKey}-[0-9]+\\b' | head -n1 || true)"
+if [ -z "\x24BRANCH_ISSUE" ]; then
+  BRANCH_ISSUE="\x24(printf '%s' "\x24BRANCH" | grep -Eo '\\b[A-Z][A-Z0-9]+-[0-9]+\\b' | head -n1 || true)"
 fi
-if [ -z "$BRANCH_ISSUE" ]; then
+if [ -z "\x24BRANCH_ISSUE" ]; then
   echo 'ERROR: branch name must include Linear ID (e.g. feature/${teamKey}-123-short-title).' >&2
   exit 1
 fi
-if ! grep -Eq "\\b[A-Z][A-Z0-9]+-[0-9]+\\b" "$MSG_FILE"; then
-  echo "ERROR: commit message must include Linear ID (expected $BRANCH_ISSUE)." >&2
+if ! grep -Eq "\\b[A-Z][A-Z0-9]+-[0-9]+\\b" "\x24MSG_FILE"; then
+  echo "ERROR: commit message must include Linear ID (expected \x24BRANCH_ISSUE)." >&2
   exit 1
 fi
-if ! grep -Eq "\\b$BRANCH_ISSUE\\b" "$MSG_FILE"; then
-  echo "ERROR: commit message should contain branch Linear ID: $BRANCH_ISSUE" >&2
+if ! grep -Eq "\\b\x24BRANCH_ISSUE\\b" "\x24MSG_FILE"; then
+  echo "ERROR: commit message should contain branch Linear ID: \x24BRANCH_ISSUE" >&2
   exit 1
 fi
 `;
@@ -11875,6 +12181,9 @@ function runCommand(bin, args, opts = {}) {
   }
   if (!mergedEnv.NEXUS_COLLECTION) {
     mergedEnv.NEXUS_COLLECTION = 'deepsea_nexus_restored';
+  }
+  if (!mergedEnv.NEXUS_PYTHON_PATH) {
+    mergedEnv.NEXUS_PYTHON_PATH = '/Users/yizhi/miniconda3/envs/openclaw-nexus/bin/python';
   }
 
   const result = spawnSync(bin, args, {
