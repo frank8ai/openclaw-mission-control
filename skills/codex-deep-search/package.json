@@ -1,0 +1,6 @@
+{
+  "name": "codex-deep-search",
+  "version": "1.0.0",
+  "description": "Codex CLI deep search skill for OpenClaw",
+  "private": true
+}

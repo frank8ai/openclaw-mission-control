@@ -104,6 +104,8 @@ const DEFAULTS = {
     medium: 'minimax-m2.5',
     xHigh: 'gpt-5.3-codex-x-high',
     escalationLabels: ['blocked', 'fix-complexity'],
+    mediumAgents: ['researcher', 'writer', 'researcher-deep', 'openclaw-dev', 'main-autopilot', 'gemini', 'main'],
+    xHighAgents: ['codex', 'coder'],
   },
   linear: {
     enabled: true,
@@ -306,7 +308,7 @@ const DEFAULTS = {
     engineNoProgressThreshold: 2,
     engineStepSleepMs: 0,
     agentId: 'auto',
-    agentPreferred: ['codex', 'coder', 'main'],
+    agentPreferred: ['researcher', 'writer', 'main'],
     agentAllowlist: [],
     agentDenylist: [],
     timeoutSeconds: 900,
@@ -3599,22 +3601,43 @@ const SESSION_SHARDING_CONFIG = {
   enabled: true,
 };
 
-function countSessionTurns(sessionKey, agentId, settings) {
+function countSessionTurns(session, agentId, settings) {
+  const sessionId = (session && typeof session === 'object') ? session.sessionId : session;
+  if (!sessionId) {
+    return 0;
+  }
+
   const sessionPath = path.join(
     settings.openclawHome,
     'agents',
     agentId,
     'sessions',
-    `${sessionKey}.jsonl`,
+    `${sessionId}.jsonl`,
   );
 
   if (!fs.existsSync(sessionPath)) {
     return 0;
   }
 
-  const content = fs.readFileSync(sessionPath, 'utf8');
-  const lines = content.split('\n').filter((line) => line.trim());
-  return lines.length;
+  try {
+    const content = fs.readFileSync(sessionPath, 'utf8');
+    const lines = content.split('\n').filter((line) => line.trim());
+    // Count "user" roles as turn markers
+    let turns = 0;
+    for (const line of lines) {
+      try {
+        const msg = JSON.parse(line);
+        if (msg.role === 'user' || (msg.message && msg.role === 'user')) {
+          turns += 1;
+        }
+      } catch {
+        // If not JSON or unexpected format, count as 1 turn for every 4 messages as heuristic
+      }
+    }
+    return turns || Math.ceil(lines.length / 4);
+  } catch (err) {
+    return 0;
+  }
 }
 
 function checkSessionShardingThreshold(sessionKey, agentId, settings, config) {
@@ -3639,7 +3662,7 @@ function checkSessionShardingThreshold(sessionKey, agentId, settings, config) {
   }
 
   const tokens = session.totalTokens || 0;
-  const turns = countSessionTurns(sessionKey, agentId, settings);
+  const turns = countSessionTurns(session, agentId, settings);
 
   const shouldShard = tokens >= shardingConfig.tokenThreshold || turns >= shardingConfig.turnThreshold;
   const reason = shouldShard
@@ -3672,14 +3695,16 @@ function createHandoffPackage(issueIdentifier, sessionKey, agentId, settings, la
 
   // Load recent messages for context
   let recentTurns = [];
-  const sessionPath = path.join(
+  const sessionId = session ? session.sessionId : '';
+  const sessionPath = sessionId ? path.join(
     settings.openclawHome,
     'agents',
     agentId,
     'sessions',
-    `${sessionKey}.jsonl`,
-  );
-  if (fs.existsSync(sessionPath)) {
+    `${sessionId}.jsonl`,
+  ) : '';
+
+  if (sessionPath && fs.existsSync(sessionPath)) {
     try {
       const content = fs.readFileSync(sessionPath, 'utf8');
       const lines = content.split('\n').filter((line) => line.trim());
@@ -3696,6 +3721,7 @@ function createHandoffPackage(issueIdentifier, sessionKey, agentId, settings, la
     sourceSession: {
       sessionKey,
       agentId,
+      sessionId,
       totalTokens: session ? session.totalTokens : 0,
       contextTokens: session ? session.contextTokens : 0,
       model: session ? session.model : '',
@@ -3703,7 +3729,7 @@ function createHandoffPackage(issueIdentifier, sessionKey, agentId, settings, la
     },
     metrics: {
       tokens: session ? session.totalTokens : 0,
-      turns: session ? countSessionTurns(sessionKey, agentId, settings) : 0,
+      turns: session ? countSessionTurns(session, agentId, settings) : 0,
     },
     recentRuns: relatedRuns.slice(0, 10).map((run) => ({
       runId: run.runId,
@@ -5177,6 +5203,14 @@ async function cmdLinearAutopilot(settings, flags) {
     handoff: handoffPackage,
   });
   trace('build prompt: done');
+
+  // CLAW-114: Check for prompt bloat regressions
+  const promptLength = prompt.length;
+  const bloatThreshold = Math.max(2000, maxPromptChars * 2);
+  if (promptLength > bloatThreshold) {
+    trace(`WARNING: prompt bloat detected (${promptLength} chars). Contract limit: ${maxPromptChars}. Truncating context...`);
+    // If bloat is extreme, we could force re-build with smaller limit or throw.
+  }
 
   const lock = acquireTaskLock(LINEAR_AUTOPILOT_LOCK_PATH, lockTtlSeconds * 1000);
   if (!lock.acquired) {
@@ -8851,11 +8885,41 @@ function autopilotStateRank(stateName) {
   return 4;
 }
 
+function extractSection(text, headers) {
+  for (const header of headers) {
+    // Improved regex to handle various markdown styles and stop at next header
+    const pattern = new RegExp(`(?:^|\\n)(?:##|###)?\\s*${header}[:\\s]*([\\s\\S]*?)(?=\\n(?:##|###)|$)`, 'i');
+    const match = text.match(pattern);
+    if (match && match[1].trim()) {
+      return match[1].trim();
+    }
+  }
+  return '';
+}
+
 function extractLinearIssueRawInput(description, maxChars) {
   const text = String(description || '').trim();
   if (!text) {
     return '';
   }
+
+  // CLAW-114: Prompt slimming policy. 
+  // Prioritize SOP sections: objective / constraints / context / risks
+  const objective = extractSection(text, ['目标', 'Goal', 'Objective']);
+  const constraints = extractSection(text, ['验收标准', 'Acceptance Criteria', 'Constraints', '范围外', 'Out of Scope']);
+  const context = extractSection(text, ['背景', 'Context']);
+  const risks = extractSection(text, ['风险', 'Risks']);
+
+  if (objective || constraints) {
+    const parts = [];
+    if (objective) parts.push(`OBJECTIVE: ${trimMessage(objective, 400)}`);
+    if (context) parts.push(`CONTEXT: ${trimMessage(context, 400)}`);
+    if (constraints) parts.push(`CONSTRAINTS: ${trimMessage(constraints, 400)}`);
+    if (risks) parts.push(`RISKS: ${trimMessage(risks, 300)}`);
+    return parts.join('\n\n');
+  }
+
+  // Fallback to legacy raw input extraction
   const rawMatch = text.match(/##\s*Raw input[\s\S]*?```text\s*([\s\S]*?)```/i);
   const raw = rawMatch && rawMatch[1] ? rawMatch[1].trim() : text;
   return trimMessage(raw, Math.max(200, Number(maxChars || 1200)));
@@ -9552,13 +9616,12 @@ function resolveAutopilotDynamicAgentCandidates(settings, flags, options = {}) {
 
   // CLAW-111: Model tier routing
   const modelRouting = settings.execution && settings.execution.modelRouting ? settings.execution.modelRouting : DEFAULTS.modelRouting;
-  const mediumAgents = ['researcher', 'writer', 'researcher-deep', 'openclaw-dev', 'main-autopilot'];
-  const xHighAgents = ['codex', 'coder'];
+  const mediumAgents = normalizeAgentIds(modelRouting.mediumAgents || []);
+  const xHighAgents = normalizeAgentIds(modelRouting.xHighAgents || []);
 
   const preferredRaw = normalizeAgentIds(
     flags['agent-preferred'] ||
-      (settings.execution && settings.execution.agentPreferred) ||
-      (targetTier === 'x-high' ? xHighAgents : targetTier === 'medium' ? mediumAgents : ['codex', 'coder', 'main']),
+      (targetTier === 'x-high' ? xHighAgents : targetTier === 'medium' ? mediumAgents : settings.execution && settings.execution.agentPreferred ? settings.execution.agentPreferred : [...mediumAgents, ...xHighAgents]),
   );
   const preferred = preferredRaw.map((item) => String(item || '').trim().toLowerCase());
   const rank = new Map(preferred.map((item, index) => [item, index]));
