@@ -5455,6 +5455,22 @@ async function cmdLinearAutopilot(settings, flags) {
 }
 
 async function cmdLinearEngine(settings, flags) {
+  if (flags.help || flags.h) {
+    process.stdout.write(
+      [
+        'Usage:',
+        '  linear-engine [--issue CLAW-123 | --auto-pick] [--max-steps N] [--no-progress-threshold N] [--json]',
+        '  linear-engine --drain [--drain-max-issues N] [--max-steps N] [--auto-pick] [--json]',
+        '',
+        'Behavior:',
+        '  - default mode: execute one issue for multiple steps until done/blocked/no-progress/max-steps',
+        '  - drain mode: process multiple runnable issues in sequence within one run',
+        '  - no-progress escalation: tracked across runs; default threshold=3 consecutive no-progress rounds',
+      ].join('\n') + '\n',
+    );
+    return;
+  }
+
   const drainMode =
     flags.drain !== undefined
       ? isTruthyLike(flags.drain)
