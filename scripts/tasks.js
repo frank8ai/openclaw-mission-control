@@ -5348,9 +5348,13 @@ async function cmdLinearAutopilot(settings, flags) {
     }
   }
 
+  const smartContextMessage = buildSmartContextSnippet(candidate, settings);
+  const smartContext = maybeCompressSmartContext(candidate, smartContextMessage, settings);
   const prompt = buildLinearAutopilotPrompt(candidate, maxPromptChars, {
     workdir: ROOT_DIR,
     handoff: handoffPackage,
+    smartContextMessage: smartContext.text,
+    smartContextBudget: smartContext.budget,
   });
   trace('build prompt: done');
 
@@ -9123,6 +9127,10 @@ function buildLinearAutopilotPrompt(issue, maxPromptChars, options = {}) {
   const rawInput = extractLinearIssueRawInput(issue && issue.description ? issue.description : '', maxPromptChars);
   const workdir = String(options && options.workdir ? options.workdir : ROOT_DIR).trim();
   const handoff = options && options.handoff ? options.handoff : null;
+  const smartContextMessage = String(options && options.smartContextMessage ? options.smartContextMessage : '').trim();
+  const smartContextBudget = Number.isFinite(Number(options && options.smartContextBudget))
+    ? Number(options.smartContextBudget)
+    : 0;
 
   const lines = [];
   lines.push('You are OpenClaw execution autopilot.');
@@ -9154,12 +9162,15 @@ function buildLinearAutopilotPrompt(issue, maxPromptChars, options = {}) {
       lines.push('');
     }
     if (handoff.recentTurns && handoff.recentTurns.length > 0) {
+      // Keep only the most recent turns to avoid prompt bloat on shard handoffs.
+      const turns = handoff.recentTurns.slice(-8);
       lines.push('### RECENT SESSION TURNS');
-      for (const turn of handoff.recentTurns) {
+      for (const turn of turns) {
         const role = turn.role || 'unknown';
         const content = turn.text || turn.message || turn.content || (turn.raw ? turn.raw.substring(0, 100) : '');
         if (content) {
-          lines.push(`${role.toUpperCase()}: ${content.toString().substring(0, 400)}${content.toString().length > 400 ? '...' : ''}`);
+          const s = content.toString();
+          lines.push(`${role.toUpperCase()}: ${s.substring(0, 300)}${s.length > 300 ? '...' : ''}`);
         }
       }
       lines.push('');
@@ -9184,6 +9195,13 @@ function buildLinearAutopilotPrompt(issue, maxPromptChars, options = {}) {
   lines.push(rawInput || '(no description)');
   lines.push('```');
   lines.push('');
+  if (smartContextMessage && smartContextBudget > 0) {
+    lines.push('Smart Context (Second Brain):');
+    lines.push('```text');
+    lines.push(trimMessage(smartContextMessage, smartContextBudget));
+    lines.push('```');
+    lines.push('');
+  }
   lines.push('Status contract (strict):');
   lines.push('- status reflects ISSUE-level progress, not just this single step result.');
   lines.push('- Use status="done" only when the issue acceptance criteria are fully satisfied.');
@@ -9197,6 +9215,75 @@ function buildLinearAutopilotPrompt(issue, maxPromptChars, options = {}) {
     '{"status":"done|in_progress|blocked","summary":"what changed","next_action":"single next action","artifacts":["path or url"],"next_state":"In Progress|In Review|Blocked|Done|Triage"}',
   );
   return lines.join('\n');
+}
+
+function fnv1a32(input) {
+  const s = String(input || '');
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    hash ^= s.charCodeAt(i);
+    hash = (hash * 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
+}
+
+function SMART_CONTEXT_CACHE_PATH() {
+  return path.join(DATA_DIR, 'smart-context-cache.json');
+}
+
+function loadSmartContextCache() {
+  return readJsonFile(SMART_CONTEXT_CACHE_PATH(), { version: 1, byIssue: {} });
+}
+
+function saveSmartContextCache(cache) {
+  try {
+    writeJsonFile(SMART_CONTEXT_CACHE_PATH(), cache || { version: 1, byIssue: {} });
+  } catch {
+    // best-effort
+  }
+}
+
+function computeSmartContextBudget(issue, settings) {
+  const base = Number(
+    settings && settings.execution && settings.execution.smartContext && settings.execution.smartContext.maxChars
+      ? settings.execution.smartContext.maxChars
+      : 900,
+  );
+  const max = Math.max(0, Math.min(1800, Math.floor(base)));
+  const priority = Number.isFinite(Number(issue && issue.priority)) ? Number(issue.priority) : 0;
+  if (priority >= 3) return Math.min(1800, Math.max(900, max));
+  return Math.min(1200, max);
+}
+
+function maybeCompressSmartContext(issue, smartContextMessage, settings) {
+  const enabled =
+    (settings && settings.execution && settings.execution.smartContext && settings.execution.smartContext.enabled) ?? true;
+  if (!enabled) {
+    return { text: '', budget: 0, hash: '', changed: false };
+  }
+
+  const issueId = String(issue && issue.identifier ? issue.identifier : '').trim();
+  const raw = String(smartContextMessage || '').trim();
+  if (!issueId || !raw) {
+    return { text: raw, budget: computeSmartContextBudget(issue, settings), hash: '', changed: false };
+  }
+
+  const h = fnv1a32(raw);
+  const cache = loadSmartContextCache();
+  const prev = cache && cache.byIssue ? cache.byIssue[issueId] : null;
+  const prevHash = prev && prev.hash ? String(prev.hash) : '';
+  const nowMs = Date.now();
+
+  cache.byIssue = cache.byIssue || {};
+  cache.byIssue[issueId] = { hash: h, atMs: nowMs };
+  saveSmartContextCache(cache);
+
+  if (prevHash && prevHash === h) {
+    const marker = `UNCHANGED_SMART_CONTEXT(hash=${h})`;
+    return { text: marker, budget: Math.min(120, marker.length + 10), hash: h, changed: false };
+  }
+
+  return { text: raw, budget: computeSmartContextBudget(issue, settings), hash: h, changed: true };
 }
 
 function extractAgentText(agentPayload) {
@@ -11960,6 +12047,21 @@ function isSilent(job, nowMs, settings) {
   const schedule = job.schedule || {};
   const lastRunAtMs = firstNumber(state.lastRunAtMs);
 
+  // A job may intentionally not run during quiet-hours. Those runs are recorded as
+  // "skipped" with error="quiet-hours". Treat that as a healthy signal so the
+  // watchdog does not raise a false "cron-silent" anomaly.
+  try {
+    const runs = loadCronRuns(job.id, 1, settings);
+    const latest = Array.isArray(runs) && runs.length > 0 ? runs[runs.length - 1] : null;
+    const status = String(latest && latest.status ? latest.status : '').trim().toLowerCase();
+    const error = String(latest && latest.error ? latest.error : '').trim().toLowerCase();
+    if (status === 'skipped' && error === 'quiet-hours') {
+      return false;
+    }
+  } catch {
+    // ignore run loading errors; fall back to schedule-based detection
+  }
+
   if (schedule.kind === 'every' && Number(schedule.everyMs) > 0) {
     const everyMs = Number(schedule.everyMs);
     const silenceFloorMs = Number(settings.watchdog.silenceFloorMinutes || 10) * 60 * 1000;
@@ -14679,3 +14781,60 @@ async function cmdStatusMachineRules(settings, flags) {
 }
 
 main();
+
+function buildSmartContextSnippet(issue, settings) {
+  try {
+    const enabled = Boolean(
+      (settings.execution && settings.execution.smartContext && settings.execution.smartContext.enabled) ?? true,
+    );
+    if (!enabled) {
+      return '';
+    }
+
+    const candidatePy =
+      process.env.NEXUS_PYTHON_PATH || '/Users/yizhi/miniconda3/envs/openclaw-nexus/bin/python';
+    if (!candidatePy || !fs.existsSync(candidatePy)) {
+      return '';
+    }
+
+    const message = buildSmartContextMessage(issue);
+    if (!message) {
+      return '';
+    }
+
+    const scriptPath = path.join(ROOT_DIR, 'scripts', 'nexus-smart-context-prompt.py');
+    if (!fs.existsSync(scriptPath)) {
+      return '';
+    }
+
+    const output = runCommand(candidatePy, [scriptPath, '--message', message], {
+      timeoutMs: 45_000,
+      label: 'smart_context prompt',
+    });
+
+    const text = String(output.stdout || '').trim();
+    return trimMessage(text, 2000);
+  } catch {
+    return '';
+  }
+}
+
+function buildSmartContextMessage(issue) {
+  const parts = [];
+  parts.push(String(issue && issue.title ? issue.title : '').trim());
+  const desc = String(issue && issue.description ? issue.description : '').trim();
+  if (desc) {
+    parts.push(desc.slice(0, 1200));
+  }
+  const labels = (((issue && issue.labels) || {}).nodes || [])
+    .map((item) => String(item && item.name ? item.name : '').trim())
+    .filter(Boolean);
+  if (labels.length > 0) {
+    parts.push(`labels: ${labels.join(', ')}`);
+  }
+  const state = String((issue && issue.state && issue.state.name) || '').trim();
+  if (state) {
+    parts.push(`state: ${state}`);
+  }
+  return parts.filter(Boolean).join('\n\n');
+}
