@@ -778,9 +778,16 @@ function loadSettings() {
   // Fail-fast guard for NEXUS (Second Brain) prerequisites
   const nexusChecks = [
     { key: 'NEXUS_VECTOR_DB', env: process.env.NEXUS_VECTOR_DB || '/Users/yizhi/.openclaw/workspace/memory/.vector_db_restored' },
+    { key: 'NEXUS_COLLECTION', env: process.env.NEXUS_COLLECTION || 'deepsea_nexus_restored' },
     { key: 'NEXUS_PYTHON_PATH', env: process.env.NEXUS_PYTHON_PATH || '/Users/yizhi/miniconda3/envs/openclaw-nexus/bin/python' },
   ];
   for (const check of nexusChecks) {
+    if (check.key === 'NEXUS_COLLECTION') {
+      if (!check.env) {
+        throw new Error(`CRITICAL: NEXUS prerequisite [${check.key}] is empty. Please check your environment or Second Brain installation.`);
+      }
+      continue;
+    }
     if (!fs.existsSync(check.env)) {
       throw new Error(`CRITICAL: NEXUS prerequisite [${check.key}] path not found: ${check.env}. Please check your environment or Second Brain installation.`);
     }
