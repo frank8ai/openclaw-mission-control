@@ -660,11 +660,20 @@ Fields:
 - `github.*`
 - `todoist.*`
 - `calendar.*`
+- `discordIntake.*` (supports `channelIds` multi-channel intake, `requireExplicitTrigger`, `explicitTriggers`)
 - `statusMachine.*`
 - `intakeQueue.*`
 - `sla.*`
 - `runbook.*`
 - `execution.*` (including `loopCommand`, `engineAutoPick`, `engineMaxSteps`, `agentId`, `agentPreferred`, `agentAllowlist`, `agentDenylist`)
+
+`discordIntake` explicit trigger mode:
+
+- set `discordIntake.requireExplicitTrigger=true`
+- set `discordIntake.explicitTriggers` (for example: `linear 任务`, `linear任务`, `linear task`, `/task`)
+- when enabled, only messages containing one of the explicit triggers are auto-converted to Linear issues
+- this applies to all configured intake channels in `discordIntake.channelIds`
+- optional: keep `discordIntake.autoDiscoverFromStatus=true` to auto-include newly discovered agent Discord channels from workspace `status.json`
 
 `execution.agentId` behavior:
 

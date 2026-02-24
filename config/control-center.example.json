@@ -123,6 +123,39 @@
     "label": "calendar",
     "defaultState": "Triage"
   },
+  "discordIntake": {
+    "enabled": true,
+    "channelId": "123456789012345678",
+    "channelIds": [
+      "123456789012345678"
+    ],
+    "ownerUserIds": [
+      "1146425418937811145"
+    ],
+    "includeBotMessages": false,
+    "limit": 30,
+    "pollMinutes": 5,
+    "maxCreatePerRun": 5,
+    "minTextChars": 6,
+    "excludeProgressChecks": true,
+    "requireExplicitTrigger": true,
+    "explicitTriggers": [
+      "linear 任务",
+      "linear任务",
+      "linear task",
+      "/task",
+      "#task",
+      "任务：",
+      "任务:"
+    ],
+    "autoDiscoverFromStatus": true,
+    "labels": [
+      "auto-intake",
+      "main-directive"
+    ],
+    "defaultState": "Triage",
+    "defaultPriority": 3
+  },
   "statusMachine": {
     "enabled": true,
     "activeWindowMinutes": 120,
@@ -259,6 +292,22 @@
     "maxActionsPerRun": 5
   },
   "execution": {
+    "sessionSharding": {
+      "enabled": true,
+      "maxTokens": 60000,
+      "maxTurns": 30,
+      "enforceHandoffPackage": true
+    },
+    "tokenBudget": {
+      "enabled": true,
+      "dailyGlobalLimit": 500000,
+      "dailyAgentLimit": 100000,
+      "throttleThresholds": {
+        "downgrade": 0.8,
+        "highPriorityOnly": 0.9,
+        "freeze": 0.95
+      }
+    },
     "enabled": true,
     "pollMinutes": 15,
     "loopCommand": "linear-engine",

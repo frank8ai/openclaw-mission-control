@@ -1,7 +1,7 @@
 # Linear-Codex Dev SOP (v1)
 
 ## 1. 任务入口标准 (Task Entry Standard)
-Linear 每个任务必须包含以下 7 段：
+Linear 每个任务必须包含以下 6 段：
 - 背景 (Context)
 - 目标 (Goal)
 - 范围外 (Out of Scope)

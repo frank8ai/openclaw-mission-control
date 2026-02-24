@@ -207,6 +207,7 @@ const DEFAULTS = {
   discordIntake: {
     enabled: true,
     channelId: process.env.CONTROL_CENTER_DISCORD_INTAKE_CHANNEL || '',
+    channelIds: [],
     ownerUserIds: process.env.CONTROL_CENTER_OWNER_USER_IDS
       ? process.env.CONTROL_CENTER_OWNER_USER_IDS.split(',').map((item) => item.trim()).filter(Boolean)
       : ['1146425418937811145'],
@@ -216,6 +217,9 @@ const DEFAULTS = {
     maxCreatePerRun: 5,
     minTextChars: 6,
     excludeProgressChecks: true,
+    requireExplicitTrigger: false,
+    explicitTriggers: ['linear 任务', 'linear任务', 'linear task', '/task', '#task', '任务：', '任务:'],
+    autoDiscoverFromStatus: true,
     labels: ['auto-intake', 'main-directive'],
     defaultState: 'Triage',
     defaultPriority: 3,
@@ -2737,9 +2741,9 @@ async function cmdSchedule(settings, flags) {
   const todoistSyncParts = [nodeBin, scriptPath, 'todoist-sync', '--limit', String(todoistBatchSize)];
   const calendarSyncParts = [nodeBin, scriptPath, 'calendar-sync'];
   const discordIntakeParts = [nodeBin, scriptPath, 'discord-intake-sync'];
-  const discordIntakeChannel = resolveDiscordIntakeChannelId(settings, flags);
-  if (discordIntakeChannel) {
-    discordIntakeParts.push('--channel', discordIntakeChannel);
+  const discordIntakeChannels = resolveDiscordIntakeChannelIds(settings, flags);
+  if (discordIntakeChannels.length > 0) {
+    discordIntakeParts.push('--channel', discordIntakeChannels.join(','));
   }
   const statusSyncParts = [nodeBin, scriptPath, 'status-sync'];
   const queueDrainParts = [nodeBin, scriptPath, 'queue-drain'];
@@ -4760,9 +4764,11 @@ async function cmdDiscordIntakeSync(settings, flags) {
     return;
   }
 
-  const channelId = resolveDiscordIntakeChannelId(settings, flags);
-  if (!channelId) {
-    throw new Error('discord-intake-sync requires a channel id. Set discordIntake.channelId or --channel.');
+  const channelIds = resolveDiscordIntakeChannelIds(settings, flags);
+  if (channelIds.length === 0) {
+    throw new Error(
+      'discord-intake-sync requires at least one channel id. Set discordIntake.channelIds/channelId or --channel.',
+    );
   }
 
   const includeBotMessages =
@@ -4803,169 +4809,219 @@ async function cmdDiscordIntakeSync(settings, flags) {
 
   const hasStateFile = fs.existsSync(DISCORD_INTAKE_STATE_PATH);
   const state = readJsonFile(DISCORD_INTAKE_STATE_PATH, {
-    version: 1,
-    channelId: '',
-    lastSeenTsMs: 0,
+    version: 2,
+    channels: {},
     items: {},
   });
   if (!state.items || typeof state.items !== 'object') {
     state.items = {};
   }
-  const oldLastSeenTsMs = Number(state.lastSeenTsMs || 0);
-
-  const messages = await readDiscordMessagesViaOpenClaw(channelId, limit, {
-    around: aroundId,
-    before: beforeId,
-    after: afterId,
-  });
-  const ordered = (Array.isArray(messages) ? messages : [])
-    .slice()
-    .sort((a, b) => extractMessageTimestampMs(a) - extractMessageTimestampMs(b));
-
-  const latestTsMs = ordered.reduce((acc, msg) => Math.max(acc, extractMessageTimestampMs(msg)), oldLastSeenTsMs);
-  if (!hasStateFile && !backfill) {
-    state.version = 1;
-    state.channelId = channelId;
-    state.lastSeenTsMs = latestTsMs;
-    state.updatedAtMs = Date.now();
-    writeJsonFile(DISCORD_INTAKE_STATE_PATH, state);
-    const bootstrapped = {
-      ok: true,
-      bootstrapped: true,
-      channelId,
-      lastSeenTsMs: latestTsMs,
-      inspected: ordered.length,
-      created: [],
-      queued: [],
-      deduped: [],
-      skipped: [],
-      note: 'state initialized; next run will ingest new directives only',
+  if (!state.channels || typeof state.channels !== 'object') {
+    state.channels = {};
+  }
+  // Backward-compatible migration from v1 single-channel state.
+  if (state.channelId && !state.channels[state.channelId]) {
+    state.channels[state.channelId] = {
+      lastSeenTsMs: Number(state.lastSeenTsMs || 0),
+      updatedAtMs: Number(state.updatedAtMs || Date.now()),
     };
-    if (flags.json) {
-      process.stdout.write(`${JSON.stringify(bootstrapped, null, 2)}\n`);
-    } else {
-      process.stdout.write(
-        `Discord intake bootstrapped on channel ${channelId} with ${ordered.length} recent messages. Next run will process new directives.\n`,
-      );
-    }
-    return;
   }
 
   const created = [];
   const queued = [];
   const deduped = [];
   const skipped = [];
+  const channelResults = [];
+  const bootstrappedChannels = [];
   let processed = 0;
-  let createdCount = 0;
-  let highWatermarkTsMs = oldLastSeenTsMs;
+  let inspected = 0;
 
-  for (const message of ordered) {
-    const messageId = String(message && message.id ? message.id : '').trim();
-    const author = message && message.author && typeof message.author === 'object' ? message.author : {};
-    const authorId = String(author.id || message.author_id || '').trim();
-    const isBot = Boolean(author.bot);
-    const guildId = String(message.guild_id || message.guildId || '@me').trim() || '@me';
-    const tsMs = extractMessageTimestampMs(message);
-    highWatermarkTsMs = Math.max(highWatermarkTsMs, tsMs);
-    if (!messageId) {
-      continue;
-    }
-
-    const sourceId = normalizeSourceId(`discord:${guildId}:${channelId}:${messageId}`);
-    if (state.items[sourceId]) {
-      skipped.push({ messageId, reason: 'already-processed' });
-      continue;
-    }
-    if (!backfill && tsMs <= oldLastSeenTsMs) {
-      state.items[sourceId] = tsMs || Date.now();
-      skipped.push({ messageId, reason: 'older-than-watermark' });
-      continue;
-    }
-    if (!includeBotMessages && isBot) {
-      state.items[sourceId] = tsMs || Date.now();
-      skipped.push({ messageId, reason: 'bot-message' });
-      continue;
-    }
-    if (ownerUserIds.length > 0 && (!authorId || !ownerUserIds.includes(authorId))) {
-      state.items[sourceId] = tsMs || Date.now();
-      skipped.push({ messageId, reason: 'not-owner' });
-      continue;
-    }
-
-    const content = String(message.content || '').trim();
-    if (!content || content.length < minTextChars) {
-      state.items[sourceId] = tsMs || Date.now();
-      skipped.push({ messageId, reason: 'text-too-short' });
-      continue;
-    }
-    if (!looksLikeTaskDirective(content, settings.discordIntake || {})) {
-      state.items[sourceId] = tsMs || Date.now();
-      skipped.push({ messageId, reason: 'not-task-directive' });
-      continue;
-    }
-
-    if (createdCount >= maxCreatePerRun) {
-      skipped.push({ messageId, reason: 'max-create-reached' });
-      continue;
-    }
-
-    const input = buildDiscordTriageInput({
-      ...message,
-      messageId,
-      channelId,
-      guildId,
-      sourceId,
-      title: `[main] ${singleLine(content).slice(0, 120)}`,
-      state: defaultState,
-      priority: defaultPriority,
-      labels: baseLabels,
+  for (const channelId of channelIds) {
+    const channelState =
+      state.channels && state.channels[channelId] && typeof state.channels[channelId] === 'object'
+        ? state.channels[channelId]
+        : null;
+    const oldLastSeenTsMs = Number(channelState && channelState.lastSeenTsMs ? channelState.lastSeenTsMs : 0);
+    const messages = await readDiscordMessagesViaOpenClaw(channelId, limit, {
+      around: aroundId,
+      before: beforeId,
+      after: afterId,
     });
-    input.source = 'discord';
-    input.sourceId = sourceId;
-    input.state = defaultState;
-    input.priority = Number.isFinite(defaultPriority) ? defaultPriority : 3;
-    input.labels = dedupeStrings([
-      ...normalizeLabelNames(input.labels || []),
-      ...baseLabels,
-      'discord',
-    ]);
-    input.eventType = normalizeIngestEventType(input.eventType || '', 'discord.directive');
+    const ordered = (Array.isArray(messages) ? messages : [])
+      .slice()
+      .sort((a, b) => extractMessageTimestampMs(a) - extractMessageTimestampMs(b));
+    inspected += ordered.length;
 
-    const delivery = await createTriageIssueWithFallback(input, settings, { context: 'discord-intake-sync' });
-    state.items[sourceId] = tsMs || Date.now();
-    processed += 1;
-    if (delivery.queued) {
-      queued.push({
-        messageId,
-        queueId: delivery.queueId,
-        error: delivery.error,
+    const latestTsMs = ordered.reduce(
+      (acc, msg) => Math.max(acc, extractMessageTimestampMs(msg)),
+      oldLastSeenTsMs,
+    );
+
+    if (!channelState && !backfill) {
+      state.channels[channelId] = {
+        lastSeenTsMs: latestTsMs,
+        updatedAtMs: Date.now(),
+      };
+      bootstrappedChannels.push({
+        channelId,
+        lastSeenTsMs: latestTsMs,
+        inspected: ordered.length,
+      });
+      channelResults.push({
+        channelId,
+        bootstrapped: true,
+        inspected: ordered.length,
+        processed: 0,
+        created: 0,
+        queued: 0,
+        deduped: 0,
+        skipped: 0,
+        lastSeenTsMs: latestTsMs,
       });
       continue;
     }
-    const issue = delivery.issue;
 
-    if (issue && issue.deduped) {
-      deduped.push({
+    let createdCount = 0;
+    let highWatermarkTsMs = oldLastSeenTsMs;
+    const channelCreated = [];
+    const channelQueued = [];
+    const channelDeduped = [];
+    const channelSkipped = [];
+    let channelProcessed = 0;
+
+    for (const message of ordered) {
+      const messageId = String(message && message.id ? message.id : '').trim();
+      const author = message && message.author && typeof message.author === 'object' ? message.author : {};
+      const authorId = String(author.id || message.author_id || '').trim();
+      const isBot = Boolean(author.bot);
+      const guildId = String(message.guild_id || message.guildId || '@me').trim() || '@me';
+      const tsMs = extractMessageTimestampMs(message);
+      highWatermarkTsMs = Math.max(highWatermarkTsMs, tsMs);
+      if (!messageId) {
+        continue;
+      }
+
+      const sourceId = normalizeSourceId(`discord:${guildId}:${channelId}:${messageId}`);
+      if (state.items[sourceId]) {
+        channelSkipped.push({ channelId, messageId, reason: 'already-processed' });
+        continue;
+      }
+      if (!backfill && tsMs <= oldLastSeenTsMs) {
+        state.items[sourceId] = tsMs || Date.now();
+        channelSkipped.push({ channelId, messageId, reason: 'older-than-watermark' });
+        continue;
+      }
+      if (!includeBotMessages && isBot) {
+        state.items[sourceId] = tsMs || Date.now();
+        channelSkipped.push({ channelId, messageId, reason: 'bot-message' });
+        continue;
+      }
+      if (ownerUserIds.length > 0 && (!authorId || !ownerUserIds.includes(authorId))) {
+        state.items[sourceId] = tsMs || Date.now();
+        channelSkipped.push({ channelId, messageId, reason: 'not-owner' });
+        continue;
+      }
+
+      const content = String(message.content || '').trim();
+      if (!content || content.length < minTextChars) {
+        state.items[sourceId] = tsMs || Date.now();
+        channelSkipped.push({ channelId, messageId, reason: 'text-too-short' });
+        continue;
+      }
+      if (!looksLikeTaskDirective(content, settings.discordIntake || {})) {
+        state.items[sourceId] = tsMs || Date.now();
+        channelSkipped.push({ channelId, messageId, reason: 'not-task-directive' });
+        continue;
+      }
+
+      if (createdCount >= maxCreatePerRun) {
+        channelSkipped.push({ channelId, messageId, reason: 'max-create-reached' });
+        continue;
+      }
+
+      const input = buildDiscordTriageInput({
+        ...message,
+        messageId,
+        channelId,
+        guildId,
+        sourceId,
+        title: `[main] ${singleLine(content).slice(0, 120)}`,
+        state: defaultState,
+        priority: defaultPriority,
+        labels: baseLabels,
+      });
+      input.source = 'discord';
+      input.sourceId = sourceId;
+      input.state = defaultState;
+      input.priority = Number.isFinite(defaultPriority) ? defaultPriority : 3;
+      input.labels = dedupeStrings([
+        ...normalizeLabelNames(input.labels || []),
+        ...baseLabels,
+        'discord',
+      ]);
+      input.eventType = normalizeIngestEventType(input.eventType || '', 'discord.directive');
+
+      const delivery = await createTriageIssueWithFallback(input, settings, { context: 'discord-intake-sync' });
+      state.items[sourceId] = tsMs || Date.now();
+      channelProcessed += 1;
+      if (delivery.queued) {
+        channelQueued.push({
+          channelId,
+          messageId,
+          queueId: delivery.queueId,
+          error: delivery.error,
+        });
+        continue;
+      }
+      const issue = delivery.issue;
+
+      if (issue && issue.deduped) {
+        channelDeduped.push({
+          channelId,
+          messageId,
+          identifier: issue.identifier || '',
+          dedupeKey: issue.dedupeKey || '',
+        });
+        continue;
+      }
+
+      createdCount += 1;
+      channelCreated.push({
+        channelId,
         messageId,
         identifier: issue.identifier || '',
-        dedupeKey: issue.dedupeKey || '',
+        url: issue.url || '',
+        title: issue.title || input.title,
       });
-      continue;
+      appendAuditEvent('discord-intake-created', {
+        channelId,
+        messageId,
+        sourceId,
+        identifier: issue.identifier || '',
+        url: issue.url || '',
+      });
     }
 
-    createdCount += 1;
-    created.push({
-      messageId,
-      identifier: issue.identifier || '',
-      url: issue.url || '',
-      title: issue.title || input.title,
-    });
-    appendAuditEvent('discord-intake-created', {
+    state.channels[channelId] = {
+      lastSeenTsMs: Math.max(highWatermarkTsMs, oldLastSeenTsMs),
+      updatedAtMs: Date.now(),
+    };
+
+    processed += channelProcessed;
+    created.push(...channelCreated);
+    queued.push(...channelQueued);
+    deduped.push(...channelDeduped);
+    skipped.push(...channelSkipped);
+    channelResults.push({
       channelId,
-      messageId,
-      sourceId,
-      identifier: issue.identifier || '',
-      url: issue.url || '',
+      bootstrapped: false,
+      inspected: ordered.length,
+      processed: channelProcessed,
+      created: channelCreated.length,
+      queued: channelQueued.length,
+      deduped: channelDeduped.length,
+      skipped: channelSkipped.length,
+      lastSeenTsMs: state.channels[channelId].lastSeenTsMs,
     });
   }
 
@@ -4979,23 +5035,27 @@ async function cmdDiscordIntakeSync(settings, flags) {
     }
   }
 
-  state.version = 1;
-  state.channelId = channelId;
-  state.lastSeenTsMs = Math.max(highWatermarkTsMs, oldLastSeenTsMs);
+  state.version = 2;
   state.updatedAtMs = Date.now();
   writeJsonFile(DISCORD_INTAKE_STATE_PATH, state);
 
   const result = {
     ok: true,
-    channelId,
-    inspected: ordered.length,
+    channelIds,
+    channels: channelResults,
+    bootstrappedChannels,
+    inspected,
     processed,
     created,
     queued,
     deduped,
     skipped,
-    lastSeenTsMs: state.lastSeenTsMs,
   };
+
+  if (!backfill && bootstrappedChannels.length > 0 && created.length === 0 && queued.length === 0) {
+    result.bootstrapped = true;
+    result.note = 'state initialized for one or more channels; next run will ingest new directives only';
+  }
 
   if (flags.json) {
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
@@ -5004,15 +5064,18 @@ async function cmdDiscordIntakeSync(settings, flags) {
 
   const lines = [];
   lines.push('Discord intake sync result:');
-  lines.push(`- channel: ${channelId}`);
-  lines.push(`- inspected: ${ordered.length}`);
+  lines.push(`- channels: ${channelIds.join(', ')}`);
+  lines.push(`- inspected: ${inspected}`);
   lines.push(`- processed directives: ${processed}`);
   lines.push(`- created Linear issues: ${created.length}`);
   lines.push(`- queued for retry: ${queued.length}`);
   lines.push(`- deduped: ${deduped.length}`);
   lines.push(`- skipped: ${skipped.length}`);
+  if (bootstrappedChannels.length > 0) {
+    lines.push(`- bootstrapped channels: ${bootstrappedChannels.map((item) => item.channelId).join(', ')}`);
+  }
   for (const item of created.slice(0, 8)) {
-    lines.push(`- ${item.messageId} -> ${item.identifier}`);
+    lines.push(`- [${item.channelId}] ${item.messageId} -> ${item.identifier}`);
   }
   process.stdout.write(`${lines.join('\n')}\n`);
 }
@@ -5358,12 +5421,30 @@ async function cmdLinearAutopilot(settings, flags) {
   });
   trace('build prompt: done');
 
-  // CLAW-114: Check for prompt bloat regressions
+  // CLAW-185: Prompt contract validator (length + raw-log guard) for layered write contract.
+  // Keep it cheap: just compute audit stats and optionally fail-fast under strict mode.
   const promptLength = prompt.length;
   const bloatThreshold = Math.max(2000, maxPromptChars * 2);
-  if (promptLength > bloatThreshold) {
-    trace(`WARNING: prompt bloat detected (${promptLength} chars). Contract limit: ${maxPromptChars}. Truncating context...`);
-    // If bloat is extreme, we could force re-build with smaller limit or throw.
+  const hasRawLogs = /```\s*(log|json|yaml|yml)\s*\n/i.test(prompt) || /\n\s*\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}\b/i.test(prompt);
+  const contractAudit = {
+    promptLength,
+    maxPromptChars,
+    bloatThreshold,
+    bloat: promptLength > bloatThreshold,
+    hasRawLogs,
+  };
+  if (contractAudit.bloat) {
+    trace(
+      `WARNING: prompt bloat detected (${promptLength} chars). Contract limit: ${maxPromptChars}. Truncating context...`,
+    );
+  }
+  if (contractAudit.hasRawLogs) {
+    trace('WARNING: prompt contract violation: raw logs detected in prompt.');
+  }
+  if (strictFailure && (contractAudit.bloat || contractAudit.hasRawLogs)) {
+    throw new Error(
+      `Prompt contract validation failed (bloat=${contractAudit.bloat}, rawLogs=${contractAudit.hasRawLogs}, length=${promptLength}).`,
+    );
   }
 
   const lock = acquireTaskLock(LINEAR_AUTOPILOT_LOCK_PATH, lockTtlSeconds * 1000);
@@ -5488,7 +5569,18 @@ async function cmdLinearAutopilot(settings, flags) {
     releaseTaskLock(lock);
   }
 
-  const parsed = parseLinearAutopilotResponse(agentText);
+  let parsed = parseLinearAutopilotResponse(agentText);
+  const normalizedParsed = normalizeAutopilotBlockedContention(parsed, agentText);
+  if (normalizedParsed.status !== parsed.status) {
+    appendAuditEvent('linear-autopilot-blocked-normalized', {
+      issueIdentifier: candidate.identifier,
+      runId,
+      fromStatus: parsed.status,
+      toStatus: normalizedParsed.status,
+      reason: 'execution-contention',
+    });
+  }
+  parsed = normalizedParsed;
   const nextState = resolveLinearAutopilotNextState(candidate, parsed, settings);
   let transition = null;
   if (
@@ -9132,13 +9224,54 @@ function buildLinearAutopilotPrompt(issue, maxPromptChars, options = {}) {
     ? Number(options.smartContextBudget)
     : 0;
 
+  // Expose section length metrics for strict contract validation and audit.
+  const audit = {
+    version: 1,
+    maxPromptChars: Number(maxPromptChars || 0),
+    sections: {},
+  };
+  const push = (key, value) => {
+    const text = String(value || '');
+    audit.sections[key] = {
+      chars: text.length,
+      lines: text ? text.split('\n').length : 0,
+      hash: fnv1a32(text),
+    };
+    return text;
+  };
+
   const lines = [];
+  push('instruction', 'You are OpenClaw execution autopilot.');
+  push('instruction.oneStep', 'Do exactly ONE concrete next step for this issue in local workspace.');
+  push('instruction.blocked', 'If blocked, report exact blocker and next unblock action.');
+  push(
+    'sop',
+    'Standard Operating Procedure (SOP): All actions MUST follow the standard development SOP located at docs/sop/linear-codex-dev-sop.md.',
+  );
+  push(
+    'guard.noRecursion',
+    'Do NOT invoke mission-control executors from within this task (no `tasks.js linear-engine` / `tasks.js linear-autopilot` / `openclaw agent`).',
+  );
+  push(
+    'guard.noLockAsBlocker',
+    'Do NOT treat scheduler locks or queue contention (`already-running`, lock files, circuit-open) as an issue blocker.',
+  );
+  push(
+    'guard.blockedDefinition',
+    'Use `blocked` only for real external dependency blockers that cannot be solved by local repo edits in this run.',
+  );
   lines.push('You are OpenClaw execution autopilot.');
   lines.push('Do exactly ONE concrete next step for this issue in local workspace.');
   lines.push('If blocked, report exact blocker and next unblock action.');
   lines.push('Standard Operating Procedure (SOP): All actions MUST follow the standard development SOP located at docs/sop/linear-codex-dev-sop.md.');
+  lines.push('Do NOT invoke mission-control executors from within this task (no `tasks.js linear-engine` / `tasks.js linear-autopilot` / `openclaw agent`).');
+  lines.push('Do NOT treat scheduler locks or queue contention (`already-running`, lock files, circuit-open) as an issue blocker.');
+  lines.push('Use `blocked` only for real external dependency blockers that cannot be solved by local repo edits in this run.');
   if (workdir) {
-    lines.push(`Repository root for this task: ${workdir}`);
+    const rootLine = `Repository root for this task: ${workdir}`;
+    push('repoRoot', rootLine);
+    push('repoRoot.ops', 'Run all local commands and file operations under this repository root.');
+    lines.push(rootLine);
     lines.push('Run all local commands and file operations under this repository root.');
   }
   lines.push('');
@@ -9363,6 +9496,48 @@ function parseLinearAutopilotResponse(text) {
     nextAction,
     nextState,
     artifacts,
+  };
+}
+
+function normalizeAutopilotBlockedContention(parsed, rawText) {
+  const base =
+    parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed
+      : { status: '', summary: '', nextAction: '', nextState: '', artifacts: [] };
+  if (base.status !== 'blocked') {
+    return base;
+  }
+
+  const haystack = [base.summary, base.nextAction, rawText]
+    .map((item) => String(item || '').toLowerCase())
+    .join('\n');
+  const contentionHints = [
+    'already-running',
+    'already running',
+    'linear-autopilot.lock',
+    'lock.json',
+    'circuit-open',
+    'circuit open',
+    'another `linear-engine` run is currently active',
+    'another linear-engine run is currently active',
+    'stopreason=already-running',
+    'stop reason: already-running',
+  ];
+  const isExecutionContention = contentionHints.some((hint) => haystack.includes(hint));
+  if (!isExecutionContention) {
+    return base;
+  }
+
+  return {
+    ...base,
+    status: 'in_progress',
+    nextState: 'In Progress',
+    summary: base.summary
+      ? `${base.summary} (normalized: execution contention is treated as in_progress)`
+      : 'Execution contention detected (already-running/lock/circuit). Normalized to in_progress.',
+    nextAction:
+      base.nextAction ||
+      'Continue with one repository-level code/file step. Do not invoke linear-engine/linear-autopilot inside this issue run.',
   };
 }
 
@@ -10348,28 +10523,116 @@ function renderLinearAutopilotComment(input) {
   return trimMessage(lines.join('\n'), 3400);
 }
 
-function resolveDiscordIntakeChannelId(settings, flags) {
-  const fromFlag = String(flags.channel || flags.target || '').trim();
-  if (fromFlag) {
-    return fromFlag.startsWith('channel:') ? fromFlag.split(':').pop() : fromFlag;
+function parseDiscordChannelIds(value) {
+  if (Array.isArray(value)) {
+    return dedupeStrings(
+      value
+        .map((item) => String(item || '').trim())
+        .filter(Boolean)
+        .map((item) => (item.startsWith('channel:') ? item.slice('channel:'.length).trim() : item)),
+    );
+  }
+  return dedupeStrings(
+    String(value || '')
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .map((item) => (item.startsWith('channel:') ? item.slice('channel:'.length).trim() : item)),
+  );
+}
+
+function discoverDiscordChannelIdsFromStatus(settings) {
+  const enabled = !(
+    settings &&
+    settings.discordIntake &&
+    settings.discordIntake.autoDiscoverFromStatus === false
+  );
+  if (!enabled) {
+    return [];
   }
 
-  const fromConfig = String(settings.discordIntake && settings.discordIntake.channelId ? settings.discordIntake.channelId : '').trim();
-  if (fromConfig) {
-    return fromConfig.startsWith('channel:') ? fromConfig.split(':').pop() : fromConfig;
+  const statusPath = path.join(ROOT_DIR, '..', 'status.json');
+  if (!fs.existsSync(statusPath)) {
+    return [];
+  }
+
+  let payload = null;
+  try {
+    payload = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+  } catch {
+    return [];
+  }
+
+  const found = new Set();
+  const visit = (node) => {
+    if (node == null) {
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+    if (typeof node === 'object') {
+      for (const value of Object.values(node)) {
+        visit(value);
+      }
+      return;
+    }
+    if (typeof node !== 'string') {
+      return;
+    }
+    const match = node.match(/discord:channel:(\d+)/i);
+    if (match && match[1]) {
+      found.add(match[1]);
+    }
+  };
+  visit(payload);
+  return Array.from(found);
+}
+
+function resolveDiscordIntakeChannelIds(settings, flags) {
+  const fromFlag = parseDiscordChannelIds(flags.channel || flags.target || '');
+  if (fromFlag.length > 0) {
+    return fromFlag;
+  }
+
+  const fromConfigList = parseDiscordChannelIds(
+    settings &&
+    settings.discordIntake &&
+    Array.isArray(settings.discordIntake.channelIds)
+      ? settings.discordIntake.channelIds
+      : [],
+  );
+  const fromConfigSingle = parseDiscordChannelIds(
+    settings && settings.discordIntake && settings.discordIntake.channelId ? settings.discordIntake.channelId : '',
+  );
+  const discovered = parseDiscordChannelIds(discoverDiscordChannelIdsFromStatus(settings));
+  const combinedConfig = dedupeStrings([...fromConfigList, ...fromConfigSingle, ...discovered]);
+  if (combinedConfig.length > 0) {
+    return combinedConfig;
   }
 
   const reportTarget = String(settings.report && settings.report.target ? settings.report.target : '').trim();
-  if (reportTarget.startsWith('channel:')) {
-    return reportTarget.slice('channel:'.length).trim();
+  const reportFallback = reportTarget.startsWith('channel:') ? reportTarget.slice('channel:'.length).trim() : '';
+  if (reportFallback) {
+    return [reportFallback];
   }
 
   const reminderTarget = String(settings.reminders && settings.reminders.target ? settings.reminders.target : '').trim();
-  if (reminderTarget.startsWith('channel:')) {
-    return reminderTarget.slice('channel:'.length).trim();
+  const reminderFallback =
+    reminderTarget.startsWith('channel:') ? reminderTarget.slice('channel:'.length).trim() : '';
+  if (reminderFallback) {
+    return [reminderFallback];
   }
 
-  return '';
+  return [];
+}
+
+function resolveDiscordIntakeChannelId(settings, flags) {
+  const ids = resolveDiscordIntakeChannelIds(settings, flags);
+  return ids.length > 0 ? ids[0] : '';
 }
 
 function looksLikeTaskDirective(text, options = {}) {
@@ -10383,6 +10646,21 @@ function looksLikeTaskDirective(text, options = {}) {
 
   const pureAck = /^(好|好的|ok|okay|收到|明白|👍|👌|yes|no|嗯|行|可以|谢谢|thanks|great|nice|lol|哈哈|？|\?)+$/i;
   if (pureAck.test(normalized)) {
+    return false;
+  }
+
+  const triggerList = dedupeStrings(
+    (Array.isArray(options && options.explicitTriggers) ? options.explicitTriggers : [])
+      .map((item) => String(item || '').trim().toLowerCase())
+      .filter(Boolean),
+  );
+  const normalizedLower = normalized.toLowerCase();
+  const matchedExplicitTrigger = triggerList.some((item) => normalizedLower.includes(item));
+  if (matchedExplicitTrigger) {
+    return true;
+  }
+  const requireExplicitTrigger = Boolean(options && options.requireExplicitTrigger === true);
+  if (requireExplicitTrigger) {
     return false;
   }
 
