@@ -667,6 +667,8 @@ Fields:
 - `runbook.*`
 - `execution.*` (including `loopCommand`, `engineAutoPick`, `engineMaxSteps`, `agentId`, `agentPreferred`, `agentAllowlist`, `agentDenylist`)
 
+Config values support `${ENV_VAR}` placeholders. Example: set `linear.apiKey` to `${LINEAR_API_KEY}` and keep the real key in `.env.local`.
+
 `discordIntake` explicit trigger mode:
 
 - set `discordIntake.requireExplicitTrigger=true`

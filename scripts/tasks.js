@@ -755,7 +755,7 @@ function loadSettings() {
     }
   }
 
-  const merged = deepMerge(DEFAULTS, config);
+  const merged = resolveEnvPlaceholders(deepMerge(DEFAULTS, config));
 
   if (!merged.linear.apiKey && process.env.LINEAR_API_KEY) {
     merged.linear.apiKey = process.env.LINEAR_API_KEY;
@@ -805,6 +805,28 @@ function loadSettings() {
   }
 
   return merged;
+}
+
+function resolveEnvPlaceholders(value) {
+  if (typeof value === 'string') {
+    return value.replace(/\$\{([A-Z0-9_]+)\}/g, (match, key) => {
+      if (Object.prototype.hasOwnProperty.call(process.env, key)) {
+        return process.env[key] || '';
+      }
+      return match;
+    });
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => resolveEnvPlaceholders(item));
+  }
+  if (value && typeof value === 'object') {
+    const output = {};
+    for (const [key, nested] of Object.entries(value)) {
+      output[key] = resolveEnvPlaceholders(nested);
+    }
+    return output;
+  }
+  return value;
 }
 
 function hydrateEnvFromDotEnv() {
