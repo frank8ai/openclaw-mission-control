@@ -22,3 +22,10 @@ This index lists project-level SOPs for OpenClaw Mission Control automation.
   - Purpose: suppress repeated intake issues via repo/error signature fingerprint.
 - `SOP_MC_Intake_Reliability_v2.md`
   - Purpose: unify queue fallback and queue observability across webhook + non-webhook intake paths.
+
+- `SOP_Router_v1.md`
+  - Purpose: route any incoming task to the right SOP track via a Route Card.
+- `SOP_Preflight_Counterexample_Gate_v1.md`
+  - Purpose: counterexample-based safety gate for high-risk changes.
+- `Wisdom_Dashboard_TEMPLATE.md`
+  - Purpose: weekly review template for reward signals and focus.
